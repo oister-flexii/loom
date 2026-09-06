@@ -16,10 +16,18 @@ import { parseTaskGraph, StateManager } from "../../../src/state-manager";
 import type { AgentRequestAuthority } from "../../../src/core/orchestration-contract";
 import { taskFixture } from "../../fixtures/task-lifecycle";
 import { WAVE_REVIEW_AGENTS } from "../../../src/core/model-profiles";
-import { prepareWaveReviewBatch } from "../../../src/core/wave-review-authority";
+import { isExactEpochReplay, prepareWaveReviewBatch, type WaveRequestBatch } from "../../../src/core/wave-review-authority";
+import type { SettledFloor } from "../../../src/core/requirement-coverage";
+import type { WaveReviewEpochAuthority } from "../../../src/types";
 import { observeWaveSpecCheckDocuments } from "../../../src/orchestration/wave-spec-check-documents";
 import { projectSpecBytes } from "../../../src/orchestration/spec-index-observation";
-import { parseOrchestrationRunId, parseRequestId } from "../../../src/core/orchestration-contract";
+import {
+  parseArtifactDigest,
+  parseOrchestrationRunId,
+  parseRequestId,
+  type ArtifactDigest,
+  type OrchestrationRunId,
+} from "../../../src/core/orchestration-contract";
 
 const decodeRequestId = (raw: string) => {
   const parsed = parseRequestId(raw);
@@ -237,7 +245,17 @@ describe("registered Wave spec-check scope", () => {
       wave: 1,
       batchEpoch: batch.batchEpoch,
       specCheckDocuments: batch.specCheckDocuments,
+      // The floor the packet rendered, recorded verbatim. Asserted against the
+      // batch rather than a literal so a change to the derivation cannot make
+      // the epoch and the packet disagree while both still pass.
+      settledSpecCheckFloor: batch.settledFloor,
       specCheckSlotAuthority: { slot_id: specAuthority.slotId, attempted: 1 },
+    });
+    // This fixture records no spec_file, so the honest floor is an absence WITH
+    // a stated reason - never a silent zero that would read as "nothing owed".
+    expect(batch.settledFloor).toEqual({
+      kind: "unprojected",
+      reason: "the TaskGraph records no spec_file, so no Spec Index exists to join against",
     });
     const run = installed.tasks[0]!.review_run!;
     expect(run.generation).toBe(3);
@@ -842,5 +860,86 @@ describe("a non-string recorded hash is described, not crashed on", () => {
     const rendered = new TextDecoder("utf8", { fatal: true }).decode(Uint8Array.from(section.bytes));
     expect(rendered).toContain("have been altered");
     expect(rendered).toContain("non-string number");
+  });
+});
+
+describe("an installed epoch is replayed only when it is the same epoch", () => {
+  const DIGEST = (fill: string): ArtifactDigest => {
+    const parsed = parseArtifactDigest(fill.repeat(64));
+    if (!parsed.ok) throw new Error(parsed.error.message);
+    return parsed.value;
+  };
+  const RUN_ID = ((): OrchestrationRunId => {
+    const parsed = parseOrchestrationRunId("run.replay");
+    if (!parsed.ok) throw new Error(parsed.error.message);
+    return parsed.value;
+  })();
+  const OTHER_RUN_ID = ((): OrchestrationRunId => {
+    const parsed = parseOrchestrationRunId("run.other");
+    if (!parsed.ok) throw new Error(parsed.error.message);
+    return parsed.value;
+  })();
+  const documents = Object.freeze({
+    spec: Object.freeze({ path: "spec.md", contentDigest: DIGEST("a") }),
+    plan: Object.freeze({ path: null, contentDigest: null }),
+  });
+  const batch = (settledFloor: SettledFloor): WaveRequestBatch => Object.freeze({
+    batchEpoch: DIGEST("b"),
+    specCheckDocuments: documents,
+    settledFloor,
+    requests: Object.freeze([]),
+    packets: Object.freeze([]),
+    taskRuns: Object.freeze([]),
+  });
+  const epoch = (floor?: SettledFloor): WaveReviewEpochAuthority => Object.freeze({
+    runId: RUN_ID,
+    wave: 1,
+    batchEpoch: DIGEST("b"),
+    specCheckDocuments: documents,
+    specCheckSlotAuthority: Object.freeze({ slot_id: "wave-slot:spec-check", attempted: 1 as const }),
+    ...(floor === undefined ? {} : { settledSpecCheckFloor: floor }),
+  });
+  const settled = (count: number): SettledFloor => Object.freeze({ kind: "settled", count });
+  const replay = (existing: WaveReviewEpochAuthority | undefined, floor: SettledFloor) =>
+    isExactEpochReplay(existing, batch(floor), RUN_ID, 1, "wave-slot:spec-check");
+
+  it("replays an epoch whose recorded floor matches", () => {
+    expect(replay(epoch(settled(3)), settled(3))).toBe(true);
+  });
+
+  it("refuses to replay an epoch whose recorded floor differs", () => {
+    // `batchEpoch` covers neither `spec_anchor_hashes` nor out-of-Wave
+    // `spec_anchors`, so two batches can agree on the digest and still disagree
+    // on the number the Agent would be shown. Retaining the stale one would
+    // reopen the divergence recording the floor was meant to close.
+    expect(replay(epoch(settled(3)), settled(4))).toBe(false);
+    expect(replay(epoch(settled(3)), { kind: "unprojected", reason: "no spec_file" })).toBe(false);
+  });
+
+  it("replays an epoch installed before the floor was recorded", () => {
+    // Absent is not a disagreement: it is an engine upgrade mid-Wave, and
+    // refusing it would turn that into a hard failure for no added safety.
+    expect(replay(epoch(), settled(3))).toBe(true);
+  });
+
+  it("never replays when there is no installed epoch at all", () => {
+    expect(replay(undefined, settled(3))).toBe(false);
+  });
+
+  it("refuses a different run, Wave, batch digest, documents, or spec-check slot", () => {
+    const same = batch(settled(3));
+    expect(isExactEpochReplay(epoch(settled(3)), same, OTHER_RUN_ID, 1, "wave-slot:spec-check")).toBe(false);
+    expect(isExactEpochReplay(epoch(settled(3)), same, RUN_ID, 2, "wave-slot:spec-check")).toBe(false);
+    expect(isExactEpochReplay(epoch(settled(3)), same, RUN_ID, 1, "wave-slot:other")).toBe(false);
+    expect(isExactEpochReplay(
+      { ...epoch(settled(3)), batchEpoch: DIGEST("c") },
+      same, RUN_ID, 1, "wave-slot:spec-check",
+    )).toBe(false);
+    expect(isExactEpochReplay(
+      { ...epoch(settled(3)), specCheckDocuments: {
+        spec: { path: "spec.md", contentDigest: DIGEST("f") }, plan: { path: null, contentDigest: null },
+      } },
+      same, RUN_ID, 1, "wave-slot:spec-check",
+    )).toBe(false);
   });
 });

@@ -4,6 +4,7 @@ import type {
   Task,
   TaskGraph,
   WaveSpecCheckDocumentAuthority,
+  WaveReviewEpochAuthority,
   WaveSpecCheckDocumentsAuthority,
 } from "../types";
 export type { WaveSpecCheckDocumentAuthority, WaveSpecCheckDocumentsAuthority } from "../types";
@@ -20,6 +21,7 @@ import {
   canonicalRecord,
   parseAgentRequestAuthority,
   parseArtifactDigest,
+  canonicalStructuralEquals,
   parseOrchestrationRunId,
   parseRequestId,
   parseSlotId,
@@ -32,11 +34,13 @@ import type { ReviewedWorkspaceObservation } from "./reviewed-workspace";
 import {
   projectRequirementCoverage,
   renderRequirementCoverage,
-  settledCriticalCount,
+  settledFloorOf,
+  unprojectedFloor,
   specIndexDigest,
   specIndexPath,
   type CoverageTask,
   type RecordedHash,
+  type SettledFloor,
   type SpecIndexAvailability,
 } from "./requirement-coverage";
 export type { SpecIndexAvailability } from "./requirement-coverage";
@@ -46,11 +50,14 @@ import { parseSpecContentHash } from "./parse-spec";
  * One spec-check observation: the serializable document authority together with
  * the Spec Index projected from the very bytes its digest names.
  *
- * The shell produces both from a single read, and `prepareWaveReviewBatch`
- * PROVES the pairing rather than trusting it: the index carries the digest of
- * the bytes it was parsed from, and that digest is compared with the document
- * authority's own. Declared here, where the consumer lives, and re-exported by
- * the shell producer so the contract has exactly one owner.
+ * The shell produces both from a single read. `prepareWaveReviewBatch` proves
+ * the pairing for the `indexed` arm — the index carries the digest of the bytes
+ * it was parsed from, and that digest is compared with the document authority.
+ * It does NOT prove it for the `unavailable` arm, which carries no digest and
+ * is checked on path equality alone; that arm is also the one that yields an
+ * unprojected floor, so the gap is stated here rather than overclaimed.
+ * Declared where the consumer lives, and re-exported by the shell producer so
+ * the contract has exactly one owner.
  */
 export type WaveSpecCheckObservation = Readonly<{
   authority: WaveSpecCheckDocumentsAuthority;
@@ -80,6 +87,8 @@ export type WaveTaskRunAuthority = Readonly<{
 export type WaveRequestBatch = Readonly<{
   batchEpoch: ArtifactDigest;
   specCheckDocuments: WaveSpecCheckDocumentsAuthority;
+  /** The floor derived from the exact projection rendered into this batch's packet. */
+  settledFloor: SettledFloor;
   requests: readonly InitialSpawnRequestInput[];
   packets: readonly ContextPacket[];
   taskRuns: readonly WaveTaskRunAuthority[];
@@ -521,6 +530,7 @@ export function coverageTasks(graph: TaskGraph, currentWave: number): readonly C
     id: task.id,
     inCurrentWave: task.wave === currentWave,
     completionAnchors: Object.freeze([...(task.spec_anchors ?? [])]),
+    contributions: Object.freeze([...(task.spec_contributions ?? [])]),
     declaredFiles: Object.freeze([...(task.file_list ?? [])]),
     modifiedFiles: Object.freeze([...(task.files_modified ?? [])]),
     anchorHashes: parsedAnchorHashes(task.spec_anchor_hashes),
@@ -759,6 +769,10 @@ export function prepareWaveReviewBatch(
     value: Object.freeze({
       batchEpoch: batchEpoch.value,
       specCheckDocuments,
+      // Derived from `requirementCoverage` itself - the same value the packet
+      // section above renders - so the number recorded on the epoch and the
+      // number the Agent reads are one expression, not two agreeing ones.
+      settledFloor: settledFloorOf(requirementCoverage),
       requests: Object.freeze(requests),
       packets: Object.freeze(packets),
       taskRuns: Object.freeze(taskRuns),
@@ -767,19 +781,55 @@ export function prepareWaveReviewBatch(
 }
 
 /**
- * The settled CRITICAL floor for one spec-check capture, or `null` when no
- * projection was available to floor against.
+ * The settled CRITICAL floor for one spec-check capture: the number the Agent
+ * was shown, read back from the epoch that showed it.
  *
- * The single derivation every harness uses. `reconcileSpecCheck` owns applying
- * it; this owns computing it, from the same `coverageTasks` lift the packet was
- * built from, so the number the Agent was shown and the number the engine
- * enforces come from one place.
+ * Deliberately NOT a re-projection. Re-deriving at capture time reads
+ * `spec_anchor_hashes` and the `spec_anchors` of Tasks outside the reviewed
+ * Wave, neither of which `batchEpoch` covers, so an edit between packet and
+ * capture could raise the enforced floor above the rendered one and fail a
+ * report that matched everything the Agent could see. Reading it back makes
+ * rendered and enforced the same value by construction rather than by argument.
+ *
+ * Both absences are real states, and both are stated rather than defaulted: no
+ * epoch means the capture is not packet-correlated (a legacy graph, or an
+ * operator override), and an epoch without the field predates its recording.
  */
-export function settledSpecCheckFloor(
-  specIndex: SpecIndexAvailability,
-  graph: TaskGraph,
+/**
+ * Whether an already-installed epoch is the SAME epoch this batch describes.
+ *
+ * An exact replay is idempotent and must retain the spec-check evidence
+ * captured against it; anything else invalidates that evidence. The floor
+ * participates because `batchEpoch` does not cover every input that decides it
+ * (`spec_anchor_hashes`, and the `spec_anchors` of Tasks outside the reviewed
+ * Wave), so two batches can agree on the digest and disagree on the number the
+ * Agent would be shown.
+ *
+ * An epoch with NO recorded floor is not a disagreement - it is an epoch
+ * installed before the field existed, and refusing it would turn an engine
+ * upgrade mid-Wave into a hard failure for no added safety.
+ */
+export function isExactEpochReplay(
+  existing: WaveReviewEpochAuthority | undefined,
+  batch: WaveRequestBatch,
+  runId: OrchestrationRunId,
   wave: number,
-): number | null {
-  const coverage = projectRequirementCoverage(specIndex, coverageTasks(graph, wave));
-  return coverage.kind === "projected" ? settledCriticalCount(coverage) : null;
+  specCheckSlotId: string,
+): boolean {
+  if (existing === undefined) return false;
+  return existing.runId === runId &&
+    existing.wave === wave &&
+    existing.batchEpoch === batch.batchEpoch &&
+    waveSpecCheckDocumentsMatch(existing.specCheckDocuments, batch.specCheckDocuments) &&
+    (existing.settledSpecCheckFloor === undefined ||
+      canonicalStructuralEquals(existing.settledSpecCheckFloor, batch.settledFloor)) &&
+    existing.specCheckSlotAuthority?.slot_id === specCheckSlotId;
+}
+
+export function epochSettledFloor(epoch: WaveReviewEpochAuthority | undefined): SettledFloor {
+  if (epoch === undefined) {
+    return unprojectedFloor("this capture is not packet-correlated, so the Agent was shown no projection");
+  }
+  return epoch.settledSpecCheckFloor
+    ?? unprojectedFloor("this Wave review epoch predates recorded Requirement Coverage floor authority");
 }

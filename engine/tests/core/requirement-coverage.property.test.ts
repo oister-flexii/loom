@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import fc from "fast-check";
 import { parseSpec, type ParsedSpec, type SpecContentHash } from "../../src/core/parse-spec";
+import { parseSpecCheckOutput, reconcileSpecCheck } from "../../src/core/spec-check";
 import {
   claimDecider,
   claimSeverity,
@@ -9,7 +10,7 @@ import {
   recordedAnchorHashes,
   renderRequirementCoverage,
   settledCriticalCount,
-  settledFloorProblem,
+  settledFloorOf,
   type CoverageTask,
   type RecordedHash,
   type SpecIndexAvailability,
@@ -99,6 +100,7 @@ const taskArb: fc.Arbitrary<CoverageTask> = fc
     id: fc.string({ minLength: 1, maxLength: 6 }),
     inCurrentWave: fc.boolean(),
     completionAnchors: fc.uniqueArray(claimArb, { maxLength: 6 }),
+    contributions: fc.array(fc.constantFrom(...KNOWN), { maxLength: 2 }),
     declaredFiles: fc.array(fc.string({ minLength: 1, maxLength: 8 }), { maxLength: 3 }),
     modifiedFiles: fc.array(fc.string({ minLength: 1, maxLength: 8 }), { maxLength: 3 }),
   })
@@ -206,6 +208,7 @@ describe("Requirement Coverage Projection properties", () => {
           id: "T1",
           inCurrentWave: true,
           completionAnchors: claims,
+          contributions: [],
           declaredFiles: ["src/a.ts"],
           modifiedFiles: ["src/a.ts"],
           anchorHashes,
@@ -220,24 +223,51 @@ describe("Requirement Coverage Projection properties", () => {
     ));
   });
 
-  it("the settled floor equals the CRITICAL findings the command tells the Agent to emit", () => {
+  it("the floor never counts a row the Agent is the one to decide", () => {
+    // Stated as a property of the two axes rather than by transcribing the
+    // function's body — the previous version reimplemented settledCriticalCount
+    // and could only prove it equalled its own copy.
     fc.assert(fc.property(tasksArb, (tasks) => {
       const coverage = projectRequirementCoverage(indexed, tasks);
       if (coverage.kind !== "projected") return;
-      // A Wave with no claims renders one synthetic CRITICAL row, and the floor
-      // counts it: that row names an entire Wave of work tracing to no
-      // Requirement, and it was the one settled finding an Agent could drop for
-      // free while the projection stated a floor of zero.
-      const criticalRows = coverage.rows.length === 0
-        ? 1
-        : coverage.rows.filter(({ verdict }) => claimSeverity(verdict) === "CRITICAL").length;
-      const expected = criticalRows + coverage.unclaimed.length + coverage.unclaimedScenarios.length;
-      expect(settledCriticalCount(coverage)).toBe(expected);
-      expect(settledFloorProblem(coverage, expected)).toBeNull();
-      if (expected > 0) expect(settledFloorProblem(coverage, expected - 1)).not.toBeNull();
+      const engineCriticals = coverage.rows.filter(({ verdict }) =>
+        claimDecider(verdict) === "engine" && claimSeverity(verdict) === "CRITICAL").length;
+      const unclaimed = coverage.unclaimed.length + coverage.unclaimedScenarios.length;
+      // An agent-decided CRITICAL (an altered recorded hash) has no instructed
+      // route to a CRITICAL marker line, so counting it made the floor
+      // unmeetable. The floor is blind to those rows: it is exactly the
+      // engine-decided criticals, the unclaimed identifiers, and at most the
+      // one synthetic no-traceability row.
+      const synthetic = settledCriticalCount(coverage) - engineCriticals - unclaimed;
+      expect(synthetic === 0 || synthetic === 1).toBe(true);
+      expect(coverage.rows.length === 0 || synthetic === 0).toBe(true);
     }));
   });
 
+  it("the floor is what reconcileSpecCheck actually enforces", () => {
+    // Asserted against the rule that runs, not a second copy of it. The
+    // production-dead duplicate this replaces carried these assertions while
+    // the enforced copy carried none.
+    fc.assert(fc.property(tasksArb, (tasks) => {
+      const coverage = projectRequirementCoverage(indexed, tasks);
+      if (coverage.kind !== "projected") return;
+      const floor = settledFloorOf(coverage);
+      const report = (critical: number) => reconcileSpecCheck(
+        parseSpecCheckOutput([
+          "SPEC_CHECK_WAVE: 1",
+          ...Array.from({ length: critical }, (_, at) => `CRITICAL: f${at}`),
+          `SPEC_CHECK_CRITICAL_COUNT: ${critical}`,
+          "SPEC_CHECK_HIGH_COUNT: 0",
+          `SPEC_CHECK_VERDICT: ${critical === 0 ? "PASSED" : "BLOCKED"}`,
+        ].join("\n")),
+        1, "2026-09-06T00:00:00.000Z", floor,
+      );
+      const exact = settledCriticalCount(coverage);
+      expect(report(exact).kind).toBe("captured");
+      expect(report(exact + 1).kind).toBe("captured");
+      if (exact > 0) expect(report(exact - 1).kind).toBe("evidence-failed");
+    }));
+  });
   it("renders one body row per projected row, whatever the claim text contains", () => {
     // Asserts the table's SHAPE, not substring presence: a claim carrying a
     // pipe or a newline must not become extra rows in engine-settled authority.

@@ -60,6 +60,7 @@ const task = (overrides: Partial<CoverageTask> = {}): CoverageTask => Object.fre
   id: "T1",
   inCurrentWave: true,
   completionAnchors: ["FR-001"],
+  contributions: [],
   declaredFiles: ["src/a.ts"],
   modifiedFiles: ["src/a.ts"],
   anchorHashes: new Map<string, RecordedHash>(),
@@ -140,9 +141,14 @@ describe("commands/spec-check.md is bound to the projection it consumes", () => 
     const unavailableText = renderRequirementCoverage(unavailable());
     expect(unavailableText).not.toContain("### Glossary (typed terms)");
     expect(unavailableText).not.toContain("### Out of Scope (typed exclusion list)");
-    const steps = command.slice(command.indexOf("### Step 2"));
     for (const step of ["### Step 2", "### Step 5", "### Step 6", "### Step 7"]) {
-      const body = steps.slice(steps.indexOf(step), steps.indexOf(step) + 1400);
+      // Sliced to the NEXT heading, never a fixed width: a step that grows past
+      // an arbitrary character budget would otherwise start failing for having
+      // gained prose, and one that shrinks would start passing on its neighbour.
+      const start = command.indexOf(step);
+      expect(start, `${step} must exist`).toBeGreaterThan(-1);
+      const after = command.indexOf("\n### ", start + step.length);
+      const body = command.slice(start, after === -1 ? command.length : after);
       expect(body, `${step} must state an Unprojected fallback`).toContain("**Unprojected:**");
     }
   });

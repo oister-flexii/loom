@@ -1,3 +1,4 @@
+import type { SettledFloor } from "./requirement-coverage";
 import { isNoFindingSentinel } from "../utils/no-finding-sentinel";
 import type { AgentRequestAuthority } from "./orchestration-contract";
 import {
@@ -5,6 +6,7 @@ import {
   type CapturedSpecCheck,
   type EvidenceFailedSpecCheck,
   type SpecCheck,
+  type SpecCheckEvidenceFailureCause,
   type SpecCheckVerdict,
   type TaskGraph,
   type WaveSpecCheckDocumentsAuthority,
@@ -206,9 +208,33 @@ export function decideSpecCheckManualOverride(
     : Object.freeze({ kind: "allowed", reason: overrideReason });
 }
 
-const evidenceFailure = (wave: number, runAt: string, error: string): SpecCheckResolution => ({
+/**
+ * Whether a durably captured spec-check transcript still needs semantic
+ * re-application after a crash window.
+ *
+ * The Wave Gate resume loop writes transcript bytes to disk before applying
+ * them, so it must re-apply anything whose durable capture is not reflected in
+ * protected state. A `settled-floor` failure is the one case where re-applying
+ * is not recovery but erasure: the transcript parsed, the floor is recorded on
+ * the epoch and cannot move, and re-running the same bytes against the same
+ * floor can only reach the same refusal - so a re-application can do nothing
+ * but overwrite a decided answer, which is how a refusal could disappear and
+ * the resume end as `PASSED`.
+ */
+export function specCheckNeedsReapplication(specCheck: SpecCheck | undefined, wave: number): boolean {
+  if (specCheck === undefined || specCheck.wave !== wave) return true;
+  if (specCheck.verdict !== "EVIDENCE_CAPTURE_FAILED") return false;
+  return specCheck.cause === "transcript";
+}
+
+const evidenceFailure = (
+  wave: number,
+  runAt: string,
+  error: string,
+  cause: SpecCheckEvidenceFailureCause,
+): SpecCheckResolution => ({
   kind: "evidence-failed",
-  specCheck: { wave, run_at: runAt, verdict: "EVIDENCE_CAPTURE_FAILED", error },
+  specCheck: { wave, run_at: runAt, verdict: "EVIDENCE_CAPTURE_FAILED", error, cause },
 });
 
 /**
@@ -225,38 +251,42 @@ const evidenceFailure = (wave: number, runAt: string, error: string): SpecCheckR
  * its unfloored path precisely BECAUSE the floor had written
  * `EVIDENCE_CAPTURE_FAILED`, erasing the refusal it had just recorded.
  *
- * `null` means no projection was available to floor against. That is a real
- * state — no spec file, or a specification that no longer parses — and it is
- * not a pass: the Agent is then on the Unprojected path, where the command
- * requires it to say so.
+ * The parameter is REQUIRED and is an ADT, not a nullable number, so an
+ * unfloored settlement cannot be reached by omission — which is exactly how a
+ * fourth settlement path shipped unenforced while a hand-maintained list of
+ * three claimed totality. `unprojected` states WHY no floor applies (no spec
+ * file, a specification that no longer parses, or a capture the Agent received
+ * no packet for) instead of leaving an absent argument to mean it.
  */
 export function reconcileSpecCheck(
   parsed: ParsedSpecCheckOutput,
   wave: number,
   runAt: string,
-  settledFloor: number | null = null,
+  settledFloor: SettledFloor,
 ): SpecCheckResolution {
   if (parsed.duplicateMarkers.length > 0) {
     return evidenceFailure(
       wave,
       runAt,
       `${parsed.duplicateMarkers.join(", ")} marker appears more than once in the authoritative footer - re-run /wave-gate`,
+      "transcript",
     );
   }
   if (parsed.criticalCount === null) {
-    return evidenceFailure(wave, runAt, "SPEC_CHECK_CRITICAL_COUNT marker not found - re-run /wave-gate");
+    return evidenceFailure(wave, runAt, "SPEC_CHECK_CRITICAL_COUNT marker not found - re-run /wave-gate", "transcript");
   }
   if (parsed.highCount === null) {
-    return evidenceFailure(wave, runAt, "SPEC_CHECK_HIGH_COUNT marker not found - re-run /wave-gate");
+    return evidenceFailure(wave, runAt, "SPEC_CHECK_HIGH_COUNT marker not found - re-run /wave-gate", "transcript");
   }
   if (parsed.verdict === null) {
-    return evidenceFailure(wave, runAt, "SPEC_CHECK_VERDICT marker not found - re-run /wave-gate");
+    return evidenceFailure(wave, runAt, "SPEC_CHECK_VERDICT marker not found - re-run /wave-gate", "transcript");
   }
   if (parsed.criticalCount !== parsed.critical.length) {
     return evidenceFailure(
       wave,
       runAt,
       `SPEC_CHECK_CRITICAL_COUNT (${parsed.criticalCount}) does not match CRITICAL: findings (${parsed.critical.length}); counts must match the findings - re-run /wave-gate`,
+      "transcript",
     );
   }
   const highCount = parsed.highCount;
@@ -265,17 +295,19 @@ export function reconcileSpecCheck(
       wave,
       runAt,
       `SPEC_CHECK_HIGH_COUNT (${highCount}) does not match HIGH: findings (${parsed.high.length}); counts must match the findings - re-run /wave-gate`,
+      "transcript",
     );
   }
   // Last, so a malformed footer is reported as malformed rather than as a
   // floor violation. A floor, never an equality: the Agent is expected to ADD
   // findings its own reading turns up; it may never subtract the engine's.
-  if (settledFloor !== null && parsed.criticalCount < settledFloor) {
+  if (settledFloor.kind === "settled" && parsed.criticalCount < settledFloor.count) {
     return evidenceFailure(
       wave,
       runAt,
-      `spec-check reported ${parsed.criticalCount} CRITICAL but the Requirement Coverage Projection settled ` +
-      `${settledFloor}; settled rows are decided by structure and are not the Agent's to drop - re-run /wave-gate`,
+      `spec-check reported ${parsed.criticalCount} CRITICAL but the Requirement Coverage Projection settled ${settledFloor.count}` +
+      `; settled rows are decided by structure and are not the Agent's to drop - re-run /wave-gate`,
+      "settled-floor",
     );
   }
   const verdict = parsed.verdict === "EVIDENCE_CAPTURE_FAILED" ? "UNKNOWN" : parsed.verdict;
@@ -318,19 +350,37 @@ export function parseStoredSpecCheck(raw: unknown): SpecCheckParseResult {
   }
   if (errors.length > 0 || verdict === null) return { ok: false, errors };
 
-  if (verdict === "EVIDENCE_CAPTURE_FAILED") {
-    if (typeof spec.error !== "string" || spec.error.trim() === "") {
-      errors.push("spec_check.error must be a non-empty string when evidence capture failed");
-    }
-    for (const field of ["critical_count", "high_count", "critical_findings", "high_findings", "medium_findings"] as const) {
-      if (spec[field] !== undefined) errors.push(`spec_check.${field} must be absent when evidence capture failed`);
-    }
-    return errors.length > 0
-      ? { ok: false, errors }
-      : { ok: true, value: freshEvidenceFailed(spec, verdict) };
-  }
+  return verdict === "EVIDENCE_CAPTURE_FAILED"
+    ? parseFailedSpecCheck(spec, verdict)
+    : parseCapturedSpecCheck(spec, verdict);
+}
 
+/** The evidence-failed arm: a cause and an operator message, and no counts. */
+function parseFailedSpecCheck(
+  spec: Record<string, unknown>,
+  verdict: "EVIDENCE_CAPTURE_FAILED",
+): SpecCheckParseResult {
+  const errors: string[] = [];
+  if (typeof spec.error !== "string" || spec.error.trim() === "") {
+    errors.push("spec_check.error must be a non-empty string when evidence capture failed");
+  }
+  if (spec.cause !== undefined && spec.cause !== "transcript" && spec.cause !== "settled-floor") {
+    errors.push(`spec_check.cause ${JSON.stringify(spec.cause)} is not recognized`);
+  }
+  for (const field of ["critical_count", "high_count", "critical_findings", "high_findings", "medium_findings"] as const) {
+    if (spec[field] !== undefined) errors.push(`spec_check.${field} must be absent when evidence capture failed`);
+  }
+  return errors.length > 0 ? { ok: false, errors } : { ok: true, value: freshEvidenceFailed(spec, verdict) };
+}
+
+/** The captured arm: counts that must agree with the findings they summarize. */
+function parseCapturedSpecCheck(
+  spec: Record<string, unknown>,
+  verdict: Exclude<SpecCheckVerdict, "EVIDENCE_CAPTURE_FAILED">,
+): SpecCheckParseResult {
+  const errors: string[] = [];
   if (spec.error !== undefined) errors.push("spec_check.error must be absent when evidence capture succeeded");
+  if (spec.cause !== undefined) errors.push("spec_check.cause must be absent when evidence capture succeeded");
   if (!count(spec.critical_count)) errors.push("spec_check.critical_count must be a non-negative integer");
   if (!count(spec.high_count)) errors.push("spec_check.high_count must be a non-negative integer");
   if (!stringArray(spec.critical_findings)) errors.push("spec_check.critical_findings must be an array of strings");
@@ -348,9 +398,7 @@ export function parseStoredSpecCheck(raw: unknown): SpecCheckParseResult {
   if (spec.high_count !== highFindings.length) {
     errors.push(`spec_check.high_count (${spec.high_count}) must equal high_findings.length (${highFindings.length})`);
   }
-  return errors.length > 0
-    ? { ok: false, errors }
-    : { ok: true, value: freshCaptured(spec, verdict) };
+  return errors.length > 0 ? { ok: false, errors } : { ok: true, value: freshCaptured(spec, verdict) };
 }
 
 /**
@@ -388,5 +436,9 @@ function freshEvidenceFailed(
     run_at: spec.run_at as string,
     verdict,
     error: spec.error as string,
+    // Absent is not unknown: every failure written before the floor existed was
+    // a transcript failure, so the historical shape has exactly one meaning and
+    // the parse boundary is where it becomes total.
+    cause: spec.cause === "settled-floor" ? "settled-floor" : "transcript",
   });
 }

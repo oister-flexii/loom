@@ -1778,6 +1778,99 @@ describe("orchestration CLI", () => {
     expect(verdict.diagnostic?.message.length).toBeGreaterThan(0);
   }, 30_000);
 
+  it("refuses a below-floor spec-check through the facade and keeps the refusal across resumes", async () => {
+    // Two gaps in one end-to-end path. Every other fixture here records
+    // `spec_file: null`, so the facade's floor had never once been exercised
+    // behaviourally - the suite would have stayed green with the enforcement
+    // removed. And the resume loop re-applies a durable capture exactly when
+    // the recorded verdict is EVIDENCE_CAPTURE_FAILED, which is what a floor
+    // violation writes, so the refusal used to be overwritten in place.
+    const root = repository();
+    const proof = evaluateTaskProof(
+      { newTestsRequired: true, declaredArtifacts: ["src/x.ts"] },
+      { taskCompleted: true, testResult: { verdict: "trusted-pass" }, filesModified: ["src/x.ts"], newTestsWritten: true },
+    );
+    writeFileSync(join(root, "src-x.ts"), "export const x = 1;\n");
+    const specPath = join(root, "spec.md");
+    writeFileSync(specPath, [
+      "# Feature: Floored",
+      "",
+      "## User Scenarios",
+      "",
+      "### US1: [P1] Enforce the floor at the facade",
+      "",
+      "**Acceptance Scenarios:**",
+      "- AS-001: Given a settled row, When the Agent drops it, Then evidence capture fails",
+      "",
+      "## Functional Requirements",
+      "",
+      "- FR-001: System MUST floor the reported CRITICAL count at the settled count",
+      "",
+      "## Out of Scope",
+      "",
+      "- OOS-001: Symbol-level source indexing",
+      "",
+      "## Appendix: Glossary",
+      "",
+      "| Term | Definition |",
+      "|------|------------|",
+      "| Spec Index | A deterministic projection of specification entries |",
+      "",
+    ].join("\n"));
+    const statePath = join(root, ".claude", "state", "active_task_graph.json");
+    writeFileSync(statePath, JSON.stringify({
+      spec_trace_version: 2,
+      current_phase: "execute", current_wave: 1, phase_artifacts: {}, skipped_phases: [],
+      spec_file: specPath, plan_file: null, wave_gates: {}, tasks: [{
+        id: "T1", description: "claims an undefined Requirement", agent: "code-implementer-agent", wave: 1,
+        status: "implemented", proof, depends_on: [], file_list: ["src/x.ts"], files_modified: ["src/x.ts"],
+        spec_anchors: ["FR-404"], spec_contributions: [],
+        test_result: { verdict: "trusted-pass" }, test_evidence: "passed", new_tests_written: true,
+        new_test_evidence: "present", review_status: "passed", review_generation: 0,
+        findings: [], critical_findings: [], advisory_findings: [],
+      }],
+    }));
+    const runsRoot = realpathSync.native(mkdtempSync(join(tmpdir(), "loom-wave-facade-floor-runs-")));
+    cleanup.push(runsRoot);
+    const runDir = join(runsRoot, "run.wave-facade-floor");
+    mkdirSync(runDir);
+    const started = runCli(["start", "wave-gate", "--runs-root", runsRoot, "--run", runDir], JSON.stringify({ wave: 1 }), root);
+    expect(started.status, started.stderr).toBe(0);
+    const initial = JSON.parse(started.stdout) as { kind: string; requests: readonly { authority: AgentRequestAuthority }[] };
+    expect(initial.kind, started.stdout).toBe("spawn-batch");
+
+    // The epoch records the floor the packet rendered: FR-404 is an unknown
+    // Requirement, and FR-001 and AS-001 go unclaimed. Three settled rows.
+    const epochFloor = (JSON.parse(readFileSync(statePath, "utf8")) as {
+      wave_review_epoch?: { settledSpecCheckFloor?: { kind: string; count?: number } };
+    }).wave_review_epoch?.settledSpecCheckFloor;
+    expect(epochFloor).toEqual({ kind: "settled", count: 3 });
+
+    const opened = openRunDirectory(runsRoot, runDir);
+    if (!opened.ok) throw new Error(opened.error.message);
+    const specCheck = initial.requests
+      .find(({ authority }) => authority.role === "spec-check-invoker" && authority.attempt === 1)!.authority;
+    expect((await opened.value.captureTranscript(specCheck, [...Buffer.from(
+      "SPEC_CHECK_WAVE: 1\nSPEC_CHECK_CRITICAL_COUNT: 0\nSPEC_CHECK_HIGH_COUNT: 0\nSPEC_CHECK_VERDICT: PASSED")])).ok).toBe(true);
+
+    const firstResume = runCli(["resume", "--runs-root", runsRoot, "--run", runDir], "", root);
+    expect(firstResume.status, firstResume.stderr).toBe(0);
+    const refused = (JSON.parse(readFileSync(statePath, "utf8")) as {
+      spec_check?: { verdict: string; cause?: string; error?: string; run_at: string };
+    }).spec_check;
+    expect(refused).toMatchObject({ verdict: "EVIDENCE_CAPTURE_FAILED", cause: "settled-floor" });
+    expect(String(refused?.error)).toContain("the Requirement Coverage Projection settled 3");
+
+    const secondResume = runCli(["resume", "--runs-root", runsRoot, "--run", runDir], "", root);
+    expect(secondResume.status, secondResume.stderr).toBe(0);
+    const afterResume = (JSON.parse(readFileSync(statePath, "utf8")) as {
+      spec_check?: { verdict: string; cause?: string; run_at: string };
+    }).spec_check;
+    // Byte-identical, `run_at` included: the refusal was not re-decided, and a
+    // fresh timestamp would mean the loop had re-entered and rewritten it.
+    expect(afterResume).toEqual(refused);
+  }, 30_000);
+
   it("advances a capture-rejected Wave reviewer attempt 1 to diagnostic-rich attempt 2", async () => {
     const root = repository();
     const proof = evaluateTaskProof(

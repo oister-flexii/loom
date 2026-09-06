@@ -2335,6 +2335,7 @@ export default function (pi: ExtensionAPI) {
                       run_at: runAt,
                       verdict: "EVIDENCE_CAPTURE_FAILED" as const,
                       error: `reserved spec-check result ${missing.index + 1} for spec-check-invoker was missing or mismatched`,
+                      cause: "transcript" as const,
                     },
                   };
                 }

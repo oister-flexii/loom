@@ -68,6 +68,7 @@ import {
   parseTaskTestResult,
 } from "./core/proof-obligations";
 import { parseDeclaredArtifactBaseline } from "./core/artifact-baseline";
+import { parseSettledFloor } from "./core/requirement-coverage";
 import { parseStoredSpecCheck } from "./core/spec-check";
 import { waveHasBlockCause } from "./core/wave-gate-model";
 import { parseIssuedReviewPacketRegistration, parseReviewPath } from "./core/review-packet";
@@ -436,7 +437,7 @@ function exactFieldsError(
 }
 
 const WAVE_REVIEW_EPOCH_FIELDS = ["runId", "wave", "batchEpoch"] as const;
-const WAVE_REVIEW_EPOCH_OPTIONAL_FIELDS = ["specCheckDocuments", "specCheckSlotAuthority"] as const;
+const WAVE_REVIEW_EPOCH_OPTIONAL_FIELDS = ["specCheckDocuments", "specCheckSlotAuthority", "settledSpecCheckFloor"] as const;
 
 function parseWaveSpecCheckDocument(
   raw: unknown,
@@ -546,6 +547,14 @@ function parseWaveReviewEpoch(raw: unknown): ParseResult<WaveReviewEpochAuthorit
   if (!specCheckDocuments.ok) return specCheckDocuments;
   const specCheckSlotAuthority = parseWaveSpecCheckSlotAuthority(record.specCheckSlotAuthority);
   if (!specCheckSlotAuthority.ok) return specCheckSlotAuthority;
+  // Absent is a historical epoch and stays absent; present-but-unrecognized is
+  // corruption and must not silently degrade the floor to "no floor".
+  const settledSpecCheckFloor = record.settledSpecCheckFloor === undefined
+    ? null
+    : parseSettledFloor(record.settledSpecCheckFloor);
+  if (record.settledSpecCheckFloor !== undefined && settledSpecCheckFloor === null) {
+    return parseErr("wave_review_epoch.settledSpecCheckFloor is not a recognized settled floor");
+  }
   return parseOk(Object.freeze({
     runId: runId.value,
     wave: wave.value,
@@ -554,6 +563,7 @@ function parseWaveReviewEpoch(raw: unknown): ParseResult<WaveReviewEpochAuthorit
     ...(specCheckSlotAuthority.value === undefined
       ? {}
       : { specCheckSlotAuthority: specCheckSlotAuthority.value }),
+    ...(settledSpecCheckFloor === null ? {} : { settledSpecCheckFloor }),
   }));
 }
 

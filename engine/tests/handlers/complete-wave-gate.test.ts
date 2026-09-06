@@ -527,6 +527,7 @@ describe("checkSpecAlignment (pure)", () => {
         run_at: "",
         verdict: "EVIDENCE_CAPTURE_FAILED",
         error: "SPEC_CHECK_CRITICAL_COUNT marker not found",
+        cause: "transcript",
       },
     });
 
@@ -547,6 +548,7 @@ describe("checkSpecAlignment (pure)", () => {
         run_at: "",
         verdict: "EVIDENCE_CAPTURE_FAILED",
         error: "transcript truncated",
+        cause: "transcript",
       },
     });
 

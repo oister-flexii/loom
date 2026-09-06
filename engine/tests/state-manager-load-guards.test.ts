@@ -453,6 +453,29 @@ describe("parseTaskGraph wave_review_epoch authority", () => {
     }))).toContain("paths must match spec_file/plan_file");
   });
 
+  it.each([
+    ["settled", { kind: "settled", count: 3 }],
+    ["unprojected", { kind: "unprojected", reason: "the TaskGraph records no spec_file" }],
+  ])("round-trips and freezes a %s Requirement Coverage floor", (_label, floor) => {
+    const parsed = parseTaskGraph(graph({
+      current_wave: 1,
+      wave_review_epoch: waveReviewEpoch({ settledSpecCheckFloor: floor }),
+    }));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.wave_review_epoch?.settledSpecCheckFloor).toEqual(floor);
+    expect(isDeeplyFrozen(parsed.value.wave_review_epoch?.settledSpecCheckFloor)).toBe(true);
+  });
+
+  it("keeps an epoch installed before the floor was recorded readable", () => {
+    // Absent is a historical fact, not corruption; `epochSettledFloor` is where
+    // that absence acquires its stated meaning.
+    const parsed = parseTaskGraph(graph({ current_wave: 1, wave_review_epoch: waveReviewEpoch() }));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.wave_review_epoch?.settledSpecCheckFloor).toBeUndefined();
+  });
+
   it("keeps historical epochs readable without spec-check slot authority", () => {
     const legacy = waveReviewEpoch();
     const { specCheckSlotAuthority: _absent, ...withoutSlotAuthority } = legacy;
@@ -474,6 +497,15 @@ describe("parseTaskGraph wave_review_epoch authority", () => {
     ["bad spec-check attempt", waveReviewEpoch({ specCheckSlotAuthority: { slot_id: "wave-slot:spec-check", attempted: 3 } })],
     ["surplus spec-check slot field", waveReviewEpoch({ specCheckSlotAuthority: { slot_id: "wave-slot:spec-check", attempted: 1, forged: true } })],
     ["unknown field", waveReviewEpoch({ forged: true })],
+    // A corrupt floor must not degrade to "no floor": that would silently
+    // unfloor a live epoch, which is the exact failure recording it prevents.
+    ["forged settled floor", waveReviewEpoch({ settledSpecCheckFloor: "forged" })],
+    ["unknown floor variant", waveReviewEpoch({ settledSpecCheckFloor: { kind: "waived" } })],
+    ["settled floor with no count", waveReviewEpoch({ settledSpecCheckFloor: { kind: "settled" } })],
+    ["negative settled floor", waveReviewEpoch({ settledSpecCheckFloor: { kind: "settled", count: -1 } })],
+    ["non-integer settled floor", waveReviewEpoch({ settledSpecCheckFloor: { kind: "settled", count: 1.5 } })],
+    ["unprojected floor with no reason", waveReviewEpoch({ settledSpecCheckFloor: { kind: "unprojected" } })],
+    ["unprojected floor with a blank reason", waveReviewEpoch({ settledSpecCheckFloor: { kind: "unprojected", reason: "  " } })],
   ])("refuses %s", (_label, epoch) => {
     expect(errorOf(graph({ wave_review_epoch: epoch }))).toContain("wave_review_epoch");
   });

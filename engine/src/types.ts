@@ -25,6 +25,7 @@ import type {
 } from "./core/completion-suite";
 import type { FrozenVerificationManifest } from "./core/verification-manifest";
 import type { Phase } from "./core/phases";
+import type { SettledFloor } from "./core/requirement-coverage";
 export type { IssuedReviewPacketRegistration } from "./core/review-packet";
 export { PHASES, type Phase } from "./core/phases";
 import type {
@@ -637,10 +638,25 @@ export type CapturedSpecCheck = Readonly<SpecCheckBase & {
   error?: never;
 }>;
 
+/**
+ * Why a spec-check capture failed, as a closed set rather than prose.
+ *
+ * `transcript` is a capture the harness could not read or whose footer does not
+ * parse: re-applying the same bytes is exactly what the Wave Gate resume loop
+ * exists to do. `settled-floor` is a DECIDED refusal - the transcript parsed
+ * perfectly and reported fewer CRITICAL findings than the Requirement Coverage
+ * Projection had already settled. Re-applying it cannot change that answer, and
+ * the resume loop overwriting the refusal with a fresh `PASSED` is the defect
+ * this distinction closes. The `error` string is for operators; this is the
+ * field control flow is allowed to branch on.
+ */
+export type SpecCheckEvidenceFailureCause = "transcript" | "settled-floor";
+
 /** A failed capture carries a cause and cannot masquerade as usable counts. */
 export type EvidenceFailedSpecCheck = Readonly<SpecCheckBase & {
   verdict: "EVIDENCE_CAPTURE_FAILED";
   error: string;
+  cause: SpecCheckEvidenceFailureCause;
   critical_count?: never;
   high_count?: never;
   critical_findings?: never;
@@ -1065,6 +1081,17 @@ export interface WaveReviewEpochAuthority {
    * epochs and while modern task-attempt invalidation awaits reissuance; exact
    * recovery refuses to infer it from evidence. */
   readonly specCheckSlotAuthority?: WaveSpecCheckSlotAuthority;
+  /**
+   * The settled CRITICAL floor rendered into this epoch's spec-check packet.
+   *
+   * Recorded at installation because it is the ONLY number the Agent was
+   * actually shown. Re-projecting it at capture time reads `spec_anchor_hashes`
+   * and out-of-Wave `spec_anchors` that no epoch digest covers, so the enforced
+   * count could drift above the rendered one and fail an honest report. Absent
+   * on epochs installed before this field existed; `epochSettledFloor` is the
+   * only reader, and it maps that absence to a stated `unprojected` floor.
+   */
+  readonly settledSpecCheckFloor?: SettledFloor;
 }
 
 export interface TaskGraph {

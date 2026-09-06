@@ -124,6 +124,11 @@ export type CoverageTask = Readonly<{
   id: string;
   inCurrentWave: boolean;
   completionAnchors: readonly string[];
+  /** Partial Requirement Contributions. Carried because a Wave that claims no
+   * completion but contributes to a later one is a legitimate shape in this
+   * domain: without this field the projection cannot tell it apart from a Wave
+   * that traces nowhere, and asserted the latter about the former. */
+  contributions: readonly string[];
   declaredFiles: readonly string[];
   modifiedFiles: readonly string[];
   anchorHashes: ReadonlyMap<string, RecordedHash>;
@@ -145,6 +150,10 @@ export type RequirementCoverage =
        * roster of scenarios to check coverage for, and the step that exists to
        * find uncovered scenarios silently iterates nothing. */
       unclaimedScenarios: readonly SpecEntryId<"AS">[];
+      /** Whether this Wave traces to any Requirement at all through partial
+       * Contributions, when it claims no completions. Distinguishes a
+       * legitimate foundation Wave from work that traces nowhere. */
+      tracesByContribution: boolean;
       /** The typed exclusion list, replacing a grep of the Out of Scope section. */
       exclusions: NonEmpty<SpecEntry<"OOS">>;
       /** The typed glossary, replacing a grep of the Appendix table. */
@@ -244,6 +253,7 @@ export function projectRequirementCoverage(
   return Object.freeze({
     kind: "projected",
     rows: Object.freeze(rows),
+    tracesByContribution: tasks.some((task) => task.inCurrentWave && task.contributions.length > 0),
     unclaimed: unclaimedOf(specIndex.index.frs),
     unclaimedScenarios: unclaimedOf(specIndex.index.scenarios),
     exclusions: specIndex.index.oos,
@@ -309,14 +319,84 @@ export function claimSeverity(verdict: ClaimVerdict): ClaimSeverity {
  */
 export function settledCriticalCount(coverage: RequirementCoverage): number {
   if (coverage.kind === "unavailable") return 0;
-  // A Wave that claims nothing renders one synthetic CRITICAL row, and it is
-  // the whole point of that row that the floor covers it: the defect it names —
-  // an entire Wave of work tracing to no Requirement — was otherwise the one
-  // CRITICAL an Agent could drop for free.
-  const criticalRows = coverage.rows.length === 0
-    ? 1
-    : coverage.rows.filter((row) => claimSeverity(row.verdict) === "CRITICAL").length;
-  return criticalRows + coverage.unclaimed.length + coverage.unclaimedScenarios.length;
+  // By DECIDER, not by severity. Severity says how bad a structural fact is;
+  // the decider says who owes the verdict. Counting by severity swept in
+  // `agent`-decided rows — an altered recorded hash grades CRITICAL, yet the
+  // command tells the Agent to assess it and emit PASS or FAIL — so the floor
+  // demanded a marker line no instruction produces and no compliant transcript
+  // could clear it. The floor may contain only what the command instructs the
+  // Agent to emit as a `CRITICAL:` line.
+  const engineCriticals = coverage.rows.filter((row) =>
+    claimDecider(row.verdict) === "engine" && claimSeverity(row.verdict) === "CRITICAL").length;
+  // A Wave that traces nowhere at all renders one synthetic CRITICAL and the
+  // floor covers it. A Wave that traces only through Requirement Contributions
+  // is a legitimate shape in this domain — it renders as such and must NOT be
+  // floored, or the Agent would have to substantiate a finding that is false.
+  const syntheticCritical = coverage.rows.length === 0 && !coverage.tracesByContribution ? 1 : 0;
+  return engineCriticals + syntheticCritical + coverage.unclaimed.length + coverage.unclaimedScenarios.length;
+}
+
+/**
+ * The settled floor as it travels to a settlement path.
+ *
+ * A closed ADT rather than `number | null`, and non-optional wherever it is
+ * consumed, for one reason: an unfloored settlement must be unrepresentable.
+ * The nullable default it replaces meant a caller that never passed an argument
+ * settled unenforced — which is exactly how a fourth settlement path shipped
+ * silently while a hand-maintained list of three claimed totality. A list is
+ * not a closure; a required parameter is.
+ *
+ * `unprojected` is a real, honest state — no spec file, a specification that no
+ * longer parses, or a capture the Agent received no packet for — and it carries
+ * WHY, so the absence is stated rather than inferred from a missing argument.
+ */
+export type SettledFloor =
+  | Readonly<{ kind: "settled"; count: number }>
+  | Readonly<{ kind: "unprojected"; reason: string }>;
+
+/** The only mint for a settled floor: a coverage projection decides it. */
+export function settledFloorOf(coverage: RequirementCoverage): SettledFloor {
+  return coverage.kind === "projected"
+    ? Object.freeze({ kind: "settled", count: settledCriticalCount(coverage) })
+    : Object.freeze({ kind: "unprojected", reason: specIndexUnavailableMessage(coverage.reason) });
+}
+
+/**
+ * The floor for a capture that was never packet-correlated.
+ *
+ * A legacy or unregistered capture ran with no `LOOM_CONTEXT_PATH`, so the
+ * Agent was on the Unprojected path and saw no settled count. Flooring it
+ * against a number derived from the live graph failed honest reports against
+ * evidence they were never shown.
+ */
+export function unprojectedFloor(reason: string): SettledFloor {
+  return Object.freeze({ kind: "unprojected", reason });
+}
+
+/**
+ * Parse a persisted settled floor back into its ADT. `null` for anything else.
+ *
+ * Keyed by variant rather than written as an if-chain: the `Record` is typed
+ * over `SettledFloor["kind"]`, so adding a third variant fails to compile here
+ * instead of silently parsing as `null` and unfloring every restored epoch.
+ */
+const FLOOR_VARIANTS: Readonly<Record<SettledFloor["kind"], (record: Record<string, unknown>) => SettledFloor | null>> =
+  Object.freeze({
+    settled: (record) => typeof record.count === "number" && Number.isInteger(record.count) && record.count >= 0
+      ? Object.freeze({ kind: "settled" as const, count: record.count })
+      : null,
+    unprojected: (record) => typeof record.reason === "string" && record.reason.trim() !== ""
+      ? Object.freeze({ kind: "unprojected" as const, reason: record.reason })
+      : null,
+  });
+
+export function parseSettledFloor(raw: unknown): SettledFloor | null {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  const record = raw as Record<string, unknown>;
+  const variant = typeof record.kind === "string"
+    ? FLOOR_VARIANTS[record.kind as SettledFloor["kind"]]
+    : undefined;
+  return variant === undefined ? null : variant(record);
 }
 
 /**
@@ -367,14 +447,6 @@ function requirementText(verdict: ClaimVerdict): string {
   return verdict.kind === "unknown-requirement" ? "—" : verdict.entry.content;
 }
 
-/**
- * The Requirement Coverage Projection as the spec-check Agent reads it.
- *
- * Deterministic text: the same projection always renders the same bytes, so the
- * rendering contributes to Context Packet identity like any other frozen input.
- * The `Decided by` column, not the severity, says which rows the Agent still
- * has work to do on.
- */
 /** The honest-absence rendering: what is NOT carried is as load-bearing as what is. */
 function renderUnavailable(reason: SpecIndexUnavailable): readonly string[] {
   return [
@@ -389,12 +461,19 @@ function renderUnavailable(reason: SpecIndexUnavailable): readonly string[] {
   ];
 }
 
-function renderRows(rows: readonly CoverageRow[]): readonly string[] {
+function renderRows(rows: readonly CoverageRow[], tracesByContribution: boolean): readonly string[] {
   if (rows.length === 0) {
-    // A Wave whose Tasks claim nothing is a decompose defect, not a quiet pass:
-    // an entire Wave of work then traces to no Requirement at all.
-    return ["| — | — | engine | CRITICAL | — |" +
-      " this Wave's Tasks make no Requirement Completion Claims, so no work in this Wave traces to a Requirement |"];
+    // Two different facts, and only one of them is a defect. A Wave that traces
+    // NOWHERE is a decompose defect and settles CRITICAL. A Wave that traces
+    // only through Requirement Contributions is a legitimate foundation Wave —
+    // CONTEXT.md defines Contributions as exactly that — and asserting the
+    // first about the second forced the Agent to substantiate a finding that
+    // was false, with no remedy available to it.
+    return tracesByContribution
+      ? ["| — | — | engine | NONE | — |" +
+          " this Wave's Tasks claim no Requirement completion; they trace through Requirement Contributions, which is a legitimate foundation Wave |"]
+      : ["| — | — | engine | CRITICAL | — |" +
+          " this Wave's Tasks make no Requirement Completion Claims and no Contributions, so no work in this Wave traces to a Requirement |"];
   }
   return rows.map((row) => [
     "|", cell(row.taskId),
@@ -418,6 +497,14 @@ function renderUnclaimed(heading: string, family: string, ids: readonly string[]
   ];
 }
 
+/**
+ * The Requirement Coverage Projection as the spec-check Agent reads it.
+ *
+ * Deterministic text: the same projection always renders the same bytes, so the
+ * rendering contributes to Context Packet identity like any other frozen input.
+ * The `Decided by` column, not the severity, says which rows the Agent still
+ * has work to do on.
+ */
 export function renderRequirementCoverage(coverage: RequirementCoverage): string {
   if (coverage.kind === "unavailable") return renderUnavailable(coverage.reason).join("\n");
   return [
@@ -430,7 +517,7 @@ export function renderRequirementCoverage(coverage: RequirementCoverage): string
     "",
     "| Task | Claim | Decided by | Severity | Requirement | Detail |",
     "|---|---|---|---|---|---|",
-    ...renderRows(coverage.rows),
+    ...renderRows(coverage.rows, coverage.tracesByContribution),
     "",
     ...renderUnclaimed("Functional Requirements", "Functional Requirement", coverage.unclaimed),
     ...renderUnclaimed("Acceptance Scenarios", "Acceptance Scenario", coverage.unclaimedScenarios),
@@ -495,25 +582,4 @@ export function specIndexPath(availability: SpecIndexAvailability): string | nul
 /** The digest of the bytes an available index was parsed from; `null` otherwise. */
 export function specIndexDigest(availability: SpecIndexAvailability): string | null {
   return availability.kind === "indexed" ? availability.contentDigest : null;
-}
-
-/**
- * Whether a spec-check report honours the floor the projection already set.
- *
- * The projection settles verdicts from structure and then hands them to a model
- * as text. Without this check that hand-off is the end of the story: an Agent
- * that summarizes the coverage section instead of copying it can report zero
- * CRITICAL findings, and the Wave Gate opens on the model's own arithmetic
- * while the engine holds the proof it should not have. `null` means the report
- * may stand; a string names the exact shortfall.
- *
- * Deliberately a floor, not an equality: the Agent is expected to ADD findings
- * its own reading turns up. It may never subtract the engine's.
- */
-export function settledFloorProblem(coverage: RequirementCoverage, reportedCritical: number): string | null {
-  const floor = settledCriticalCount(coverage);
-  return reportedCritical >= floor
-    ? null
-    : `spec-check reported ${reportedCritical} CRITICAL but the Requirement Coverage Projection settled ${floor}; ` +
-      "settled rows are decided by structure and are not the Agent's to drop";
 }

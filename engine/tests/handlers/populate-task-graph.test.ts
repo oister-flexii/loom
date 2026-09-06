@@ -793,6 +793,67 @@ describe("populate-task-graph — one spec_file precedence", () => {
     expect(resolvedSpecFile(undefined, undefined)).toBeNull();
   });
 
+  it("refuses to stamp prepared hashes when spec_file changes before the lock", async () => {
+    // The guard itself, not just the derivation it uses. The Spec Index is read
+    // BEFORE the lock; if the locked graph names a different specification, the
+    // prepared hashes describe another document, and stamping them would record
+    // Requirement text that was never at these identifiers. Forcing the pre-lock
+    // snapshot to disagree is the only way to reach the branch.
+    const { StateManager } = await import("../../src/state-manager");
+    const dir = tempDir();
+    const plan = modelFreePlan(dir);
+    writeManifest(dir);
+    const specFile = join(dir, "spec.md");
+    const spec = [
+      "# Feature: Guarded", "",
+      "## User Scenarios", "",
+      "### US1: [P1] Guard the prepared index", "",
+      "**Acceptance Scenarios:**",
+      "- AS-001: Given a changed spec_file, When populate locks, Then it refuses", "",
+      "## Functional Requirements", "",
+      "- FR-001: System MUST refuse to stamp hashes prepared from another document", "",
+      "## Out of Scope", "",
+      "- OOS-001: Symbol-level source indexing", "",
+      "## Appendix: Glossary", "",
+      "| Term | Definition |",
+      "|------|------------|",
+      "| Spec Index | A deterministic projection of specification entries |", "",
+    ].join("\n");
+    writeFileSync(specFile, spec, "utf8");
+    const statePath = writeState(dir, plan, [], { spec_file: specFile });
+    const decompose = JSON.stringify({
+      spec_trace_version: 2,
+      plan_title: "t",
+      spec_file: specFile,
+      plan_file: plan,
+      tasks: [{
+        id: "T1", description: "impl", agent: "code-implementer-agent", wave: 1, depends_on: [],
+        spec_anchors: ["FR-001"], spec_contributions: [],
+        verification_policy: REQUIRED_VERIFICATION, plan_context: "", file_list: ["src/a.ts"],
+      }],
+    });
+
+    const real = StateManager.prototype.load;
+    let seen = 0;
+    const spy = vi.spyOn(StateManager.prototype, "load").mockImplementation(function (this: unknown) {
+      const graph = real.call(this as never);
+      seen += 1;
+      // Only the PRE-LOCK read is diverted, so the locked transform sees the
+      // real graph and the two derivations genuinely disagree.
+      return seen === 1 ? { ...graph, spec_file: join(dir, "other-spec.md") } : graph;
+    });
+    try {
+      const result = await populate(decompose, []);
+      expect(result).toMatchObject({ kind: "error" });
+      expect(result.kind === "error" ? result.message : "").toContain("spec_file changed from");
+    } finally {
+      spy.mockRestore();
+    }
+    // And the refusal is total: no partially stamped graph was written.
+    const graph = JSON.parse(stateBytes(statePath)) as TaskGraph;
+    expect(graph.tasks.some(({ id }) => id === "T1")).toBe(false);
+  });
+
   it("makes the in-lock guard compare like for like", () => {
     // The guard fires exactly when the two derivations disagree, which is the
     // only condition under which the prepared Spec Index describes another

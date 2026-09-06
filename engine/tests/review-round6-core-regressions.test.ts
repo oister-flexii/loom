@@ -1,6 +1,10 @@
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import { parseSpecCheckOutput, reconcileSpecCheck } from "../src/core/spec-check";
+import { unprojectedFloor } from "../src/core/requirement-coverage";
+
+/** These cases exercise footer parsing, not the floor, so they settle unfloored. */
+const NO_FLOOR = unprojectedFloor("test fixture: no projection");
 import { extractTestEvidence } from "../src/core/test-evidence";
 import { countNewTests } from "../src/utils/git";
 
@@ -25,7 +29,7 @@ describe("round-six evidence authority regressions", () => {
     ["malformed", ["SPEC_CHECK_WAVE: 2", "SPEC_CHECK_CRITICAL_COUNT: nope", "SPEC_CHECK_HIGH_COUNT: 0", "SPEC_CHECK_VERDICT: PASSED"]],
   ])("does not borrow an earlier spec-check count when the final footer is %s", (_label, finalFooter) => {
     const parsed = parseSpecCheckOutput(`${passedSpecFooter}\n${finalFooter.join("\n")}`);
-    const resolution = reconcileSpecCheck(parsed, 2, "2026-08-31T00:00:00.000Z");
+    const resolution = reconcileSpecCheck(parsed, 2, "2026-08-31T00:00:00.000Z", NO_FLOOR);
 
     expect(parsed.wave).toBe(2);
     expect(parsed.criticalCount).toBeNull();
@@ -42,7 +46,7 @@ describe("round-six evidence authority regressions", () => {
       "SPEC_CHECK_HIGH_COUNT: 0",
       "SPEC_CHECK_VERDICT: PASSED",
     ].join("\n"));
-    const resolution = reconcileSpecCheck(parsed, 2, "2026-08-31T00:00:00.000Z");
+    const resolution = reconcileSpecCheck(parsed, 2, "2026-08-31T00:00:00.000Z", NO_FLOOR);
 
     expect(parsed.criticalCount).toBeNull();
     expect(resolution).toMatchObject({

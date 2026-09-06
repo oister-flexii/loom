@@ -8,6 +8,10 @@ import { parseSpecCheckOutput } from "../../src/handlers/subagent-stop/store-spe
 import handler, { runStoreSpecCheckFindings } from "../../src/handlers/subagent-stop/store-spec-check-findings";
 import { projectSlug } from "../../src/utils/agent-transcript-path";
 import { reconcileSpecCheck } from "../../src/core/spec-check";
+import { unprojectedFloor } from "../../src/core/requirement-coverage";
+
+/** These cases exercise footer parsing, not the floor, so they settle unfloored. */
+const NO_FLOOR = unprojectedFloor("test fixture: no projection");
 import { parseOrchestrationRunId, parseSlotId } from "../../src/core/orchestration-contract";
 
 describe("parseSpecCheckOutput (pure)", () => {
@@ -67,7 +71,7 @@ describe("parseSpecCheckOutput (pure)", () => {
       "SPEC_CHECK_HIGH_COUNT: 0",
     ].join("\n"));
 
-    const resolution = reconcileSpecCheck(parsed, 1, "now");
+    const resolution = reconcileSpecCheck(parsed, 1, "now", NO_FLOOR);
     expect(resolution).toEqual({
       kind: "evidence-failed",
       specCheck: {
@@ -75,6 +79,7 @@ describe("parseSpecCheckOutput (pure)", () => {
         run_at: "now",
         verdict: "EVIDENCE_CAPTURE_FAILED",
         error: "SPEC_CHECK_VERDICT marker not found - re-run /wave-gate",
+        cause: "transcript",
       },
     });
   });
@@ -88,7 +93,7 @@ describe("parseSpecCheckOutput (pure)", () => {
       "SPEC_CHECK_VERDICT: PASSED",
     ].join("\n"));
 
-    const resolution = reconcileSpecCheck(parsed, 1, "now");
+    const resolution = reconcileSpecCheck(parsed, 1, "now", NO_FLOOR);
     expect(resolution).toEqual({
       kind: "evidence-failed",
       specCheck: {
@@ -96,6 +101,7 @@ describe("parseSpecCheckOutput (pure)", () => {
         run_at: "now",
         verdict: "EVIDENCE_CAPTURE_FAILED",
         error: "SPEC_CHECK_HIGH_COUNT marker not found - re-run /wave-gate",
+        cause: "transcript",
       },
     });
   });
@@ -107,7 +113,7 @@ describe("parseSpecCheckOutput (pure)", () => {
       "SPEC_CHECK_VERDICT: PASSED",
     ].join("\n"));
 
-    const resolution = reconcileSpecCheck(parsed, 1, "now");
+    const resolution = reconcileSpecCheck(parsed, 1, "now", NO_FLOOR);
     expect(resolution.kind).toBe("captured");
     if (resolution.kind !== "captured") return;
     expect(resolution.specCheck.high_count).toBe(0);
@@ -124,7 +130,7 @@ describe("parseSpecCheckOutput (pure)", () => {
     ].join("\n"));
 
     expect(parsed.duplicateMarkers).toEqual(["SPEC_CHECK_CRITICAL_COUNT"]);
-    expect(reconcileSpecCheck(parsed, 1, "now")).toMatchObject({
+    expect(reconcileSpecCheck(parsed, 1, "now", NO_FLOOR)).toMatchObject({
       kind: "evidence-failed",
       specCheck: {
         verdict: "EVIDENCE_CAPTURE_FAILED",
@@ -143,7 +149,7 @@ describe("parseSpecCheckOutput (pure)", () => {
     ].join("\n"));
 
     expect(parsed.duplicateMarkers).toEqual(["SPEC_CHECK_VERDICT"]);
-    expect(reconcileSpecCheck(parsed, 1, "now")).toMatchObject({
+    expect(reconcileSpecCheck(parsed, 1, "now", NO_FLOOR)).toMatchObject({
       kind: "evidence-failed",
       specCheck: {
         verdict: "EVIDENCE_CAPTURE_FAILED",
@@ -176,7 +182,7 @@ describe("parseSpecCheckOutput (pure)", () => {
           `${marker}: ${value(second)}`,
           "SPEC_CHECK_VERDICT: PASSED",
         ].join("\n"));
-        const resolution = reconcileSpecCheck(parsed, 1, "now");
+        const resolution = reconcileSpecCheck(parsed, 1, "now", NO_FLOOR);
 
         expect(parsed.duplicateMarkers).toContain(marker);
         expect(resolution.kind).toBe("evidence-failed");
@@ -195,7 +201,7 @@ describe("parseSpecCheckOutput (pure)", () => {
       "SPEC_CHECK_VERDICT: PASSED",
     ].join("\n"));
 
-    const resolution = reconcileSpecCheck(parsed, 1, "now");
+    const resolution = reconcileSpecCheck(parsed, 1, "now", NO_FLOOR);
     expect(resolution.kind).toBe("evidence-failed");
     if (resolution.kind === "evidence-failed") {
       expect(resolution.specCheck.error).toContain("SPEC_CHECK_HIGH_COUNT");
@@ -856,8 +862,20 @@ describe("the Requirement Coverage Projection is enforced, not merely rendered",
    * One Wave whose single Task claims an identifier the spec does not define —
    * a settled CRITICAL — and a spec-check transcript reporting `reported`
    * CRITICAL findings. Returns the persisted `spec_check` record.
+   *
+   * `floor` is what the epoch RECORDED when the packet was installed, which is
+   * the only number the engine enforces. Passing it explicitly is what lets a
+   * test tell the recorded floor apart from anything re-projected at capture:
+   * the live graph here settles 3, so a recorded 1 that admits a 1-CRITICAL
+   * report proves the recorded value is the one in force.
    */
-  async function storedSpecCheck(reported: number): Promise<Record<string, unknown>> {
+  async function storedSpecCheck(
+    reported: number,
+    // `null`, never `undefined`: a default parameter answers for `undefined`,
+    // so an omitted-floor case written that way would silently receive the
+    // default and test the opposite of what it claims.
+    floor: Readonly<Record<string, unknown>> | null = { kind: "settled", count: 3 },
+  ): Promise<Record<string, unknown>> {
     const tmpRoot = join(tmpdir(), `spec-check-floor-${reported}-${Date.now()}`);
     mkdirSync(tmpRoot, { recursive: true });
     const tmpDir = realpathSync.native(tmpRoot);
@@ -902,9 +920,10 @@ describe("the Requirement Coverage Projection is enforced, not merely rendered",
           plan: { path: null, contentDigest: null },
         },
         specCheckSlotAuthority: { slot_id: slotId.value, attempted: 1 },
+        ...(floor === null ? {} : { settledSpecCheckFloor: floor }),
       },
     }));
-    const session = `spec-check-floor-${reported}-${process.pid}-${Date.now()}`;
+    const session = `spec-check-floor-${reported}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     await withTaskGraphPointer(session, statePath, async () => {
       await runStoreSpecCheckFindings(JSON.stringify({
         session_id: session,
@@ -922,16 +941,35 @@ describe("the Requirement Coverage Projection is enforced, not merely rendered",
     // it into the packet, and then accepted a transcript claiming zero. The
     // Wave Gate opened on the model's own arithmetic.
     const stored = await storedSpecCheck(0);
-    expect(stored).toMatchObject({ wave: 5, verdict: "EVIDENCE_CAPTURE_FAILED" });
+    expect(stored).toMatchObject({ wave: 5, verdict: "EVIDENCE_CAPTURE_FAILED", cause: "settled-floor" });
     expect(String(stored.error)).toContain("the Requirement Coverage Projection settled");
     expect(String(stored.error)).toContain("re-run /wave-gate");
+  });
+
+  it("enforces the floor the epoch recorded, not one re-projected at capture", async () => {
+    // The divergence this closes: `spec_anchor_hashes` and the `spec_anchors`
+    // of Tasks outside the reviewed Wave both move the projected count and are
+    // both absent from `batchEpoch`, so a re-projection at capture could
+    // enforce a number the Agent was never shown. This fixture's live graph
+    // settles 3; the epoch recorded 1; a 1-CRITICAL report must be accepted.
+    const stored = await storedSpecCheck(1, { kind: "settled", count: 1 });
+    expect(stored).toMatchObject({ wave: 5, critical_count: 1 });
+    expect(stored.verdict).not.toBe("EVIDENCE_CAPTURE_FAILED");
+  });
+
+  it("imposes no floor on an epoch installed before the floor was recorded", async () => {
+    // A historical epoch genuinely showed the Agent no settled count. Failing
+    // its honest report against a number invented after the fact would be the
+    // same defect in the opposite direction.
+    const stored = await storedSpecCheck(0, null);
+    expect(stored).toMatchObject({ wave: 5, critical_count: 0, verdict: "PASSED" });
   });
 
   it("accepts a report that meets the floor", async () => {
     // FR-404 is the one settled CRITICAL: unknown-requirement, and no FR or AS
     // in the fixture goes unclaimed except the ones the Task does not name.
     const settled = 3; // FR-404 row + FR-001 unclaimed + AS-001 unclaimed
-    const stored = await storedSpecCheck(settled);
+    const stored = await storedSpecCheck(settled, { kind: "settled", count: settled });
     expect(stored).toMatchObject({ wave: 5, critical_count: settled });
     expect(stored.verdict).not.toBe("EVIDENCE_CAPTURE_FAILED");
   });

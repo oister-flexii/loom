@@ -14,7 +14,7 @@ import {
   recordedAnchorHashes,
   renderRequirementCoverage,
   settledCriticalCount,
-  settledFloorProblem,
+  settledFloorOf,
   specIndexDigest,
   specIndexPath,
   specIndexUnavailableMessage,
@@ -22,6 +22,17 @@ import {
   type RecordedHash,
   type SpecIndexAvailability,
 } from "../../src/core/requirement-coverage";
+import { parseSpecCheckOutput, reconcileSpecCheck } from "../../src/core/spec-check";
+
+const RUN_AT = "2026-09-06T00:00:00.000Z";
+/** A spec-check footer reporting `critical` CRITICAL findings. */
+const report = (critical: number) => parseSpecCheckOutput([
+  "SPEC_CHECK_WAVE: 1",
+  ...Array.from({ length: critical }, (_, at) => `CRITICAL: finding ${at + 1}`),
+  `SPEC_CHECK_CRITICAL_COUNT: ${critical}`,
+  "SPEC_CHECK_HIGH_COUNT: 0",
+  `SPEC_CHECK_VERDICT: ${critical === 0 ? "PASSED" : "BLOCKED"}`,
+].join("\n"));
 
 const specSource = `# Feature: Coverage
 
@@ -75,6 +86,7 @@ const task = (overrides: Partial<CoverageTask> = {}): CoverageTask => Object.fre
   id: "T1",
   inCurrentWave: true,
   completionAnchors: ["FR-001"],
+  contributions: [],
   declaredFiles: ["src/a.ts"],
   modifiedFiles: ["src/a.ts"],
   anchorHashes: new Map<string, RecordedHash>(),
@@ -210,10 +222,14 @@ describe("settled floor", () => {
   });
 
   it("refuses a report that falls below the floor and admits one that exceeds it", () => {
-    expect(settledFloorProblem(settled(), 5)).toContain("settled 6");
-    expect(settledFloorProblem(settled(), 6)).toBeNull();
+    // Asserted through reconcileSpecCheck, the rule that actually gates. The
+    // production-dead duplicate these once used carried the only tests, so a
+    // divergence between the two copies would have stayed green.
+    const floor = settledFloorOf(settled());
+    expect(reconcileSpecCheck(report(5), 1, RUN_AT, floor).kind).toBe("evidence-failed");
+    expect(reconcileSpecCheck(report(6), 1, RUN_AT, floor).kind).toBe("captured");
     // A floor, not an equality: the Agent is expected to add its own findings.
-    expect(settledFloorProblem(settled(), 9)).toBeNull();
+    expect(reconcileSpecCheck(report(9), 1, RUN_AT, floor).kind).toBe("captured");
   });
 
   it("imposes no floor when no projection was possible", () => {
@@ -222,7 +238,8 @@ describe("settled floor", () => {
       [task()],
     );
     expect(settledCriticalCount(unavailable)).toBe(0);
-    expect(settledFloorProblem(unavailable, 0)).toBeNull();
+    expect(settledFloorOf(unavailable).kind).toBe("unprojected");
+    expect(reconcileSpecCheck(report(0), 1, RUN_AT, settledFloorOf(unavailable)).kind).toBe("captured");
   });
 });
 
@@ -259,6 +276,41 @@ describe("renderRequirementCoverage", () => {
     ]));
     expect(all).toContain("Every Functional Requirement in the Spec Index is claimed by some Task.");
     expect(all).toContain("Every Acceptance Scenario in the Spec Index is claimed by some Task.");
+  });
+
+  it("renders each unclaimed identifier under its OWN family heading", () => {
+    // The gap this closes: asserting only `toContain` over the whole render
+    // passes just as happily when the two rosters are swapped, because both
+    // identifiers appear somewhere. Sliced per heading, a swap fails.
+    const rendered = renderRequirementCoverage(rowsOf([task({ completionAnchors: [] })]));
+    const section = (heading: string): string => {
+      const start = rendered.indexOf(`### ${heading} whose completion no Task claims`);
+      expect(start, `${heading} roster must be rendered`).toBeGreaterThan(-1);
+      const next = rendered.indexOf("\n### ", start + 1);
+      return rendered.slice(start, next === -1 ? rendered.length : next);
+    };
+    const requirements = section("Functional Requirements");
+    const scenarios = section("Acceptance Scenarios");
+    for (const id of ["FR-001", "FR-002"]) {
+      expect(requirements).toContain(id);
+      expect(scenarios).not.toContain(id);
+    }
+    for (const id of ["AS-001", "AS-002"]) {
+      expect(scenarios).toContain(id);
+      expect(requirements).not.toContain(id);
+    }
+  });
+
+  it("collapses a newline inside a claim into a space, never a row break", () => {
+    // A cell that kept its newline would split one row into two, and the second
+    // half would parse as a body row the projection never emitted.
+    const rendered = renderRequirementCoverage(rowsOf([
+      task({ completionAnchors: ["FR-A\r\n\nFR-B"] }),
+    ]));
+    const body = rendered.split("\n").filter((line) => line.startsWith("| T1"));
+    expect(body).toHaveLength(1);
+    expect(body[0]).toContain("FR-A FR-B");
+    expect(rendered).not.toContain("FR-A\n");
   });
 
   it("renders the typed exclusion list and glossary sections with their content", () => {
@@ -409,6 +461,27 @@ describe("round-2 regressions", () => {
     const rendered = renderRequirementCoverage(coverage);
     expect(rendered).toContain("| engine | CRITICAL |");
     expect(rendered).toContain("Settled CRITICAL findings: 1.");
-    expect(settledFloorProblem(coverage, 0)).toContain("settled 1");
+    const failed = reconcileSpecCheck(report(0), 1, RUN_AT, settledFloorOf(coverage));
+    expect(failed.kind).toBe("evidence-failed");
+    expect(String((failed.specCheck as { error?: string }).error)).toContain("settled 1");
+  });
+
+  it("does not floor a Wave that traces only through Requirement Contributions", () => {
+    // CONTEXT.md defines a Contribution as work that advances a Requirement
+    // without asserting its completion, so a Wave carrying only Contributions
+    // is a legitimate foundation Wave. Counting the synthetic row for it forced
+    // the Agent to emit a CRITICAL it could not substantiate and could not fix.
+    const coverage = projectRequirementCoverage(indexed, [
+      task({ id: "W1", inCurrentWave: false, completionAnchors: ["FR-001", "FR-002", "AS-001", "AS-002"] }),
+      task({ id: "W2", inCurrentWave: true, completionAnchors: [], contributions: ["FR-001"] }),
+    ]);
+    expect(coverage.kind === "projected" && coverage.tracesByContribution).toBe(true);
+    expect(settledCriticalCount(coverage)).toBe(0);
+    const rendered = renderRequirementCoverage(coverage);
+    expect(rendered).toContain("legitimate foundation Wave");
+    expect(rendered).not.toContain("| engine | CRITICAL |");
+    expect(rendered).toContain("Settled CRITICAL findings: 0.");
+    // And an honest zero-CRITICAL report is accepted, which is the whole point.
+    expect(reconcileSpecCheck(report(0), 1, RUN_AT, settledFloorOf(coverage)).kind).toBe("captured");
   });
 });

@@ -264,6 +264,7 @@ describe("wave review context authority", () => {
       run_at: "2026-08-28T00:00:01.000Z",
       verdict: "EVIDENCE_CAPTURE_FAILED" as const,
       error: "attempt 1 capture rejected",
+      cause: "transcript" as const,
     };
 
     const transition = applyCurrentSpecCheckCaptureRejection(
@@ -313,6 +314,7 @@ describe("wave review context authority", () => {
       run_at: "2026-08-28T00:00:01.000Z",
       verdict: "EVIDENCE_CAPTURE_FAILED" as const,
       error: "attempt 1 capture rejected",
+      cause: "transcript" as const,
     };
 
     const transition = applyCurrentSpecCheckCaptureRejection(

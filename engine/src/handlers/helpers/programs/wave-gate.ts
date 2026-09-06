@@ -21,12 +21,13 @@ import { runFullTierWaveLint } from '../lint-wave-gate';
 import { ensureWaveCompletionSuite, observeCurrentWaveWorkspace } from '../wave-completion-suite';
 import { observeReviewedWorkspace } from '../reviewed-workspace';
 import { observeWaveSpecCheckDocuments } from '../../../orchestration/wave-spec-check-documents';
+import { unprojectedFloor } from '../../../core/requirement-coverage';
 import { applyFindingOutcomes, preserveAcceptedReviewRunFindings } from '../../../core/findings';
 import { buildFindingBrief } from '../../../core/review-panel';
 import { applyReviewResolution, constrainReviewResolutionToScope, resolveTaskReviewFindings } from '../../../core/review-output';
 import type { ReviewRunSlotAuthority, Task, TaskGraph } from '../../../types';
 import { anyActiveSubagent } from '../../../machine';
-import { parseSpecCheckOutput, reconcileSpecCheck } from '../../../core/spec-check';
+import { parseSpecCheckOutput, reconcileSpecCheck, specCheckNeedsReapplication } from '../../../core/spec-check';
 import { reconcileWaveBlock } from '../../../core/wave-gate-model';
 import { resolveModelProfile, lowerModelProfile } from '../../../core/model-profiles';
 import {
@@ -34,7 +35,8 @@ import {
   readWaveReviewContext,
   waveSpecCheckDocumentsMatch,
   waveSpecCheckScope,
-  settledSpecCheckFloor,
+  isExactEpochReplay,
+  epochSettledFloor,
   type WaveRequestBatch,
   type WaveReviewContextAuthority,
   type WaveReviewContextRead,
@@ -734,11 +736,8 @@ export async function installWaveReviewRuns(
       throw new Error("Wave review packet context changed before the batch could be installed");
     }
     const existingEpoch = locked.wave_review_epoch;
-    const exactEpochReplay = existingEpoch !== undefined &&
-      existingEpoch.runId === specCheckAuthority.runId && existingEpoch.wave === wave &&
-      existingEpoch.batchEpoch === batch.batchEpoch &&
-      waveSpecCheckDocumentsMatch(existingEpoch.specCheckDocuments, batch.specCheckDocuments) &&
-      existingEpoch.specCheckSlotAuthority?.slot_id === specCheckAuthority.slotId;
+    const exactEpochReplay = isExactEpochReplay(
+      existingEpoch, batch, specCheckAuthority.runId, wave, specCheckAuthority.slotId);
     if (existingEpoch !== undefined && !exactEpochReplay && locked.tasks.some((task) =>
       registration.taskIds.includes(task.id) && task.review_run !== undefined)) {
       throw new Error("Wave review batch differs from the exact installed Wave review epoch");
@@ -753,6 +752,7 @@ export async function installWaveReviewRuns(
         wave,
         batchEpoch: batch.batchEpoch,
         specCheckDocuments: batch.specCheckDocuments,
+        settledSpecCheckFloor: batch.settledFloor,
         specCheckSlotAuthority: {
           slot_id: specCheckAuthority.slotId,
           attempted: 1,
@@ -1432,7 +1432,7 @@ export async function applyWaveFacadeSubmission(
         // which is what a floor violation writes — so an unfloored facade
         // silently overwrote the refusal the hook had just recorded.
         const resolution = reconcileSpecCheck(parsed, wave, new Date().toISOString(),
-          settledSpecCheckFloor(currentObservation.specIndex, locked, wave));
+          epochSettledFloor(locked.wave_review_epoch));
         return {
           ...locked,
           spec_check: resolution.specCheck,
@@ -1709,8 +1709,8 @@ export async function resumeWaveGateFacade(
     for (const request of currentIssued.filter((authority) => authority.program === "wave-gate" &&
       belongsToCurrentPacket(authority) && captured.value.has(captureKey(authority.slotId, authority.attempt)))) {
       const now = manager.load();
-      if (request.role === "spec-check-invoker" && now.spec_check?.wave === registration.input.wave &&
-          now.spec_check.verdict !== "EVIDENCE_CAPTURE_FAILED") continue;
+      if (request.role === "spec-check-invoker" &&
+          !specCheckNeedsReapplication(now.spec_check, registration.input.wave)) continue;
       const read = readWaveRequestContext(handle, request);
       if (!read.ok) return read.result;
       const context = read.context;
@@ -1742,10 +1742,14 @@ export async function resumeWaveGateFacade(
         if (context.kind !== "loaded") {
           return waveBlocked(handle, "rejected spec-check request lacks exact Wave authority");
         }
+        // An empty transcript synthesizes an evidence failure for a durable
+        // capture rejection; it fails on the missing marker long before any
+        // floor applies, so it states that rather than deriving one.
         const resolution = reconcileSpecCheck(
           parseSpecCheckOutput(""),
           context.value.wave,
           new Date().toISOString(),
+          unprojectedFloor("durable capture rejection: no transcript to floor"),
         );
         await manager.updateAndReturn((locked) => {
           const applied = applyCurrentSpecCheckCaptureRejection(

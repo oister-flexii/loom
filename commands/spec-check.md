@@ -73,7 +73,7 @@ The projection is engine-derived authority, not advice, and it states its own ru
 - **`Decided by`** — `engine` means the row is settled: copy it into your report verbatim, do not re-litigate it. `agent` means an assessment is still owed **regardless of severity**.
 - **`Severity`** — how bad the structural fact is. A `MEDIUM` (drifted) or `CRITICAL` (altered hash) row can still be `Decided by: agent`; severity never excuses you from reading the code.
 
-The projection's last line states the settled CRITICAL count. **Your report may not fall below it** — the engine re-derives that count at capture and fails evidence capture if you do.
+The projection's last line states the settled CRITICAL count. **Your report may not fall below it** — the engine enforces this exact number at capture and fails evidence capture if you do.
 
 If it renders `UNAVAILABLE` you are on the **Unprojected** path: nothing is settled, and the projection carries no Requirement text, no scenario roster, no exclusion list and no glossary.
 
@@ -162,9 +162,11 @@ The convention is `it('AS-001: …')` — an identifier in a test name is a stru
 
 If that section says every scenario is claimed, this step is genuinely empty — say so; do not leave the scenario table blank.
 
+**This step does not re-grade what Step 4 already settled.** Every identifier in the projection's unclaimed-scenario roster ALREADY has its `CRITICAL:` line from Step 4, and the engine counts it into the settled floor. What you produce here is the *coverage* fact beside it — whether any test exercises the scenario — not a competing severity. Downgrading one of those identifiers to HIGH, MEDIUM or LOW instead of emitting its CRITICAL puts your report below the floor and fails evidence capture.
+
 **Unprojected:** grep the spec for `Given .* When .* Then` lines and assess each, as before.
 
-**Severity for uncovered scenarios:**
+**Severity for a scenario that IS claimed by a Task but has no test** (these carry no Step 4 CRITICAL, so this is their only severity):
 - Happy path not tested = HIGH
 - Error path not tested = MEDIUM
 - Edge case not tested = LOW
@@ -311,7 +313,7 @@ SPEC_CHECK_VERDICT: PASSED | BLOCKED
 - Registered Wave Gate scope comes only from `LOOM_CONTEXT_PATH`; never reread mutable `active_task_graph.json`
 - The Requirement Coverage Projection is engine-derived authority: `Decided by: engine` rows are copied, never overturned or softened
 - Severity is not settlement. A `MEDIUM` or `CRITICAL` row that reads `Decided by: agent` still needs you to read the code
-- Your CRITICAL count may never fall below the projection's stated settled floor; the engine re-derives it at capture and fails evidence capture if it does
+- Your CRITICAL count may never fall below the projection's stated settled floor; the engine enforces that exact number at capture and fails evidence capture if it does
 - An UNAVAILABLE projection puts you on the Unprojected path: nothing is settled, and the glossary and Out-of-Scope list must be read from the specification — say so in the summary
 - Requirement Contributions are traceability only and never enter completion scope
 - MUST use tool calls (Grep, Read, Bash) for evidence — no assessing from memory, and no re-deriving what the projection already decided

@@ -35,9 +35,8 @@ import {
   type ParsedSpecCheckOutput,
 } from "../engine/src/core/spec-check";
 import {
-  settledSpecCheckFloor,
+  epochSettledFloor,
   waveSpecCheckDocumentsMatch,
-  type SpecIndexAvailability,
 } from "../engine/src/core/wave-review-authority";
 import { observeWaveSpecCheckDocuments } from "../engine/src/orchestration/wave-spec-check-documents";
 import { reconcileWaveBlock } from "../engine/src/core/wave-gate-model";
@@ -623,7 +622,6 @@ async function applyFailedSpecCheckResult(
         state,
         args.reservedSlot?.specCheckAuthority,
         { kind: "capture-failed", error: failure },
-        specObservation.specIndex,
         specObservation.authority,
         args.now,
       ));
@@ -1716,7 +1714,6 @@ function reducePiSpecCheckResult(
   state: TaskGraph,
   authority: PiSpecCheckAttemptAuthority | null | undefined,
   observation: PiSpecCheckObservation,
-  observationIndex: SpecIndexAvailability,
   documents: WaveSpecCheckDocumentsAuthority,
   now: string,
 ): Readonly<{ state: TaskGraph; value: PiResultOutcome }> {
@@ -1732,6 +1729,7 @@ function reducePiSpecCheckResult(
       run_at: now,
       verdict: "EVIDENCE_CAPTURE_FAILED" as const,
       error: observation.error,
+      cause: "transcript" as const,
     };
     return commitPiSpecCheck(
       state,
@@ -1745,7 +1743,7 @@ function reducePiSpecCheckResult(
   // floor unenforced on this transport entirely, while the command told the
   // Agent the engine re-derives it at capture.
   const resolution = reconcileSpecCheck(observation.findings, wave, now,
-    settledSpecCheckFloor(observationIndex, state, wave));
+    epochSettledFloor(state.wave_review_epoch));
   if (resolution.kind === "evidence-failed") {
     return commitPiSpecCheck(
       state,
@@ -1781,7 +1779,7 @@ export async function applySpecCheckPiResult(args: Readonly<{
     const specObservation = observeWaveSpecCheckDocuments(observedState.spec_file, observedState.plan_file);
     return await args.store.updateAndReturn((state) =>
       reducePiSpecCheckResult(state, args.reservedSlot?.specCheckAuthority, observation,
-        specObservation.specIndex, specObservation.authority, args.now));
+        specObservation.authority, args.now));
   } catch (error) {
     const diagnostic = `spec-check state commit failed: ${error instanceof Error ? error.message : String(error)}`;
     return outcome([`loom(pi): ${diagnostic}`], [diagnostic]);

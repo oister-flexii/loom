@@ -1,3 +1,4 @@
+import type { SettledFloor } from "../../src/core/requirement-coverage";
 import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -92,7 +93,10 @@ function parsedGraph(graph: TaskGraph): ParsedTaskGraph {
   return parsed.value;
 }
 
-function graphWithSpecCheckAuthority(wave = 1) {
+function graphWithSpecCheckAuthority(
+  wave = 1,
+  settledSpecCheckFloor: SettledFloor | null = null,
+) {
   const state = parsedGraph(graph({
     current_wave: wave,
     active_wave_gate: {
@@ -113,6 +117,7 @@ function graphWithSpecCheckAuthority(wave = 1) {
         plan: { path: null, contentDigest: null },
       },
       specCheckSlotAuthority: { slot_id: "wave-slot:spec-check", attempted: 1 },
+      ...(settledSpecCheckFloor === null ? {} : { settledSpecCheckFloor }),
     },
   }));
   const authority = currentPiSpecCheckAuthority(state);
@@ -1206,6 +1211,40 @@ describe("applySpecCheckPiResult", () => {
       expect.stringContaining("does not match current"),
     ]);
     expect(store.current()).toEqual(current.state);
+  });
+
+  it("refuses a Pi report that falls below the floor its epoch recorded", async () => {
+    // The gap this closes: every Pi fixture used an epoch with no recorded
+    // floor, so the transport's enforcement was never once exercised - the
+    // suite would have stayed green with the floor argument removed entirely.
+    const fixture = graphWithSpecCheckAuthority(1, { kind: "settled", count: 2 });
+    const store = fakeStore(fixture.state);
+    await applySpecCheckPiResult({
+      store,
+      result: result({ agent: "spec-check-invoker", messages: assistantText(specCheckText(0)) }),
+      reservedSlot: fixture.reservedSlot,
+      now: NOW,
+    });
+
+    expect(store.current().spec_check).toMatchObject({
+      verdict: "EVIDENCE_CAPTURE_FAILED",
+      cause: "settled-floor",
+    });
+    expect(String(store.current().spec_check?.error))
+      .toContain("the Requirement Coverage Projection settled 2");
+  });
+
+  it("accepts a Pi report that meets the floor its epoch recorded", async () => {
+    const fixture = graphWithSpecCheckAuthority(1, { kind: "settled", count: 1 });
+    const store = fakeStore(fixture.state);
+    await applySpecCheckPiResult({
+      store,
+      result: result({ agent: "spec-check-invoker", messages: assistantText(specCheckText(1)) }),
+      reservedSlot: fixture.reservedSlot,
+      now: NOW,
+    });
+
+    expect(store.current().spec_check).toMatchObject({ verdict: "BLOCKED", critical_count: 1 });
   });
 
   it("rejects unreserved spec-check evidence without mutating protected state", async () => {

@@ -18,7 +18,7 @@ import { readTranscriptWithRetry } from "../../utils/read-transcript-with-retry"
 import { resolveAgentTranscriptPath, resolveAgentType } from "../../utils/agent-transcript-path";
 import { stripNamespace } from "../../utils/strip-namespace";
 import { observeWaveSpecCheckDocuments } from "../../orchestration/wave-spec-check-documents";
-import { settledSpecCheckFloor } from "../../core/wave-review-authority";
+import { epochSettledFloor } from "../../core/wave-review-authority";
 
 export const runStoreSpecCheckFindings = async (
   stdin: string,
@@ -94,10 +94,19 @@ export const runStoreSpecCheckFindings = async (
         },
       };
     }
-    const wave = state.wave_review_epoch?.wave ?? findings.wave ?? state.current_wave ?? 1;
-    const captured = transcriptFailure === null
+    // The floor NEVER takes its Wave from findings.wave: that is the Agent's own
+    // SPEC_CHECK_WAVE marker, and letting the reported party select the roster
+    // its floor is derived from means it can name a Wave with no CRITICAL rows.
+    // The stored wave keeps the old precedence, because it decides only WHERE
+    // the evidence is filed, not what it is measured against.
+    const epochWave = state.wave_review_epoch?.wave ?? null;
+    const wave = epochWave ?? findings.wave ?? state.current_wave ?? 1;
+    // Read back from the epoch, never re-projected: only a packet-correlated
+    // capture carries a floor at all, and the recorded one is the exact number
+    // rendered into the packet this Agent was shown.
+    const resolution = transcriptFailure === null
       ? reconcileSpecCheck(findings, wave, new Date().toISOString(),
-          settledSpecCheckFloor(observation.specIndex, state, wave))
+          epochSettledFloor(state.wave_review_epoch))
       : {
           kind: "evidence-failed" as const,
           specCheck: {
@@ -105,9 +114,9 @@ export const runStoreSpecCheckFindings = async (
             run_at: new Date().toISOString(),
             verdict: "EVIDENCE_CAPTURE_FAILED" as const,
             error: `${transcriptFailure} - re-run /wave-gate`,
+            cause: "transcript" as const,
           },
         };
-    const resolution = captured;
     const value = resolution.kind === "evidence-failed"
       ? passthroughResult(`WARNING: ${resolution.specCheck.error} — marking evidence_capture_failed`)
       : passthroughResult(
