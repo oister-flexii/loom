@@ -975,6 +975,73 @@ describe("the Requirement Coverage Projection is enforced, not merely rendered",
   });
 });
 
+describe("round-4: the reported party selects no Wave", () => {
+  it("files the record and the block on the engine's wave, never the Agent's claimed wave, on the legacy path", async () => {
+    // The defect this closes: the Wave chain took findings.wave — the Agent's
+    // own SPEC_CHECK_WAVE marker — so on the legacy path (epoch absent) the
+    // Agent chose both the roster its floor is derived from and, through
+    // reconcileWaveBlock's cause attribution, the veto's target. One Wave
+    // variable feeds the stored record and the block; it takes the epoch when
+    // the engine has one, else the state's current wave.
+    const tmpRoot = join(tmpdir(), `spec-check-block-wave-${Date.now()}`);
+    mkdirSync(tmpRoot, { recursive: true });
+    const tmpDir = realpathSync.native(tmpRoot);
+    const statePath = join(tmpDir, "active_task_graph.json");
+    writeFileSync(statePath, JSON.stringify({
+      current_phase: "execute",
+      phase_artifacts: {},
+      skipped_phases: [],
+      spec_file: null,
+      plan_file: null,
+      // Legacy path: no wave_review_epoch, so the epoch chain is absent — the
+      // exact path where the Agent's claimed wave used to select the target.
+      current_wave: 3,
+      tasks: [],
+      spec_check: {
+        wave: 1, run_at: "earlier", verdict: "PASSED", critical_count: 0, high_count: 0,
+        critical_findings: [], high_findings: [], medium_findings: [],
+      },
+      wave_gates: {
+        "3": { impl_complete: false, tests_passed: null, reviews_complete: false, blocked: false },
+        "5": { impl_complete: false, tests_passed: null, reviews_complete: false, blocked: false },
+      },
+    }));
+    const transcriptPath = join(tmpDir, "transcript.jsonl");
+    writeFileSync(transcriptPath, JSON.stringify({
+      type: "assistant",
+      message: { content: [{ type: "text", text: [
+        "SPEC_CHECK_WAVE: 5",
+        "CRITICAL: the Agent's claimed wave must not choose the veto's target",
+        "SPEC_CHECK_CRITICAL_COUNT: 1",
+        "SPEC_CHECK_HIGH_COUNT: 0",
+        "SPEC_CHECK_VERDICT: BLOCKED",
+      ].join("\n") }] },
+    }));
+    const session = `spec-check-block-wave-${process.pid}-${Date.now()}`;
+    try {
+      await withTaskGraphPointer(session, statePath, async () => {
+        const result = await handler(JSON.stringify({
+          session_id: session,
+          agent_type: "spec-check-invoker",
+          agent_transcript_path: transcriptPath,
+        }), []);
+        expect(result.kind).toBe("passthrough");
+
+        const state = JSON.parse(readFileSync(statePath, "utf-8"));
+        // The record files under the engine's wave (state.current_wave), not
+        // the Agent's claimed wave 5.
+        expect(state.spec_check.wave).toBe(3);
+        // The block lands on the engine's wave: the cause attributes to the
+        // record's own wave, so the same honest value files and blocks.
+        expect(state.wave_gates["3"].blocked).toBe(true);
+        expect(state.wave_gates["5"].blocked).toBe(false);
+      });
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
 function withTaskGraphPointer<T>(session: string, statePath: string, run: () => Promise<T>): Promise<T> {
   return (async () => {
     const { SUBAGENT_DIR } = await import("../../src/config");

@@ -296,16 +296,31 @@ export type PiReviewAttemptAuthority = Readonly<{
   attempted: 1 | 2 | null;
 }>;
 
+/**
+ * Whether a Task is EXPLICITLY legacy — no Review Run, no review generation,
+ * no retained accepted-review authority, and no issued review packets.
+ *
+ * Two appliers must agree on this predicate in lockstep:
+ * `reviewAuthorityForTask` mints a legacy generation-0 authority for it, and
+ * `piReviewAuthorityProblem` accepts unreserved reviewer evidence against it.
+ * The predicate was written twice, which is the proof the duplication is
+ * live: a new Task field that retires legacy state had to land in both sites
+ * or the two appliers would disagree — one minting an authority the other
+ * rejects. One helper makes that defect structurally impossible.
+ */
+const isExplicitlyLegacyTask = (task: LoomTask): boolean =>
+  task.review_run === undefined &&
+  task.review_generation === undefined &&
+  task.accepted_review_authority === undefined &&
+  (task.issued_review_packets?.length ?? 0) === 0;
+
 function reviewAuthorityForTask(
   task: LoomTask,
   agentType: string,
 ): PiReviewAttemptAuthority | null {
   const run = task.review_run;
   if (run === undefined) {
-    const explicitlyLegacy = task.review_generation === undefined &&
-      task.accepted_review_authority === undefined &&
-      (task.issued_review_packets?.length ?? 0) === 0;
-    return explicitlyLegacy
+    return isExplicitlyLegacyTask(task)
       ? Object.freeze({
           taskId: task.id,
           agentType,
@@ -346,11 +361,7 @@ export function piReviewAuthorityProblem(
 ): string | null {
   const currentAuthority = reviewAuthorityForTask(task, agentType);
   if (reservedAuthority == null) {
-    const explicitlyLegacy = task.review_run === undefined &&
-      task.review_generation === undefined &&
-      task.accepted_review_authority === undefined &&
-      (task.issued_review_packets?.length ?? 0) === 0;
-    return explicitlyLegacy
+    return isExplicitlyLegacyTask(task)
       ? null
       : "reviewer has no exact current or retained review-generation authority";
   }

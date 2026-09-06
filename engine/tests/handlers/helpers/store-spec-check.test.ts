@@ -166,6 +166,63 @@ describe("store-spec-check helper", () => {
     expect(readState().spec_check?.verdict).toBe("PASSED");
   });
 
+  it("pins the floor argument: the operator override imposes no floor even when a projection would settle rows", () => {
+    // The round-3 D1 floor argument this pins: the helper's fourth settlement
+    // path states its floor as the shipped `unprojectedFloor` — the operator
+    // supplies the transcript on stdin, there is no packet, and the override
+    // exists to correct a structural verdict a human judged wrong. A regression
+    // to `settledFloorOf(coverageTasks(graph, wave))` would re-project the live
+    // graph's count and refuse this honest 0-CRITICAL override against a
+    // number the operator was never shown. Every sibling fixture has a null
+    // spec_file, where both floors are behaviorally identical; this one has a
+    // canonical spec file whose projection settles rows, so only the shipped
+    // floor admits the write.
+    const specPath = join(tmpDir, "spec.md");
+    writeFileSync(specPath, [
+      "# Feature: Override floor pin",
+      "",
+      "## User Scenarios",
+      "",
+      "### US1: [P1] Pin the operator override floor",
+      "",
+      "**Acceptance Scenarios:**",
+      "- AS-001: Given a settled row, When the operator overrides, Then no floor is imposed",
+      "",
+      "## Functional Requirements",
+      "",
+      "- FR-001: System MUST floor the reported CRITICAL count at the settled count",
+      "",
+      "## Out of Scope",
+      "",
+      "- OOS-001: Symbol-level source indexing",
+      "",
+      "## Appendix: Glossary",
+      "",
+      "| Term | Definition |",
+      "|------|------------|",
+      "| Spec Index | A deterministic projection of specification entries |",
+    ].join("\n"));
+    writeFileSync(statePath, JSON.stringify({
+      ...readState(),
+      spec_trace_version: 2,
+      spec_file: specPath,
+    }, null, 2));
+
+    const { exitCode, stderr } = runHelper([
+      "SPEC_CHECK_WAVE: 1",
+      "SPEC_CHECK_OVERRIDE: the structural verdict is wrong, human-judged",
+      "SPEC_CHECK_CRITICAL_COUNT: 0",
+      "SPEC_CHECK_HIGH_COUNT: 0",
+      "SPEC_CHECK_VERDICT: PASSED",
+    ].join("\n"));
+
+    expect(exitCode).toBe(0);
+    expect(stderr).toContain("manual operator override");
+    const spec = readState().spec_check;
+    expect(spec?.verdict).toBe("PASSED");
+    expect(spec?.critical_count).toBe(0);
+  });
+
   it("fails when the required CRITICAL_COUNT marker is absent", () => {
     const { exitCode, stderr } = runHelper("SPEC_CHECK_VERDICT: PASSED\n");
     expect(exitCode).not.toBe(0);

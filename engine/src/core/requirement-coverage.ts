@@ -23,7 +23,7 @@
  * Task→Requirement edges, and this module owns neither.
  */
 
-import { match } from "ts-pattern";
+import { match, P } from "ts-pattern";
 import type {
   NonEmpty,
   ParsedSpec,
@@ -294,10 +294,15 @@ export type ClaimSeverity = "CRITICAL" | "MEDIUM" | "NONE";
 
 export function claimSeverity(verdict: ClaimVerdict): ClaimSeverity {
   return match<ClaimVerdict, ClaimSeverity>(verdict)
-    .with({ kind: "unknown-requirement" }, () => "CRITICAL")
-    .with({ kind: "excluded-requirement" }, () => "CRITICAL")
-    .with({ kind: "not-declared" }, () => "CRITICAL")
-    .with({ kind: "not-implemented" }, () => "CRITICAL")
+    .with(
+      P.union(
+        { kind: "unknown-requirement" },
+        { kind: "excluded-requirement" },
+        { kind: "not-declared" },
+        { kind: "not-implemented" },
+      ),
+      () => "CRITICAL",
+    )
     .with({ kind: "candidate-pass" }, ({ drift }) => match<DriftFact, ClaimSeverity>(drift)
       // A stored hash the engine cannot have minted is corrupt authority, not
       // missing authority, and outranks every other fact about the row.

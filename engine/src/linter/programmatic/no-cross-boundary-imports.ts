@@ -89,7 +89,7 @@ export const DEFAULT_BOUNDARIES: readonly BoundaryRule[] = [
       "engine/src/utils/strip-namespace",
       // find-file imports only `node:fs` and `node:path`. The core boundary's
       // formerly blanket `node:` allowance is now per-module, and this
-      // dependency-free wrapper over the same calls is enumerated below — the
+      // narrow wrapper over the same calls is enumerated below — the
       // capability policed is protected-state WRITING: `engine/src/state-manager`
       // stays unlisted, and `validate-phase-order` takes its state read as an
       // injected dependency instead.

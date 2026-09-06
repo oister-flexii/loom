@@ -181,11 +181,12 @@ const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 // write a schema this in-memory runtime may not parse.
 const LOADED_RUNTIME_IDENTITY = captureLoomRuntimeIdentity(PACKAGE_ROOT);
 // Also frozen at load. Correct under Pi, which sets the environment before it
-// loads any extension — but it makes the FIRST import of this module in a
-// process binding, which matters under `bun test`, where all files share one
-// process: a test file that imports this module before `pi-extension-review-
-// events.test.ts` sets `PI_CODING_AGENT_DIR` pins the real `~/.pi` for the
-// whole run and every agent-definition check there resolves the wrong catalog.
+// loads any extension — but under `bun test` it pins the FIRST import of this
+// module to whichever environment is current in that process, and all files
+// share one process: a test file that imports this module before `pi-
+// extension-review-events.test.ts` sets `PI_CODING_AGENT_DIR` pins the real
+// `~/.pi` for the whole run and every agent-definition check there resolves
+// the wrong catalog.
 // Keep unit tests of this file's pure helpers importing `pi/subagent-result`,
 // which reads no environment, rather than pulling this module in early.
 const PI_AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");

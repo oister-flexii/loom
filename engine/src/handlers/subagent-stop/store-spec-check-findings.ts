@@ -94,13 +94,17 @@ export const runStoreSpecCheckFindings = async (
         },
       };
     }
-    // The floor NEVER takes its Wave from findings.wave: that is the Agent's own
-    // SPEC_CHECK_WAVE marker, and letting the reported party select the roster
-    // its floor is derived from means it can name a Wave with no CRITICAL rows.
-    // The stored wave keeps the old precedence, because it decides only WHERE
-    // the evidence is filed, not what it is measured against.
+    // The Wave here NEVER takes findings.wave: that is the Agent's own
+    // SPEC_CHECK_WAVE marker, and letting the reported party select it would
+    // let the Agent choose both the roster its floor is derived from (a Wave
+    // with no CRITICAL rows) AND the veto's target — reconcileWaveBlock
+    // attributes the spec-check cause to the record's own wave and marks that
+    // wave's gate, so one Wave variable feeds both the stored record and the
+    // block. The epoch is the engine's own record of which wave the capture is
+    // about; on the legacy path (epoch absent) the state's current wave is the
+    // engine's belief. The reported party selects nothing.
     const epochWave = state.wave_review_epoch?.wave ?? null;
-    const wave = epochWave ?? findings.wave ?? state.current_wave ?? 1;
+    const wave = epochWave ?? state.current_wave ?? 1;
     // Read back from the epoch, never re-projected: only a packet-correlated
     // capture carries a floor at all, and the recorded one is the exact number
     // rendered into the packet this Agent was shown.

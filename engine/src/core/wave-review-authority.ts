@@ -472,6 +472,31 @@ export function readWaveReviewContext(
 }
 
 /**
+ * One shared Task→row-fields lift, consumed by both Task→row serializations.
+ *
+ * `waveSpecCheckScope` (packet serialization) and `coverageTasks` (projection
+ * join input) differ for good reasons — description, `inCurrentWave`, and
+ * `anchorHashes` diverge — but these four field expressions are the same
+ * mapping written at two seams. Round 3's D4 fix had to touch both mappers,
+ * which is the proof the duplication is live: a domain change to the Task→row
+ * shape required two edits, and a field carried by one serialization could be
+ * dropped by the other. One lift makes that defect structurally impossible —
+ * a new field lands here once, and both serializations derive from it.
+ */
+const taskRowFields = (task: Task): Readonly<{
+  completionAnchors: readonly string[];
+  contributions: readonly string[];
+  declaredFiles: readonly string[];
+  modifiedFiles: readonly string[];
+}> =>
+  Object.freeze({
+    completionAnchors: Object.freeze([...(task.spec_anchors ?? [])]),
+    contributions: Object.freeze([...(task.spec_contributions ?? [])]),
+    declaredFiles: Object.freeze([...(task.file_list ?? [])]),
+    modifiedFiles: Object.freeze([...(task.files_modified ?? [])]),
+  });
+
+/**
  * Immutable current-Wave spec-check scope. Only `completionAnchors` assert
  * Requirement Completion Claims. Every serialized field directly contributes
  * to Context Packet identity; complete TaskGraph bytes, including descriptions,
@@ -483,10 +508,7 @@ export function waveSpecCheckScope(tasks: readonly Task[]): readonly WaveSpecChe
   return Object.freeze(tasks.map((task) => Object.freeze({
     id: task.id,
     description: task.description,
-    completionAnchors: Object.freeze([...(task.spec_anchors ?? [])]),
-    contributions: Object.freeze([...(task.spec_contributions ?? [])]),
-    declaredFiles: Object.freeze([...(task.file_list ?? [])]),
-    modifiedFiles: Object.freeze([...(task.files_modified ?? [])]),
+    ...taskRowFields(task),
   })));
 }
 
@@ -505,17 +527,15 @@ export function waveSpecCheckScope(tasks: readonly Task[]): readonly WaveSpecChe
 const parsedAnchorHashes = (stored: Task["spec_anchor_hashes"]): ReadonlyMap<string, RecordedHash> =>
   new Map(Object.entries(stored ?? {}).map(([claim, raw]) => {
     const hash = parseSpecContentHash(raw);
-    // `raw` is typed `string` by the TaskGraph interface, but nothing on the
-    // load path parses `spec_anchor_hashes` — `migrateParsedTask` spreads the
-    // record through verbatim — so a hand-edited graph can put a number or an
-    // object here. Rendering it later did `stored.slice(0, 16)` and threw a
-    // TypeError out of a function whose contract is a stated refusal, aborting
-    // the Wave Gate. Describe whatever was actually there instead.
+    // The load boundary proves `spec_anchor_hashes` — `migrateParsedTask`
+    // refuses a non-record and describes every non-string value with the same
+    // `<non-string …>` vocabulary this arm used to mint — so `raw` is always a
+    // string here. The unreadable arm keeps covering strings that are not the
+    // shape `specContentHash` mints: a truncated or tampered hash stays
+    // distinguishable from one that was never recorded, and the projection
+    // says so instead of grading the row down silently.
     const recorded: RecordedHash = hash === null
-      ? Object.freeze({
-          kind: "unreadable",
-          stored: typeof raw === "string" ? raw : `<non-string ${typeof raw}>`,
-        })
+      ? Object.freeze({ kind: "unreadable", stored: raw })
       : Object.freeze({ kind: "readable", hash });
     return [claim, recorded] as const;
   }));
@@ -529,10 +549,7 @@ export function coverageTasks(graph: TaskGraph, currentWave: number): readonly C
   return Object.freeze(graph.tasks.map((task) => Object.freeze({
     id: task.id,
     inCurrentWave: task.wave === currentWave,
-    completionAnchors: Object.freeze([...(task.spec_anchors ?? [])]),
-    contributions: Object.freeze([...(task.spec_contributions ?? [])]),
-    declaredFiles: Object.freeze([...(task.file_list ?? [])]),
-    modifiedFiles: Object.freeze([...(task.files_modified ?? [])]),
+    ...taskRowFields(task),
     anchorHashes: parsedAnchorHashes(task.spec_anchor_hashes),
   })));
 }
@@ -781,21 +798,6 @@ export function prepareWaveReviewBatch(
 }
 
 /**
- * The settled CRITICAL floor for one spec-check capture: the number the Agent
- * was shown, read back from the epoch that showed it.
- *
- * Deliberately NOT a re-projection. Re-deriving at capture time reads
- * `spec_anchor_hashes` and the `spec_anchors` of Tasks outside the reviewed
- * Wave, neither of which `batchEpoch` covers, so an edit between packet and
- * capture could raise the enforced floor above the rendered one and fail a
- * report that matched everything the Agent could see. Reading it back makes
- * rendered and enforced the same value by construction rather than by argument.
- *
- * Both absences are real states, and both are stated rather than defaulted: no
- * epoch means the capture is not packet-correlated (a legacy graph, or an
- * operator override), and an epoch without the field predates its recording.
- */
-/**
  * Whether an already-installed epoch is the SAME epoch this batch describes.
  *
  * An exact replay is idempotent and must retain the spec-check evidence
@@ -826,6 +828,21 @@ export function isExactEpochReplay(
     existing.specCheckSlotAuthority?.slot_id === specCheckSlotId;
 }
 
+/**
+ * The settled CRITICAL floor for one spec-check capture: the number the Agent
+ * was shown, read back from the epoch that showed it.
+ *
+ * Deliberately NOT a re-projection. Re-deriving at capture time reads
+ * `spec_anchor_hashes` and the `spec_anchors` of Tasks outside the reviewed
+ * Wave, neither of which `batchEpoch` covers, so an edit between packet and
+ * capture could raise the enforced floor above the rendered one and fail a
+ * report that matched everything the Agent could see. Reading it back makes
+ * rendered and enforced the same value by construction rather than by argument.
+ *
+ * Both absences are real states, and both are stated rather than defaulted: no
+ * epoch means the capture is not packet-correlated (a legacy graph, or an
+ * operator override), and an epoch without the field predates its recording.
+ */
 export function epochSettledFloor(epoch: WaveReviewEpochAuthority | undefined): SettledFloor {
   if (epoch === undefined) {
     return unprojectedFloor("this capture is not packet-correlated, so the Agent was shown no projection");

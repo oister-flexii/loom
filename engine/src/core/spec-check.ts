@@ -61,11 +61,6 @@ function scalarMarker(input: string, name: string, regex: RegExp): ScalarMarker 
   return Object.freeze({ name, matches: Object.freeze(allMatches(input, regex)) });
 }
 
-/**
- * Parse the final concrete spec-check footer, bounded by its verdict when one
- * landed. A final incomplete footer remains authoritative and reconciles to
- * evidence failure; it never lends an earlier footer's counts or verdict.
- */
 /** Collect the itemized finding lines from the authoritative footer block. */
 function footerFindings(searchBlock: string): Readonly<{
   critical: readonly string[];
@@ -82,6 +77,11 @@ function footerFindings(searchBlock: string): Readonly<{
   return findings;
 }
 
+/**
+ * Parse the final concrete spec-check footer, bounded by its verdict when one
+ * landed. A final incomplete footer remains authoritative and reconciles to
+ * evidence failure; it never lends an earlier footer's counts or verdict.
+ */
 export function parseSpecCheckOutput(output: string): ParsedSpecCheckOutput {
   const finalWaveMarker = lastMatch(output, /^SPEC_CHECK_WAVE:\s*.*$/gm);
   const blockStart = finalWaveMarker?.index ?? 0;

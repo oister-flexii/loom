@@ -1863,6 +1863,29 @@ function migrateParsedTask(
     if (!proof.ok) return parseErr(proof.errors.join("; "));
     migrated = { ...migrated, proof: proof.value };
   }
+  // `spec_anchor_hashes` is typed `Record<string, string>` by the TaskGraph
+  // interface and used to reach the projection spread through verbatim, so a
+  // hand-edited graph could put a number or an object here. The boundary now
+  // proves the field: a non-record refuses, and each value must be a string —
+  // a non-string is described with the same vocabulary the projection's
+  // unreadable-record arm uses, so the kept-and-described contract survives
+  // and the type asserts what load proves.
+  if (task.spec_anchor_hashes !== undefined) {
+    if (typeof task.spec_anchor_hashes !== "object" || task.spec_anchor_hashes === null ||
+        Array.isArray(task.spec_anchor_hashes)) {
+      return parseErr(
+        `tasks[${index}].spec_anchor_hashes must be a record of strings when present, ` +
+        `got ${JSON.stringify(task.spec_anchor_hashes)}`,
+      );
+    }
+    migrated = {
+      ...migrated,
+      spec_anchor_hashes: Object.freeze(Object.fromEntries(
+        Object.entries(task.spec_anchor_hashes).map(([claim, value]) =>
+          [claim, typeof value === "string" ? value : `<non-string ${typeof value}>`] as const),
+      )),
+    };
+  }
   if (task.active_implementation_attempt !== undefined) {
     const authority = parseImplementationAttemptAuthority(task.active_implementation_attempt);
     if (!authority.ok) return parseErr(authority.error.errors.join("; "));
