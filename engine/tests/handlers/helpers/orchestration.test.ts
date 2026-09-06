@@ -2942,6 +2942,109 @@ describe("orchestration CLI", () => {
     expect(JSON.parse(replay.stdout).kind).toBe("done");
   }, 30_000);
 
+  it("advances a capture-rejected refutation attempt 1 to its attempt-2 retry and completes the run", async () => {
+    const root = repository();
+    writeFileSync(join(root, "a.txt"), "changed\n");
+    const runsRoot = realpathSync.native(mkdtempSync(join(tmpdir(), "loom-standalone-refutation-tombstone-runs-")));
+    cleanup.push(runsRoot);
+    const runDir = join(runsRoot, "run.standalone-refutation-tombstone");
+    mkdirSync(runDir);
+    const started = runCli([
+      "start", "standalone-review", "--runs-root", runsRoot, "--run", runDir,
+    ], JSON.stringify({ kind: "all", files: ["a.txt"], dryRun: false }), root);
+    expect(started.status, started.stderr).toBe(0);
+    const initial = JSON.parse(started.stdout) as { requests: readonly { authority: AgentRequestAuthority }[] };
+    const opened = openRunDirectory(runsRoot, runDir);
+    if (!opened.ok) throw new Error(opened.error.message);
+    const critical = [
+      "### Machine Summary", "CRITICAL_COUNT: 1", "ADVISORY_COUNT: 0", "CRITICAL: tombstone finding",
+      "```findings", '[{"severity":"critical","file":"a.txt","line":1,"claim":"tombstone finding"}]', "```",
+    ].join("\n");
+    const clean = ["### Machine Summary", "CRITICAL_COUNT: 0", "ADVISORY_COUNT: 0", "```findings", "[]", "```"].join("\n");
+    for (const [index, request] of initial.requests.entries()) {
+      expect((await opened.value.captureTranscript(request.authority, [...Buffer.from(index === 0 ? critical : clean)])).ok).toBe(true);
+    }
+    const panelResult = runCli(["resume", "--runs-root", runsRoot, "--run", runDir], "", root);
+    expect(panelResult.status, panelResult.stderr).toBe(0);
+    const panel = JSON.parse(panelResult.stdout) as {
+      kind: string; requests: readonly { authority: AgentRequestAuthority }[];
+    };
+    expect(panel.kind).toBe("spawn-batch");
+    expect(panel.requests).toHaveLength(3);
+    // Two slots produce valid verdicts; the third reproduces the harness
+    // runtime's exact durable state for a child that exited without a final
+    // payload: the capture runtime persistently rejects the attempt AND the
+    // parent records the audited rejection event. No bytes ever land here.
+    for (const [index, request] of panel.requests.entries()) {
+      if (index === panel.requests.length - 1) {
+        expect((await opened.value.rejectCapture(request.authority, "no-final-payload: result carried no final text payload")).ok).toBe(true);
+        await opened.value.appendEvent({
+          schemaVersion: 1,
+          sequence: 0,
+          dedupKey: `capture-rejected:${request.authority.requestId}`,
+          recordedAtMs: Date.now(),
+          event: {
+            kind: "request-capture-rejected",
+            requestId: request.authority.requestId,
+            slotId: request.authority.slotId,
+            attempt: request.authority.attempt,
+            diagnostic: "no-final-payload: result carried no final text payload",
+          },
+        });
+        continue;
+      }
+      const raw = refutationVerdicts(opened.value, request.authority, "upheld");
+      expect((await opened.value.captureTranscript(request.authority, [...Buffer.from(raw)])).ok).toBe(true);
+    }
+
+    // Resume: the tombstoned attempt-1 slot must NOT be re-issued — the
+    // capture runtime will never accept its bytes again — and the verdict loop
+    // must advance it to its prepared attempt-2 authority through the panel's
+    // rejection path, with the real tombstone diagnostic on the retry task.
+    const resumed = runCli(["resume", "--runs-root", runsRoot, "--run", runDir], "", root);
+
+    expect(resumed.status, resumed.stderr).toBe(0);
+    const retry = JSON.parse(resumed.stdout) as {
+      kind: string; requests: readonly { authority: AgentRequestAuthority; task: string }[];
+    };
+    expect(retry.kind, resumed.stdout).toBe("spawn-batch");
+    expect(retry.requests).toHaveLength(1);
+    const tombstonedSlot = panel.requests.at(-1)!.authority;
+    expect(retry.requests[0]?.authority).toMatchObject({
+      attempt: 2, program: "refutation-panel", slotId: tombstonedSlot.slotId,
+    });
+    expect(retry.requests[0]?.authority.requestId).not.toBe(tombstonedSlot.requestId);
+    expect(retry.requests[0]?.task).toContain("no-final-payload: result carried no final text payload");
+
+    // Convergent replay: a further resume re-issues the exact same attempt-2
+    // retry (the panel's rejection path is deterministic), never the
+    // terminally rejected attempt-1 request again.
+    const replayed = runCli(["resume", "--runs-root", runsRoot, "--run", runDir], "", root);
+    expect(replayed.status, replayed.stderr).toBe(0);
+    const replay = JSON.parse(replayed.stdout) as {
+      kind: string; requests: readonly { authority: AgentRequestAuthority }[];
+    };
+    expect(replay.kind, replayed.stdout).toBe("spawn-batch");
+    expect(replay.requests).toHaveLength(1);
+    expect(replay.requests[0]?.authority.requestId).toBe(retry.requests[0]?.authority.requestId);
+
+    // The attempt-2 retry lands, the panel completes, and the run reaches
+    // idempotent done — and the checkpoint-independent evidence replay proves
+    // the completion from the attempt-2 capture: the tombstoned slot has no
+    // attempt-1 evidence for it to consult, so that advance must hold in the
+    // replay too, not only in the resume path.
+    const retryRequest = retry.requests[0]!;
+    const valid = refutationVerdicts(opened.value, retryRequest.authority, "upheld");
+    expect((await opened.value.captureTranscript(retryRequest.authority, [...Buffer.from(valid)])).ok).toBe(true);
+    const done = runCli(["resume", "--runs-root", runsRoot, "--run", runDir], "", root);
+    expect(done.status, done.stderr).toBe(0);
+    expect(JSON.parse(done.stdout).kind).toBe("done");
+    const evidenceReplay = replayFromCapturedEvidence(opened.value);
+    expect(evidenceReplay, evidenceReplay.ok ? "" : evidenceReplay.message).toMatchObject({ ok: true });
+    const again = runCli(["resume", "--runs-root", runsRoot, "--run", runDir], "", root);
+    expect(JSON.parse(again.stdout).kind).toBe("done");
+  }, 30_000);
+
   it("drives a registered standalone review from spawn-batch to idempotent done", async () => {
     const root = project();
     const runsRoot = join(root, "runs");
