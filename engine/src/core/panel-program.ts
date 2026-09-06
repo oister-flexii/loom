@@ -2423,6 +2423,26 @@ export function submitRefutationVerdict(state: RefutationPanelState, resolver: P
   return reduceParsedRefutation(state, Object.freeze({ schemaVersion: 1, type: "refutation-verdict-accepted", request: resolved.value.identity, value: parsed.value }), resolver);
 }
 
+/**
+ * Records a capture rejection for one refutation verdict: the attempt's bytes
+ * never landed (the harness terminally rejected the capture, e.g. a child that
+ * exited without a final payload), so there is no verdict to parse and the
+ * slot advances to its attempt-2 retry with the capture diagnostic as the
+ * rejection message. `submitRefutationVerdict` cannot record this — its
+ * diagnostic is derived from parsing bytes that never landed — so the resume
+ * that detects the tombstone calls this with the capture runtime's own
+ * diagnostic instead. The category is `malformed-result` because the verdict
+ * was malformed by absence: it never existed as a valid payload.
+ */
+export function rejectRefutationVerdict(state: RefutationPanelState, resolver: PublicationAuthorityResolver, requestIdentity: unknown, diagnostic: string): PersistentPanelResult<PersistentRefutationStep> {
+  if (state.stage !== "awaiting-verdicts") return persistentFailure(panelError("refutation", "unexpected-event", `a capture rejection cannot be recorded during ${state.stage}`));
+  const resolved = resolvePanelRequest("refutation", state.authority.verifierRoster, requestIdentity, resolver);
+  if (!resolved.ok) return resolved;
+  const located = locateProgress(state.authority.verifierRoster, state.slots, resolved.value.expected.requestId);
+  if (!located.ok) return located;
+  return reduceParsedRefutation(state, rejectionEvent("refutation", "verdict", resolved.value.identity, located.value.expected, panelError("refutation", "malformed-result", diagnostic)) as PersistentRefutationPanelEvent, resolver);
+}
+
 function rehydrateAccepted<T>(panel: "architecture" | "refutation", roster: ExactRoster, accepted: readonly DurableAcceptedPanelResult<T>[], resolver: PublicationAuthorityResolver): PersistentPanelResult<readonly AcceptedAgentResult<T>[]> {
   const results: AcceptedAgentResult<T>[] = [];
   for (const durable of accepted) {

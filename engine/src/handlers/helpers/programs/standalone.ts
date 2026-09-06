@@ -9,7 +9,7 @@ import { parseAgentRequestAuthority, parseIssuedSpawnRequest, type AgentRequestA
 import { aggregateStandaloneReview, bindStandaloneCaptureAuthority, captureStandaloneReviewerBytes, canonicalStandaloneResultArtifact, completeStandaloneReviewerCapture, parseStandaloneReviewScope, prepareFreshStandaloneReview, proveStandaloneRosterCompletion, serializeStandaloneReviewAuthority, serializeAdjudicatedStandaloneReview, admitStandaloneTranscript, type FrozenStandaloneReviewAuthority, type StandaloneTranscriptAdmission } from '../../../core/standalone-review';
 import { parseStandaloneReviewMachineState, reduceStandaloneReviewMachine, freezeStandaloneRefutationPanelAuthority, parseStandaloneRefutationCompletion, serializeStandaloneReviewMachineState, startStandaloneReviewMachine, type StandaloneReviewMachineState } from '../../../core/standalone-review-machine';
 import { buildStandaloneFindingBrief, defaultRefutationThreshold, reviewSignals, selectReviewLenses } from '../../../core/review-panel';
-import { completePersistentRefutationPanel, deriveRefutationVerifierBinding, panelRequestIdentity, parseRefutationPanelAuthority, refutationPanelCheckpoint, startPersistentRefutationPanel, submitRefutationVerdict, type PersistentRefutationPanelEvent } from '../../../core/panel-program';
+import { completePersistentRefutationPanel, deriveRefutationVerifierBinding, panelRequestIdentity, parseRefutationPanelAuthority, refutationPanelCheckpoint, rejectRefutationVerdict, startPersistentRefutationPanel, submitRefutationVerdict, type PersistentPanelResult, type PersistentRefutationPanelEvent, type PersistentRefutationStep } from '../../../core/panel-program';
 import { buildContextPacket, encodeByteSection, type ContextPacket } from '../../../orchestration/context-packets';
 import { readRunBytesNoFollow, writeRunBytesExclusiveNoFollow } from '../../../orchestration/no-follow-fs';
 import { captureKey } from '../../../core/harness-capture';
@@ -552,19 +552,39 @@ export function replayStandaloneResultFromEvidence(
       let panelState = startPersistentRefutationPanel(preparation.panel).state;
       const panelEvents: PersistentRefutationPanelEvent[] = [];
       for (const request of durablePanel.requests) {
-        if (request.authority.attempt !== 1 ||
-            !captured.value.has(captureKey(request.authority.slotId, request.authority.attempt))) {
-          return failed(`checkpoint-independent replay is missing initial refutation ${request.authority.requestId}`);
+        if (request.authority.attempt !== 1) {
+          return failed("checkpoint-independent replay requires the initial refutation attempt for every slot");
         }
-        const bytes = witnessedBytes(request.authority);
-        if (!bytes.ok) return failed(bytes.message);
-        let submitted = submitRefutationVerdict(
-          panelState,
-          resolver,
-          panelRequestIdentity(request),
-          Buffer.from(bytes.value).toString("utf8"),
-        );
-        if (!submitted.ok) return failed(submitted.error.message);
+        // Two independent refusal classes for an attempt-1 refutation slot:
+        //   1. captured transcript that fails its process witness or the panel's
+        //      semantic validator (semantic);
+        //   2. capture terminally rejected by the harness runtime (no bytes
+        //      landed at all). Without case 2 the replay refuses a run whose
+        //      result.json was produced through the resume path's tombstone
+        //      advance — the evidence replay can never see the attempt-1
+        //      verdict, so the tombstoned slot's attempt-2 capture IS its
+        //      evidence and the slot advances to it through the panel's
+        //      rejection path here, exactly as the resume path does.
+        let submitted: PersistentPanelResult<PersistentRefutationStep>;
+        if (captured.value.has(captureKey(request.authority.slotId, 1))) {
+          const bytes = witnessedBytes(request.authority);
+          if (!bytes.ok) return failed(bytes.message);
+          submitted = submitRefutationVerdict(
+            panelState,
+            resolver,
+            panelRequestIdentity(request),
+            Buffer.from(bytes.value).toString("utf8"),
+          );
+          if (!submitted.ok) return failed(submitted.error.message);
+        } else {
+          const tombstone = handle.readCaptureRejection(request.authority);
+          if (!tombstone.ok) return failed(tombstone.error.message);
+          if (tombstone.value === null) {
+            return failed(`checkpoint-independent replay is missing initial refutation ${request.authority.requestId}`);
+          }
+          submitted = rejectRefutationVerdict(panelState, resolver, panelRequestIdentity(request), tombstone.value);
+          if (!submitted.ok) return failed(submitted.error.message);
+        }
         panelState = submitted.value.state;
         if (submitted.value.recordedEvent !== undefined) panelEvents.push(submitted.value.recordedEvent);
         if (submitted.value.action?.kind === "spawn-refutation-verifiers") {
@@ -777,11 +797,30 @@ export async function resumeStandaloneFacade(
       const panelRequests = recovered.requests;
       const captured = handle.readCapturedAttempts();
       if (!captured.ok) return failed(captured.error.message);
-      const missing = panelRequests.filter((request) => !captured.value.has(captureKey(request.authority.slotId, request.authority.attempt)));
-      if (missing.length > 0) {
+      // Phase A — admission check for every attempt-1 slot the panel still
+      // expects at attempt 1. Two independent refusal classes both REJECT the
+      // slot HERE — where the panel machine can advance it to attempt 2 —
+      // instead of dead-locking the roster on every resume:
+      //   1. captured transcript the frozen-scope validator refuses (semantic);
+      //   2. capture terminally rejected by the harness runtime (no bytes
+      //      landed at all — a child that exited without a final payload).
+      // Without case 2 the refutation resume re-issues the terminally rejected
+      // attempt-1 request forever — the capture runtime will never accept its
+      // bytes again — dead-locking the panel. The tombstoned slot is dead for
+      // capture, so it is NOT re-issued here; the verdict loop below advances
+      // it to its attempt-2 retry through the panel's rejection path.
+      const reissues: (typeof panelRequests)[number][] = [];
+      const tombstones = new Map<string, string>();
+      for (const request of panelRequests) {
+        if (captured.value.has(captureKey(request.authority.slotId, request.authority.attempt))) continue;
+        const rejection = await durableCaptureRejection(handle, request.authority);
+        if (rejection === null) reissues.push(request);
+        else tombstones.set(request.authority.slotId, rejection);
+      }
+      if (reissues.length > 0) {
         return {
           ok: true,
-          action: { kind: "spawn-batch", runId: handle.runId, requests: executableRefutationRequests(handle, missing, true) },
+          action: { kind: "spawn-batch", runId: handle.runId, requests: executableRefutationRequests(handle, reissues, true) },
         };
       }
       let panelState = startPersistentRefutationPanel(preparation.panel).state;
@@ -795,8 +834,17 @@ export async function resumeStandaloneFacade(
       const panelEvents: PersistentRefutationPanelEvent[] = [];
       for (const request of panelRequests) {
         const bytes = handle.readTranscriptBytes(request.authority);
-        if (!bytes.ok) return failed(bytes.error.message);
-        let submitted = submitRefutationVerdict(panelState, resolver, panelRequestIdentity(request), Buffer.from(bytes.value).toString("utf8"));
+        // A tombstoned attempt-1 slot has no evidence: the capture runtime
+        // terminally rejected the attempt, so there is no verdict to parse.
+        // The slot advances to its attempt-2 retry through the panel's
+        // rejection path — with the capture diagnostic as the rejection
+        // message, which the attempt-2 task repeats to the verifier. Kept
+        // as a fail-closed guard: a runtime whose missing-filter and this
+        // loop disagree must fail loudly, not pass an undefined tombstone
+        // downstream as if the slot had a verdict.
+        let submitted = bytes.ok
+          ? submitRefutationVerdict(panelState, resolver, panelRequestIdentity(request), Buffer.from(bytes.value).toString("utf8"))
+          : rejectRefutationVerdict(panelState, resolver, panelRequestIdentity(request), tombstones.get(request.authority.slotId) ?? bytes.error.message);
         if (!submitted.ok) return failed(submitted.error.message);
         panelState = submitted.value.state;
         if (submitted.value.recordedEvent !== undefined) panelEvents.push(submitted.value.recordedEvent);
