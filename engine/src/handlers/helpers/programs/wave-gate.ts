@@ -8,7 +8,7 @@ import { createHash } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { awaitUserAction, parseAgentRequestAuthority, parseStoredAgentRequestAuthority, canonicalStructuralEquals, parseArtifactDigest, parseOrchestrationRunId, parseRequestId, type AgentRequestAuthority, type AwaitUserAction, type InitialSpawnRequestInput, type SpawnRequest } from '../../../core/orchestration-contract';
 import { defaultRefutationThreshold } from '../../../core/review-panel';
-import { completePersistentRefutationPanel, deriveRefutationVerifierBinding, panelRequestIdentity, parseRefutationPanelAuthority, startPersistentRefutationPanel, submitRefutationVerdict, type RefutationPanelAuthority } from '../../../core/panel-program';
+import { completePersistentRefutationPanel, deriveRefutationVerifierBinding, panelRequestIdentity, parseRefutationPanelAuthority, rejectRefutationVerdict, startPersistentRefutationPanel, submitRefutationVerdict, type RefutationPanelAuthority } from '../../../core/panel-program';
 import type { FindingOutcome } from '../../../core/review-panel';
 import { buildContextPacket, encodeByteSection, type ContextPacket } from '../../../orchestration/context-packets';
 import { captureKey } from '../../../core/harness-capture';
@@ -1986,7 +1986,24 @@ export async function resumeWaveGateFacade(
           const retry = await recoverOrPublishRefutationRetry(
             handle, retryAuthority, preparation.retryInputs, resolver, "wave-refutation",
           );
-          if (!retry.ok) return waveBlocked(handle, retry.message);
+          if (!retry.ok) {
+            // The attempt-2 capture was TERMINALLY rejected: the capture runtime
+            // refuses any future capture for this slot, so re-issuing the spawn
+            // can never land evidence — that is the attempt-2 doom loop this
+            // exists to break. Attempt 2 is the FINAL attempt, so the panel
+            // machine records the rejection as an explicit panel rejection
+            // (terminal-blocked) instead of the resume blocking on the same raw
+            // recovery error forever — the same terminal path a semantic
+            // attempt-2 rejection already takes.
+            if (retry.kind !== "capture-rejected" || retry.request === null) return waveBlocked(handle, retry.message);
+            submitted = rejectRefutationVerdict(panelState, resolver, panelRequestIdentity(retry.request), retry.rejection);
+            if (!submitted.ok) return waveBlocked(handle, submitted.error.message);
+            panelState = submitted.value.state;
+            if (submitted.value.action?.kind === "refutation-blocked") {
+              return waveBlocked(handle, `Wave refutation panel terminally blocked: ${submitted.value.action.diagnostic.message}`);
+            }
+            return waveBlocked(handle, "refutation capture rejection did not terminal-block the panel");
+          }
           const attempts = handle.readCapturedAttempts();
           if (!attempts.ok) return waveBlocked(handle, attempts.error.message);
           if (!attempts.value.has(captureKey(retry.request.authority.slotId, retry.request.authority.attempt))) {

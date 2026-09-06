@@ -853,7 +853,25 @@ export async function resumeStandaloneFacade(
           const retry = await recoverOrPublishRefutationRetry(
             handle, retryAuthority, preparation.retryInputs, resolver, "standalone-refutation",
           );
-          if (!retry.ok) return failed(retry.message);
+          if (!retry.ok) {
+            // The attempt-2 capture was TERMINALLY rejected: the capture
+            // runtime refuses any future capture for this slot, so re-issuing
+            // the spawn can never land evidence — that is the attempt-2 doom
+            // loop this exists to break. Attempt 2 is the FINAL attempt, so
+            // the panel machine records the rejection as an explicit panel
+            // rejection (terminal-blocked) instead of the resume re-failing
+            // the same raw recovery error forever — the same terminal path a
+            // semantic attempt-2 rejection already takes.
+            if (retry.kind !== "capture-rejected" || retry.request === null) return failed(retry.message);
+            submitted = rejectRefutationVerdict(panelState, resolver, panelRequestIdentity(retry.request), retry.rejection);
+            if (!submitted.ok) return failed(submitted.error.message);
+            panelState = submitted.value.state;
+            if (submitted.value.recordedEvent !== undefined) panelEvents.push(submitted.value.recordedEvent);
+            if (submitted.value.action?.kind === "refutation-blocked") {
+              return failed(submitted.value.action.diagnostic.message);
+            }
+            return failed("refutation capture rejection did not terminal-block the panel");
+          }
           const attempts = handle.readCapturedAttempts();
           if (!attempts.ok) return failed(attempts.error.message);
           if (!attempts.value.has(captureKey(retry.request.authority.slotId, retry.request.authority.attempt))) {

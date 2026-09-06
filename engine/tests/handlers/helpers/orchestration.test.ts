@@ -1538,9 +1538,13 @@ describe("orchestration CLI", () => {
     });
     const exhausted = runCli(["resume", "--runs-root", runsRoot, "--run", runDir], "", root);
     expect(exhausted.status, exhausted.stderr).toBe(0);
+    // The panel machine owns the rejection prose: the blocked diagnostic is
+    // the panel's terminal one (the loop frames the verdict, the panel's
+    // message carries the cause), not the raw recovery prefix the loop used
+    // to block with before routing through the panel's own rejection path.
     expect(JSON.parse(exhausted.stdout)).toMatchObject({
       kind: "blocked",
-      diagnostic: { message: expect.stringContaining("attempt 2 exhausted after capture rejection") },
+      diagnostic: { message: expect.stringContaining("Wave refutation panel terminally blocked") },
     });
   }, 30_000);
 
@@ -3043,6 +3047,101 @@ describe("orchestration CLI", () => {
     expect(evidenceReplay, evidenceReplay.ok ? "" : evidenceReplay.message).toMatchObject({ ok: true });
     const again = runCli(["resume", "--runs-root", runsRoot, "--run", runDir], "", root);
     expect(JSON.parse(again.stdout).kind).toBe("done");
+  }, 30_000);
+
+  it("terminalizes the refutation panel when the attempt-2 capture is terminally rejected", async () => {
+    const root = repository();
+    writeFileSync(join(root, "a.txt"), "changed\n");
+    const runsRoot = realpathSync.native(mkdtempSync(join(tmpdir(), "loom-standalone-refutation-attempt2-tombstone-runs-")));
+    cleanup.push(runsRoot);
+    const runDir = join(runsRoot, "run.standalone-refutation-attempt2-tombstone");
+    mkdirSync(runDir);
+    const started = runCli([
+      "start", "standalone-review", "--runs-root", runsRoot, "--run", runDir,
+    ], JSON.stringify({ kind: "all", files: ["a.txt"], dryRun: false }), root);
+    expect(started.status, started.stderr).toBe(0);
+    const initial = JSON.parse(started.stdout) as { requests: readonly { authority: AgentRequestAuthority }[] };
+    const opened = openRunDirectory(runsRoot, runDir);
+    if (!opened.ok) throw new Error(opened.error.message);
+    const critical = [
+      "### Machine Summary", "CRITICAL_COUNT: 1", "ADVISORY_COUNT: 0", "CRITICAL: doomed finding",
+      "```findings", '[{"severity":"critical","file":"a.txt","line":1,"claim":"doomed finding"}]', "```",
+    ].join("\n");
+    const clean = ["### Machine Summary", "CRITICAL_COUNT: 0", "ADVISORY_COUNT: 0", "```findings", "[]", "```"].join("\n");
+    for (const [index, request] of initial.requests.entries()) {
+      expect((await opened.value.captureTranscript(request.authority, [...Buffer.from(index === 0 ? critical : clean)])).ok).toBe(true);
+    }
+    const panelResult = runCli(["resume", "--runs-root", runsRoot, "--run", runDir], "", root);
+    expect(panelResult.status, panelResult.stderr).toBe(0);
+    const panel = JSON.parse(panelResult.stdout) as {
+      kind: string; requests: readonly { authority: AgentRequestAuthority }[];
+    };
+    expect(panel.kind).toBe("spawn-batch");
+    expect(panel.requests).toHaveLength(3);
+    // Two slots produce valid verdicts; the third is terminally rejected on
+    // attempt 1 — the harness tombstones it and journals the audited event,
+    // and no bytes ever land.
+    const tombstone = async (authority: AgentRequestAuthority) => {
+      expect((await opened.value.rejectCapture(authority, "no-final-payload: result carried no final text payload")).ok).toBe(true);
+      await opened.value.appendEvent({
+        schemaVersion: 1,
+        sequence: 0,
+        dedupKey: `capture-rejected:${authority.requestId}`,
+        recordedAtMs: Date.now(),
+        event: {
+          kind: "request-capture-rejected",
+          requestId: authority.requestId,
+          slotId: authority.slotId,
+          attempt: authority.attempt,
+          diagnostic: "no-final-payload: result carried no final text payload",
+        },
+      });
+    };
+    for (const [index, request] of panel.requests.entries()) {
+      if (index === panel.requests.length - 1) {
+        await tombstone(request.authority);
+        continue;
+      }
+      const raw = refutationVerdicts(opened.value, request.authority, "upheld");
+      expect((await opened.value.captureTranscript(request.authority, [...Buffer.from(raw)])).ok).toBe(true);
+    }
+
+    // First resume: the tombstoned attempt-1 advances to its attempt-2 retry
+    // (the prior fix's rejection path), never the rejected attempt-1 again.
+    const advanced = runCli(["resume", "--runs-root", runsRoot, "--run", runDir], "", root);
+    expect(advanced.status, advanced.stderr).toBe(0);
+    const retry = JSON.parse(advanced.stdout) as {
+      kind: string; requests: readonly { authority: AgentRequestAuthority }[];
+    };
+    expect(retry.kind, advanced.stdout).toBe("spawn-batch");
+    expect(retry.requests).toHaveLength(1);
+    expect(retry.requests[0]?.authority).toMatchObject({
+      attempt: 2, program: "refutation-panel", slotId: panel.requests.at(-1)!.authority.slotId,
+    });
+
+    // THE DOOM LOOP this exists to break: the attempt-2 capture is ALSO
+    // terminally rejected — the state that used to re-issue the spawn forever,
+    // because the capture runtime will never accept its bytes again. Attempt 2
+    // is the FINAL attempt, so the resume must terminalize through the panel's
+    // own rejection path (the panel machine terminal-blocks) instead of
+    // re-failing the same raw recovery error on every resume.
+    await tombstone(retry.requests[0]!.authority);
+    const blocked = runCli(["resume", "--runs-root", runsRoot, "--run", runDir], "", root);
+    expect(blocked.status, blocked.stdout).not.toBe(0);
+    // The panel owns the rejection prose: the diagnostic is the panel's
+    // terminal one, carrying the capture cause — not the raw recovery prefix
+    // the resume used to re-fail with forever.
+    expect(blocked.stderr).toContain("no-final-payload: result carried no final text payload");
+    expect(blocked.stderr).not.toContain("exhausted after capture rejection");
+    // And the resume must NOT re-issue the attempt-2 spawn: no capture will
+    // ever land, so the spawn is unissuable.
+    expect(blocked.stdout).not.toContain("spawn-batch");
+
+    // Idempotent: a further resume repeats the same loud terminal failure —
+    // never a spawn.
+    const replayed = runCli(["resume", "--runs-root", runsRoot, "--run", runDir], "", root);
+    expect(replayed.status, replayed.stderr).not.toBe(0);
+    expect(replayed.stdout).not.toContain("spawn-batch");
   }, 30_000);
 
   it("drives a registered standalone review from spawn-batch to idempotent done", async () => {
