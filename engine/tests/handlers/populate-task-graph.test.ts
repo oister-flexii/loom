@@ -18,6 +18,7 @@ import {
   defaultVerificationManifest,
   freezeVerificationManifest,
 } from "../../src/core/verification-manifest";
+import { capturedSpecCheck } from "../../src/core/spec-check";
 
 /**
  * Exercises the REAL populate-task-graph overwrite guard through the handler's
@@ -387,16 +388,7 @@ describe("populate-task-graph — protected verification manifest authority", ()
         specCheckSlotAuthority: { slot_id: "wave-slot:stale", attempted: 1 },
         settledSpecCheckFloor: { kind: "unprojected", reason: "stale population" },
       } as TaskGraph["wave_review_epoch"],
-      spec_check: {
-        wave: 1,
-        run_at: "before",
-        verdict: "PASSED",
-        critical_count: 0,
-        high_count: 0,
-        critical_findings: [],
-        high_findings: [],
-        medium_findings: [],
-      },
+      spec_check: capturedSpecCheck({ wave: 1, runAt: "before", criticalFindings: [] }),
     });
     const manifestPath = writeManifest(dir, manifestDocument("npm"));
     const expected = freezeVerificationManifest(readFileSync(manifestPath));

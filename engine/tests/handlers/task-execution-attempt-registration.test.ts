@@ -30,6 +30,7 @@ import {
 } from "../../src/core/implementation-completion";
 import { taskFixture, graphFixture } from "../fixtures/task-lifecycle";
 import { deriveImplementationRetryDisposition } from "../../src/core/implementation-retry";
+import { capturedSpecCheck } from "../../src/core/spec-check";
 import type { TaskGraph } from "../../src/types";
 
 const roots: string[] = [];
@@ -507,16 +508,11 @@ describe("modern implementation attempt registration", () => {
         batchEpoch: "b".repeat(64) as never,
         specCheckSlotAuthority: { slot_id: "wave-slot:stale" as never, attempted: 1 },
       },
-      spec_check: {
+      spec_check: capturedSpecCheck({
         wave: 1,
-        run_at: "2020-01-01T00:01:00.000Z",
-        verdict: "PASSED",
-        critical_count: 0,
-        high_count: 0,
-        critical_findings: [],
-        high_findings: [],
-        medium_findings: [],
-      },
+        runAt: "2020-01-01T00:01:00.000Z",
+        criticalFindings: [],
+      }),
       wave_gates: {
         "1": { impl_complete: true, tests_passed: true, reviews_complete: true, blocked: false },
       },

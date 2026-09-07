@@ -2,12 +2,13 @@ import { describe, expect, it } from "vitest";
 import fc from "fast-check";
 import { parseSpec } from "../../src/core/parse-spec";
 import {
+  parseAuthoredTaskRoster,
   populateTaskGraph,
   type AuthoredTask,
-  type NonEmptyAuthoredTasks,
   type TaskGraphPopulationCommand,
 } from "../../src/core/task-graph-population";
 import { defaultVerificationManifest } from "../../src/core/verification-manifest";
+import { parseArtifactDigest } from "../../src/core/orchestration-contract";
 import type { TaskGraph } from "../../src/types";
 
 const specSource = `# Feature: Population
@@ -36,10 +37,12 @@ const specSource = `# Feature: Population
 
 const parsedSpec = parseSpec(specSource);
 if (!parsedSpec.ok) throw new Error("population fixture specification must parse");
+const parsedDigest = parseArtifactDigest("a".repeat(64));
+if (!parsedDigest.ok) throw new Error("population fixture Artifact Digest must parse");
 const specIndex = Object.freeze({
   kind: "indexed" as const,
   path: "spec.md",
-  contentDigest: "a".repeat(64),
+  contentDigest: parsedDigest.value,
   index: parsedSpec.value,
 });
 
@@ -59,6 +62,12 @@ const authoredTask = (id: string, wave: number, anchors: readonly string[] = ["F
     file_list: Object.freeze([`src/${id}.ts`]),
   });
 
+const roster = (tasks: readonly AuthoredTask[]) => {
+  const parsed = parseAuthoredTaskRoster(tasks);
+  if (!parsed.ok) throw new Error(`invalid authored roster fixture: ${parsed.error}`);
+  return parsed.value;
+};
+
 const graph = (overrides: Partial<TaskGraph> = {}): TaskGraph => ({
   current_phase: "decompose",
   phase_artifacts: {},
@@ -74,7 +83,7 @@ const command = (overrides: Partial<TaskGraphPopulationCommand> = {}): TaskGraph
   planTitle: "Population plan",
   validatedPlanFile: "plan.md",
   authoredSpecFile: "spec.md",
-  tasks: [authoredTask("T1", 1)],
+  tasks: roster([authoredTask("T1", 1)]),
   verificationManifest: defaultVerificationManifest(),
   specIndex,
   observedSpecFile: "spec.md",
@@ -87,7 +96,7 @@ describe("populateTaskGraph aggregate command", () => {
     const result = populateTaskGraph(graph({
       active_wave_completion_suite: { stale: true } as never,
     }), command({
-      tasks: [authoredTask("T1", 1), authoredTask("T2", 2, ["AS-001"])],
+      tasks: roster([authoredTask("T1", 1), authoredTask("T2", 2, ["AS-001"])]),
       issue: 43,
       repo: "peterstorm/loom",
     }));
@@ -128,6 +137,19 @@ describe("populateTaskGraph aggregate command", () => {
     expect(populateTaskGraph(graph(), forged)).toMatchObject({
       ok: false,
       error: { kind: "no-tasks" },
+    });
+  });
+
+  it.each([
+    ["zero", [authoredTask("T1", 0)]],
+    ["unsafe", [authoredTask("T1", Number.MAX_SAFE_INTEGER + 1)]],
+    ["gap", [authoredTask("T1", 1), authoredTask("T3", 3)]],
+  ])("refuses %s Wave topology before it becomes command authority", (_label, tasks) => {
+    expect(parseAuthoredTaskRoster(tasks)).toMatchObject({ ok: false });
+    const forged = { ...command(), tasks } as unknown as TaskGraphPopulationCommand;
+    expect(populateTaskGraph(graph(), forged)).toMatchObject({
+      ok: false,
+      error: { kind: "invalid-task-waves" },
     });
   });
 
@@ -200,10 +222,10 @@ describe("populateTaskGraph aggregate command", () => {
       fc.integer({ min: 1, max: 8 }),
       (waveCount) => {
         const waves = Array.from({ length: waveCount }, (_, index) => index + 1);
-        const tasks: NonEmptyAuthoredTasks = [
+        const tasks = roster([
           authoredTask("T1", 1),
           ...waves.slice(1).map((wave) => authoredTask(`T${wave}`, wave)),
-        ];
+        ]);
         const result = populateTaskGraph(graph(), command({ tasks }));
         expect(result.ok).toBe(true);
         if (!result.ok) return;

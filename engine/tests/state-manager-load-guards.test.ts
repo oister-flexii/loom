@@ -9,9 +9,13 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   parseCompletedWaveGateRegistration,
   parseTaskGraph,
+  StateManager,
 } from "../src/state-manager";
 import {
   authorizeWaveCompletionSuite,
@@ -281,6 +285,42 @@ describe("taskFindingsError slot_authority validation", () => {
   it("accepts a second attempt on a slot", () => {
     const [first, second] = slots();
     expect(parseTaskGraph(withSlots([{ ...first!, attempted: 2 }, second])).ok).toBe(true);
+  });
+});
+
+describe("stored Finding location authority", () => {
+  const finding = {
+    id: "code-reviewer-1",
+    agent: "code-reviewer",
+    severity: "critical",
+    file: null,
+    line: null,
+    claim: "load boundary must prove locations",
+  };
+
+  it.each([
+    ["omitted file", (({ file: _file, ...rest }) => rest)(finding)],
+    ["numeric file", { ...finding, file: 42 }],
+    ["object line", { ...finding, line: {} }],
+    ["unsafe line", { ...finding, line: Number.MAX_SAFE_INTEGER + 1 }],
+  ])("installs parser-normalized locations for a finding with %s", (_label, malformed) => {
+    const parsed = parseTaskGraph(graph({
+      tasks: [{
+        ...validTask,
+        review_status: "blocked",
+        findings: [malformed],
+        critical_findings: [finding.claim],
+        advisory_findings: [],
+      }],
+      wave_gates: { "1": { impl_complete: false, tests_passed: null, reviews_complete: false, blocked: true } },
+    }));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.tasks[0]?.findings?.[0]).toMatchObject({
+      file: null,
+      line: null,
+      claim: finding.claim,
+    });
   });
 });
 
@@ -560,6 +600,9 @@ describe("parseTaskGraph wave_review_epoch authority", () => {
     ["blank settled identity", waveReviewEpoch({
       settledSpecCheckFloor: { kind: "settled", count: 1, criticalFindings: ["  "] },
     })],
+    ["duplicate settled identity", waveReviewEpoch({
+      settledSpecCheckFloor: { kind: "settled", count: 2, criticalFindings: ["same", "same"] },
+    })],
     ["unprojected floor with no reason", waveReviewEpoch({ settledSpecCheckFloor: { kind: "unprojected" } })],
     ["unprojected floor with a blank reason", waveReviewEpoch({ settledSpecCheckFloor: { kind: "unprojected", reason: "  " } })],
   ])("refuses %s", (_label, epoch) => {
@@ -791,6 +834,49 @@ describe("parseTaskGraph spec_check count and provenance authority", () => {
     });
   });
 
+  it("migrates UNKNOWN with critical findings without leaving a causeless Wave block", () => {
+    const parsed = parseTaskGraph(graph({
+      spec_check: captured({
+        verdict: "UNKNOWN",
+        critical_count: 1,
+        critical_findings: ["historical blocker"],
+      }),
+      wave_gates: {
+        "1": { impl_complete: false, tests_passed: null, reviews_complete: false, blocked: true },
+      },
+    }));
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.spec_check).toMatchObject({
+      verdict: "EVIDENCE_CAPTURE_FAILED",
+      cause: "transcript",
+    });
+    expect(parsed.value.wave_gates["1"]?.blocked).toBe(false);
+  });
+
+  it("preserves a legitimate review block while migrating UNKNOWN evidence", () => {
+    const finding = {
+      id: "code-reviewer-1", agent: "code-reviewer", severity: "critical",
+      file: null, line: null, claim: "review blocker",
+    };
+    const parsed = parseTaskGraph(graph({
+      tasks: [{
+        ...validTask, review_status: "blocked", findings: [finding],
+        critical_findings: [finding.claim], advisory_findings: [],
+      }],
+      spec_check: captured({
+        verdict: "UNKNOWN", critical_count: 1, critical_findings: ["historical blocker"],
+      }),
+      wave_gates: {
+        "1": { impl_complete: false, tests_passed: null, reviews_complete: false, blocked: true },
+      },
+    }));
+
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) expect(parsed.value.wave_gates["1"]?.blocked).toBe(true);
+  });
+
   it("round-trips a non-empty manual override source", () => {
     const source = { kind: "manual-override", reason: "operator accepted false-positive" };
     const parsed = parseTaskGraph(graph({ spec_check: captured({ evidence_source: source }) }));
@@ -872,6 +958,22 @@ describe("untrusted test_result label validation", () => {
 
   it("refuses a non-string untrusted label", () => {
     expect(errorOf(withTestResult(42))).toContain("non-empty label naming the weak source");
+  });
+});
+
+describe("StateManager byte decoding", () => {
+  it("rejects malformed UTF-8 before attempting JSON parsing", () => {
+    const root = mkdtempSync(join(tmpdir(), "loom-invalid-state-utf8-"));
+    const stateDirectory = join(root, ".claude", "state");
+    const statePath = join(stateDirectory, "active_task_graph.json");
+    mkdirSync(stateDirectory, { recursive: true });
+    writeFileSync(statePath, Buffer.from([0x7b, 0x22, 0x78, 0x22, 0x3a, 0x22, 0xc3, 0x28, 0x22, 0x7d]));
+    try {
+      expect(() => new StateManager(statePath).load()).toThrow(/invalid UTF-8/u);
+      expect(() => new StateManager(statePath).load()).not.toThrow(/invalid JSON/u);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

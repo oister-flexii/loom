@@ -263,7 +263,29 @@ function frozenCapturedSpecCheck(
     ...(evidenceSource === undefined
       ? {}
       : { evidence_source: Object.freeze({ ...evidenceSource }) }),
-  });
+  }) as CapturedSpecCheck;
+}
+
+export type CapturedSpecCheckInput = Readonly<{
+  wave: number;
+  runAt: string;
+  criticalFindings: readonly string[];
+  highFindings?: readonly string[];
+  mediumFindings?: readonly string[];
+  evidenceSource?: CapturedSpecCheck["evidence_source"];
+}>;
+
+/** Semantic mint for trusted in-memory callers; verdict and counts are derived. */
+export function capturedSpecCheck(input: CapturedSpecCheckInput): CapturedSpecCheck {
+  return frozenCapturedSpecCheck(
+    input.wave,
+    input.runAt,
+    input.criticalFindings.length === 0 ? "PASSED" : "BLOCKED",
+    input.criticalFindings,
+    input.highFindings ?? [],
+    input.mediumFindings ?? [],
+    input.evidenceSource,
+  );
 }
 
 const evidenceFailure = (
@@ -381,8 +403,15 @@ export function reconcileSpecCheck(
     );
   }
   if (floorAuthority.kind === "settled") {
-    const reported = new Set(parsed.critical);
-    const omitted = floorAuthority.criticalFindings.filter((finding) => !reported.has(finding));
+    // Multiset subtraction keeps this correct even for a forged typed floor;
+    // the persisted parser additionally rejects duplicate identities outright.
+    const remaining = [...parsed.critical];
+    const omitted = floorAuthority.criticalFindings.filter((finding) => {
+      const index = remaining.indexOf(finding);
+      if (index < 0) return true;
+      remaining.splice(index, 1);
+      return false;
+    });
     if (omitted.length > 0) {
       return evidenceFailure(
         wave,

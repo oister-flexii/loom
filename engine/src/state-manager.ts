@@ -32,6 +32,9 @@ import {
   findingIdCollisionError,
   findingsLockstepError,
   findingsUnionError,
+  parseStoredFindings,
+  parseStoredRefutations,
+  parseStoredResolutions,
   findingsViewError,
   evidenceFailureError,
   refutationsUnionError,
@@ -70,7 +73,8 @@ import {
 import { parseDeclaredArtifactBaseline } from "./core/artifact-baseline";
 import { parseSettledFloor } from "./core/requirement-coverage";
 import { parseStoredSpecCheck } from "./core/spec-check";
-import { waveHasBlockCause } from "./core/wave-gate-model";
+import { reconcileWaveBlock, waveHasBlockCause, type WaveGate } from "./core/wave-gate-model";
+import { waveGateAuthorityDigest } from "./core/wave-review-authority";
 import { parseIssuedReviewPacketRegistration, parseReviewPath } from "./core/review-packet";
 import { assertPiCliMutationCompatible, captureLoomRuntimeIdentity } from "./runtime-compatibility";
 import { isExactGitSha } from "./core/git-sha";
@@ -1958,6 +1962,19 @@ function migrateParsedTask(
   migrated = parsedNewTests === null
     ? withoutLegacyNewTests
     : { ...withoutLegacyNewTests, ...storedNewTestEvidence(parsedNewTests) };
+  // Install parser-produced Finding values rather than retaining the raw JSON
+  // records that were merely accepted as parseable. This preserves legacy
+  // location normalization while ensuring downstream panel code receives the
+  // exact `string | null` / positive-safe-integer-or-null shape Task promises.
+  if (task.findings !== undefined) {
+    migrated = { ...migrated, findings: Object.freeze(parseStoredFindings(task.findings)) };
+  }
+  if (task.refuted_findings !== undefined) {
+    migrated = { ...migrated, refuted_findings: Object.freeze(parseStoredRefutations(task.refuted_findings)) };
+  }
+  if (task.resolved_findings !== undefined) {
+    migrated = { ...migrated, resolved_findings: Object.freeze(parseStoredResolutions(task.resolved_findings)) };
+  }
   return parseOk(migrated);
 }
 
@@ -2301,8 +2318,23 @@ export function parseTaskGraph(raw: unknown): ParseResult<ParsedTaskGraph> {
   if (!waveGates.ok) return parseErr(waveGates.error);
   const specCheck = parseSpecCheckField(obj.spec_check);
   if (!specCheck.ok) return parseErr(specCheck.error);
+  const rawSpecCheck = typeof obj.spec_check === "object" && obj.spec_check !== null &&
+      !Array.isArray(obj.spec_check)
+    ? obj.spec_check as Record<string, unknown>
+    : null;
+  // UNKNOWN was a captured-count state. Its migration deliberately discards
+  // those unusable counts, so reconcile the old spec-check-only block from the
+  // migrated evidence before enforcing the no-causeless-block invariant.
+  const migratedWaveGates = rawSpecCheck?.verdict === "UNKNOWN" && specCheck.value !== undefined
+    ? reconcileWaveBlock(
+        waveGates.value as Readonly<Record<string, WaveGate>>,
+        tasks.value as Task[],
+        specCheck.value,
+        specCheck.value.wave,
+      )
+    : waveGates.value;
   const blockedCauseError = blockedGateCauseError(
-    waveGates.value,
+    migratedWaveGates,
     tasks.value as Record<string, unknown>[],
     specCheck.value,
   );
@@ -2317,7 +2349,7 @@ export function parseTaskGraph(raw: unknown): ParseResult<ParsedTaskGraph> {
     skippedPhases,
     tasks: tasks.value,
     executingTasks: executingTasks.value,
-    waveGates: waveGates.value,
+    waveGates: migratedWaveGates,
     specCheck: specCheck.value,
     authority: authority.value,
     history: history.value,
@@ -2472,7 +2504,15 @@ export class StateManager {
   }
 
   private loadFrom(directory: AnchoredDirectory): ParsedTaskGraph {
-    const raw = readDirectoryFileNoFollow(directory, this.authority.leaf).toString("utf8");
+    const bytes = readDirectoryFileNoFollow(directory, this.authority.leaf);
+    let raw: string;
+    try {
+      raw = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch (error) {
+      throw new Error(
+        `Corrupt state file (invalid UTF-8): ${this.path} — ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
@@ -2507,11 +2547,20 @@ export class StateManager {
   async updateAndReturn<T>(
     fn: (state: ParsedTaskGraph) => Readonly<{ state: TaskGraph; value: T }>,
   ): Promise<T> {
-    return this.atomicWrite((directory) => fn(this.loadFrom(directory)));
+    return this.atomicWrite((directory) => {
+      const current = this.loadFrom(directory);
+      const produced = fn(current);
+      return produced.state === current
+        ? { ...produced, persist: false as const }
+        : produced;
+    });
   }
 
   /** Install one fresh protected active-run anchor, idempotently for exact replay. */
-  async registerActiveWaveGate(rawRegistration: unknown): Promise<ActiveWaveGateRegistration> {
+  async registerActiveWaveGate(
+    rawRegistration: unknown,
+    publishedTaskIds: readonly string[],
+  ): Promise<ActiveWaveGateRegistration> {
     const parsed = parseActiveWaveGateRegistration(rawRegistration);
     if (!parsed.ok) throw new Error(`Invalid active Wave Gate registration: ${parsed.error}`);
     const registration = parsed.value;
@@ -2544,6 +2593,17 @@ export class StateManager {
         }
         throw new Error(
           `Legacy terminal Wave Gate run ${existing.runId} must be explicitly migrated to terminal history before registering another run`,
+        );
+      }
+      const lockedTaskIds = state.tasks
+        .filter((task) => task.wave === registration.wave)
+        .map(({ id }) => id);
+      const rosterMatches = lockedTaskIds.length === publishedTaskIds.length &&
+        lockedTaskIds.every((taskId, index) => taskId === publishedTaskIds[index]);
+      const lockedDigest = waveGateAuthorityDigest(registration.wave, lockedTaskIds, state);
+      if (!rosterMatches || lockedDigest !== registration.authorityDigest) {
+        throw new Error(
+          "Protected Wave authority changed after Run Directory publication; active Wave Gate was not installed",
         );
       }
       return { state: { ...state, active_wave_gate: registration }, value: registration };
@@ -2633,7 +2693,12 @@ export class StateManager {
 
   /** lock → derive/parse → stage read-only bytes → anchored pathname rename → unlock */
   private async atomicWrite<T>(
-    produce: (directory: AnchoredDirectory) => Readonly<{ state: TaskGraph; value: T }>,
+    produce: (directory: AnchoredDirectory) => Readonly<{
+      state: TaskGraph;
+      value: T;
+      /** Exact-state refusal/idempotent replay: keep bytes and metadata untouched. */
+      persist?: false;
+    }>,
   ): Promise<T> {
     // This is the final shared write boundary, including replacement/repair
     // paths. Check before lock creation so a skewed fresh CLI leaves the
@@ -2643,6 +2708,7 @@ export class StateManager {
     return withStateDirectoryAsync(directory, `TaskGraph atomic write of ${this.path}`, () =>
       withAnchoredDirectoryHandleLock(directory, ".task_graph", () => {
         const produced = produce(directory);
+        if (produced.persist === false) return produced.value;
         const parsed = parseTaskGraph(produced.state);
         if (!parsed.ok) throw new Error(`Refusing to persist invalid task graph (${parsed.error}): ${this.path}`);
         writeDirectoryFileAtomicModeNoFollow(

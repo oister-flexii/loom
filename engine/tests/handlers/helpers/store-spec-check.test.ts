@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execSync, spawnSync } from "node:child_process";
 import type { TaskGraph } from "../../../src/types";
+import { capturedSpecCheck } from "../../../src/core/spec-check";
 
 const CLI_PATH = join(__dirname, "../../../src/cli.ts");
 
@@ -85,10 +86,9 @@ describe("store-spec-check helper", () => {
   it("replaces a prior critical spec-check and clears its derived Wave block", () => {
     const blocked: TaskGraph = {
       ...readState(),
-      spec_check: {
-        wave: 1, run_at: "earlier", verdict: "BLOCKED", critical_count: 1, high_count: 0,
-        critical_findings: ["earlier blocker"], high_findings: [], medium_findings: [],
-      },
+      spec_check: capturedSpecCheck({
+        wave: 1, runAt: "earlier", criticalFindings: ["earlier blocker"],
+      }),
       wave_gates: {
         "1": { impl_complete: false, tests_passed: null, reviews_complete: false, blocked: true },
       },

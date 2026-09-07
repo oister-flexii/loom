@@ -716,6 +716,34 @@ describe("Pi extension review tool_result integration", () => {
     expect(errors).toEqual(["roster: lock unavailable"]);
   });
 
+  it("continues startup cleanup after failure and surfaces stack plus UI warning", async () => {
+    const extensionSpecifier = "../../pi/extension.ts";
+    const module = await import(/* @vite-ignore */ extensionSpecifier) as {
+      runPiStartupSweeps: (
+        sweeps: readonly { name: string; run: () => void }[],
+        ports: { writeDiagnostic: (diagnostic: string) => void; notifyWarning: (message: string) => void },
+      ) => void;
+    };
+    const calls: string[] = [];
+    const diagnostics: string[] = [];
+    const warnings: string[] = [];
+
+    module.runPiStartupSweeps([
+      { name: "stale-sessions", run: () => { calls.push("stale"); throw new Error("registry unavailable"); } },
+      { name: "expired-grants", run: () => { calls.push("grants"); } },
+    ], {
+      writeDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+      notifyWarning: (message) => warnings.push(message),
+    });
+
+    expect(calls).toEqual(["stale", "grants"]);
+    expect(diagnostics.join("\n")).toContain("Error: registry unavailable");
+    expect(diagnostics.join("\n")).toContain("pi-extension-review-events.test.ts");
+    expect(warnings).toEqual([
+      expect.stringContaining("Loom session_start sweep failed: stale-sessions: registry unavailable"),
+    ]);
+  });
+
   it("makes rejected child write grants an unconditional direct-edit denial", async () => {
     const extensionSpecifier = "../../pi/extension.ts";
     const module = await import(/* @vite-ignore */ extensionSpecifier) as {
@@ -4394,6 +4422,7 @@ describe("Pi extension review tool_result integration", () => {
     expect(state.spec_check).toMatchObject({
       wave: 1,
       verdict: "EVIDENCE_CAPTURE_FAILED",
+      cause: "transcript",
       error: expect.stringContaining("reserved spec-check result 1"),
     });
     expect(state.wave_gates["1"].blocked).toBe(false);

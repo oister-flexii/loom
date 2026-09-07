@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  capturedSpecCheck,
   parseSpecCheckOutput,
   parseStoredSpecCheck,
   reconcileSpecCheck,
@@ -14,7 +15,7 @@ import {
   type SettledFloor,
 } from "../../src/core/requirement-coverage";
 import { epochSettledFloor } from "../../src/core/wave-review-authority";
-import type { SpecCheck, TaskGraph, WaveReviewEpochAuthority } from "../../src/types";
+import type { CapturedSpecCheck, SpecCheck, TaskGraph, WaveReviewEpochAuthority } from "../../src/types";
 
 
 /**
@@ -31,15 +32,20 @@ import type { SpecCheck, TaskGraph, WaveReviewEpochAuthority } from "../../src/t
  * cannot be clean while another is evidence-failed.
  */
 
-const transcript = (critical: number): string => [
-  "SPEC_CHECK_WAVE: 5",
-  ...Array.from({ length: critical }, (_, at) => `CRITICAL: finding ${at + 1}`),
-  `SPEC_CHECK_CRITICAL_COUNT: ${critical}`,
-  "SPEC_CHECK_HIGH_COUNT: 0",
-  `SPEC_CHECK_VERDICT: ${critical === 0 ? "PASSED" : "BLOCKED"}`,
-].join("\n");
+const transcript = (critical: number | readonly string[]): string => {
+  const findings = typeof critical === "number"
+    ? Array.from({ length: critical }, (_, at) => `finding ${at + 1}`)
+    : critical;
+  return [
+    "SPEC_CHECK_WAVE: 5",
+    ...findings.map((finding) => `CRITICAL: ${finding}`),
+    `SPEC_CHECK_CRITICAL_COUNT: ${findings.length}`,
+    "SPEC_CHECK_HIGH_COUNT: 0",
+    `SPEC_CHECK_VERDICT: ${findings.length === 0 ? "PASSED" : "BLOCKED"}`,
+  ].join("\n");
+};
 
-const settled = (count: number): SettledFloor => {
+const legacySettled = (count: number): SettledFloor => {
   const parsed = parseSettledFloor({ kind: "settled", count });
   if (parsed === null) throw new Error("fixture settled floor must parse");
   return parsed;
@@ -60,7 +66,7 @@ const reconcile = (critical: number, floor: SettledFloor) =>
 
 describe("reconcileSpecCheck enforces the settled floor", () => {
   it("fails evidence capture when the report falls below the floor", () => {
-    const result = reconcile(0, settled(3));
+    const result = reconcile(0, legacySettled(3));
     expect(result.kind).toBe("evidence-failed");
     expect(result.specCheck.verdict).toBe("EVIDENCE_CAPTURE_FAILED");
     expect(String((result.specCheck as { error?: string }).error))
@@ -70,29 +76,19 @@ describe("reconcileSpecCheck enforces the settled floor", () => {
   });
 
   it("admits a legacy report that meets the count floor, and one that exceeds it", () => {
-    expect(reconcile(3, settled(3)).kind).toBe("captured");
+    expect(reconcile(3, legacySettled(3)).kind).toBe("captured");
     // Historical packets carried count authority only.
-    expect(reconcile(7, settled(3)).kind).toBe("captured");
+    expect(reconcile(7, legacySettled(3)).kind).toBe("captured");
   });
 
   it("requires every current settled Finding identity while admitting additions", () => {
     const floor = currentSettled("required one", "required two");
-    expect(reconcileSpecCheck(parseSpecCheckOutput([
-      "SPEC_CHECK_WAVE: 5",
-      "CRITICAL: required one",
-      "CRITICAL: required two",
-      "SPEC_CHECK_CRITICAL_COUNT: 2",
-      "SPEC_CHECK_HIGH_COUNT: 0",
-      "SPEC_CHECK_VERDICT: BLOCKED",
-    ].join("\n")), 5, "now", floor).kind).toBe("captured");
-    expect(reconcileSpecCheck(parseSpecCheckOutput([
-      "SPEC_CHECK_WAVE: 5",
-      "CRITICAL: unrelated one",
-      "CRITICAL: unrelated two",
-      "SPEC_CHECK_CRITICAL_COUNT: 2",
-      "SPEC_CHECK_HIGH_COUNT: 0",
-      "SPEC_CHECK_VERDICT: BLOCKED",
-    ].join("\n")), 5, "now", floor)).toMatchObject({
+    expect(reconcileSpecCheck(
+      parseSpecCheckOutput(transcript(["required one", "required two"])), 5, "now", floor,
+    ).kind).toBe("captured");
+    expect(reconcileSpecCheck(
+      parseSpecCheckOutput(transcript(["unrelated one", "unrelated two"])), 5, "now", floor,
+    )).toMatchObject({
       kind: "evidence-failed",
       specCheck: { cause: "settled-floor", error: expect.stringContaining("required one") },
     });
@@ -128,7 +124,7 @@ describe("reconcileSpecCheck enforces the settled floor", () => {
     // Ordering matters: a transcript missing its markers must not be reported
     // as having under-counted against a floor it never reached.
     const malformed = reconcileSpecCheck(
-      parseSpecCheckOutput("SPEC_CHECK_WAVE: 5\nSPEC_CHECK_HIGH_COUNT: 0"), 5, "2026-09-05T00:00:00.000Z", settled(3),
+      parseSpecCheckOutput("SPEC_CHECK_WAVE: 5\nSPEC_CHECK_HIGH_COUNT: 0"), 5, "2026-09-05T00:00:00.000Z", legacySettled(3),
     );
     expect(malformed.kind).toBe("evidence-failed");
     expect(String((malformed.specCheck as { error?: string }).error)).toContain("SPEC_CHECK_CRITICAL_COUNT marker");
@@ -147,7 +143,7 @@ describe("epochSettledFloor reads back the authority the Agent was shown", () =>
   });
 
   it("returns a historical count-only floor as an explicit legacy variant", () => {
-    expect(epochSettledFloor(epoch(settled(4)))).toEqual({ kind: "legacy-settled", count: 4 });
+    expect(epochSettledFloor(epoch(legacySettled(4)))).toEqual({ kind: "legacy-settled", count: 4 });
   });
 
   it("returns current identity-bearing authority verbatim", () => {
@@ -201,11 +197,9 @@ describe("a settled-floor refusal survives the resume loop", () => {
   });
 
   it("leaves a successfully captured verdict alone", () => {
-    expect(specCheckNeedsReapplication({
-      wave: 5, run_at: "now", verdict: "PASSED",
-      critical_count: 0, high_count: 0,
-      critical_findings: [], high_findings: [], medium_findings: [],
-    }, 5)).toBe(false);
+    expect(specCheckNeedsReapplication(
+      capturedSpecCheck({ wave: 5, runAt: "now", criticalFindings: [] }), 5,
+    )).toBe(false);
   });
 });
 
@@ -313,16 +307,11 @@ describe("settleSpecCheck aggregate command", () => {
     wave_gates: {
       "5": { impl_complete: false, tests_passed: null, reviews_complete: false, blocked: true },
     },
-    spec_check: {
+    spec_check: capturedSpecCheck({
       wave: 5,
-      run_at: "before",
-      verdict: "BLOCKED",
-      critical_count: 1,
-      high_count: 0,
-      critical_findings: ["old blocker"],
-      high_findings: [],
-      medium_findings: [],
-    },
+      runAt: "before",
+      criticalFindings: ["old blocker"],
+    }),
   });
 
   it("changes captured evidence and its derived Wave block atomically", () => {
@@ -331,7 +320,7 @@ describe("settleSpecCheck aggregate command", () => {
       parsed: parseSpecCheckOutput(transcript(0)),
       wave: 5,
       runAt: "now",
-      floor: settled(0),
+      floor: legacySettled(0),
     });
     expect(settlement.state.spec_check).toEqual(settlement.specCheck);
     expect(settlement.specCheck).toMatchObject({ verdict: "PASSED", critical_count: 0 });
@@ -397,7 +386,7 @@ describe("transcript authority invariants", () => {
     ["missing", "SPEC_CHECK_CRITICAL_COUNT: 0\nSPEC_CHECK_HIGH_COUNT: 0\nSPEC_CHECK_VERDICT: PASSED"],
     ["wrong", "SPEC_CHECK_WAVE: 6\nSPEC_CHECK_CRITICAL_COUNT: 0\nSPEC_CHECK_HIGH_COUNT: 0\nSPEC_CHECK_VERDICT: PASSED"],
   ])("rejects a %s Wave marker", (_label, raw) => {
-    expect(reconcileSpecCheck(parseSpecCheckOutput(raw), 5, "now", settled(0))).toMatchObject({
+    expect(reconcileSpecCheck(parseSpecCheckOutput(raw), 5, "now", legacySettled(0))).toMatchObject({
       kind: "evidence-failed",
       specCheck: { cause: "transcript", error: expect.stringContaining("SPEC_CHECK_WAVE") },
     });
@@ -414,10 +403,23 @@ describe("transcript authority invariants", () => {
       "SPEC_CHECK_HIGH_COUNT: 0",
       `SPEC_CHECK_VERDICT: ${verdict}`,
     ].join("\n"));
-    expect(reconcileSpecCheck(parsed, 5, "now", settled(0))).toMatchObject({
+    expect(reconcileSpecCheck(parsed, 5, "now", legacySettled(0))).toMatchObject({
       kind: "evidence-failed",
       specCheck: { error: expect.stringContaining("SPEC_CHECK_VERDICT must be") },
     });
+  });
+
+  it("requires captured evidence to come from a smart constructor", () => {
+    if (Date.now() < 0) {
+      // @ts-expect-error direct structural construction lacks nominal parser provenance.
+      const forged: CapturedSpecCheck = {
+        wave: 5, run_at: "now", verdict: "PASSED", critical_count: 0, high_count: 0,
+        critical_findings: [], high_findings: [], medium_findings: [],
+      };
+      expect(forged.verdict).toBe("PASSED");
+    }
+    expect(capturedSpecCheck({ wave: 5, runAt: "now", criticalFindings: [] }))
+      .toMatchObject({ verdict: "PASSED", critical_count: 0 });
   });
 
   it("rejects blank authority reasons at construction", () => {
@@ -433,6 +435,28 @@ describe("transcript authority invariants", () => {
 
   it.each([1e100, Number.MAX_SAFE_INTEGER + 1])("refuses unsafe persisted floor count %s", (count) => {
     expect(parseSettledFloor({ kind: "settled", count })).toBeNull();
+  });
+
+  it("rejects duplicate persisted settled Finding identities", () => {
+    expect(parseSettledFloor({
+      kind: "settled",
+      count: 2,
+      criticalFindings: ["required", "required"],
+    })).toBeNull();
+  });
+
+  it("compares identities as a multiset even when typed authority is forged", () => {
+    const forged = {
+      kind: "settled",
+      count: 2,
+      criticalFindings: ["required", "required"],
+    } as unknown as SettledFloor;
+    expect(reconcileSpecCheck(
+      parseSpecCheckOutput(transcript(["required", "replacement"])), 5, "now", forged,
+    )).toMatchObject({
+      kind: "evidence-failed",
+      specCheck: { cause: "settled-floor", error: expect.stringContaining("required") },
+    });
   });
 
   it.each([

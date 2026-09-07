@@ -26,10 +26,10 @@ import { readRunBytesNoFollow } from "../../orchestration/no-follow-fs";
 import { observeSpecIndex } from "../../orchestration/spec-index-observation";
 import { specIndexUnavailableMessage } from "../../core/requirement-coverage";
 import {
+  parseAuthoredTaskRoster,
   populateTaskGraph,
   resolvedSpecFile,
   type AuthoredTask,
-  type NonEmptyAuthoredTasks,
   type TaskGraphPopulationCommand,
   type TaskGraphPopulationResult,
 } from "../../core/task-graph-population";
@@ -375,14 +375,13 @@ const handler: HookHandler = async (stdin, args) => {
     );
   }
 
-  const [firstTask, ...remainingTasks] = decompose.tasks;
-  if (firstTask === undefined) return { kind: "error", message: "No tasks in decompose JSON" };
-  const tasks: NonEmptyAuthoredTasks = Object.freeze([firstTask, ...remainingTasks]);
+  const taskRoster = parseAuthoredTaskRoster(decompose.tasks);
+  if (!taskRoster.ok) return { kind: "error", message: taskRoster.error };
   const command: TaskGraphPopulationCommand = Object.freeze({
     planTitle: decompose.plan_title,
     validatedPlanFile,
     ...(decompose.spec_file === undefined ? {} : { authoredSpecFile: decompose.spec_file }),
-    tasks,
+    tasks: taskRoster.value,
     verificationManifest: preparedManifest.value,
     specIndex,
     observedSpecFile,

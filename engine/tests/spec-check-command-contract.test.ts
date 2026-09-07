@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { parseSpec, type ParsedSpec } from "../src/core/parse-spec";
+import { parseArtifactDigest } from "../src/core/orchestration-contract";
 import {
   projectRequirementCoverage,
   renderRequirementCoverage,
@@ -53,8 +54,12 @@ const index = ((): ParsedSpec => {
   return parsed.value;
 })();
 
+const indexedDigest = parseArtifactDigest("a".repeat(64));
+if (!indexedDigest.ok) throw new Error("fixture Artifact Digest must parse");
+const unavailableDigest = parseArtifactDigest("b".repeat(64));
+if (!unavailableDigest.ok) throw new Error("fixture unavailable Artifact Digest must parse");
 const indexed: SpecIndexAvailability =
-  Object.freeze({ kind: "indexed", path: "spec.md", contentDigest: "a".repeat(64), index });
+  Object.freeze({ kind: "indexed", path: "spec.md", contentDigest: indexedDigest.value, index });
 
 const task = (overrides: Partial<CoverageTask> = {}): CoverageTask => Object.freeze({
   id: "T1",
@@ -82,7 +87,7 @@ const unavailable = () => {
   return projectRequirementCoverage(
     {
       kind: "unavailable",
-      reason: { kind: "unparsed", path: "spec.md", contentDigest: "b".repeat(64), errors: parsed.errors },
+      reason: { kind: "unparsed", path: "spec.md", contentDigest: unavailableDigest.value, errors: parsed.errors },
     },
     [task()],
   );

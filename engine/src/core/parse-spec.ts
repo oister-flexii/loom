@@ -254,13 +254,15 @@ function expandLeadingTabs(line: string): string {
  * info string may not contain a backtick (CommonMark calls such a line
  * paragraph text); a closer is a marker-only line (nothing but whitespace
  * after) of the same character, equal or longer. Lines indented four or more
- * spaces are furniture only after a blank line, a fence line, or the start of
- * the document (an indented code block cannot interrupt a paragraph); lazy
+ * spaces are top-level furniture only after a blank line, a fence line, or the
+ * start of the document; indentation owned by an open list item remains item
+ * content, and an indented code block cannot interrupt a paragraph. Lazy
  * continuations are real content. The returned flag marks an unterminated
  * fence so parseSpec can fail closed.
  */
 function withoutFences(markdown: string): Readonly<{ text: string; unterminated: boolean }> {
   let marker: Readonly<{ char: string; length: number }> | null = null;
+  let activeListContentIndent: number | null = null;
   let previousBlank = true;
   const out: string[] = [];
   for (const rawLine of markdown.replace(/\r\n?/gu, "\n").split("\n")) {
@@ -276,13 +278,24 @@ function withoutFences(markdown: string): Readonly<{ text: string; unterminated:
         previousBlank = true;
         continue;
       }
-      // An indented code block cannot interrupt a paragraph: a 4+-space
-      // indented line is furniture only after a blank line (or the start of
-      // the document); a lazy continuation is real content.
-      if (previousBlank && /^ {4,}/u.test(line)) {
+      // Four columns after a blank are top-level code furniture only when no
+      // open list item owns them. Inside a list item the marker's content
+      // indentation is the boundary: a four-space paragraph is legitimate
+      // item content and must survive into the Requirement hash.
+      const indentation = leadingSpaces(line);
+      const indentedListMarker = indentation >= 4 && /^(?:[-+*]|\d+[.)]) +/u.test(line.trimStart());
+      if (previousBlank && indentation >= 4 &&
+          (activeListContentIndent === null || indentation < activeListContentIndent || indentedListMarker)) {
         out.push("");
         previousBlank = true;
         continue;
+      }
+      const listMarker = /^ {0,3}(?:[-+*]|\d+[.)]) +/u.exec(line);
+      if (listMarker !== null) {
+        activeListContentIndent = listMarker[0].length;
+      } else if (line.trim() !== "" && previousBlank &&
+          (activeListContentIndent === null || indentation < activeListContentIndent)) {
+        activeListContentIndent = null;
       }
       out.push(line);
       previousBlank = line.trim().length === 0;
@@ -362,6 +375,15 @@ function sectionLines(section: MarkdownSection | undefined): readonly SourceLine
   return sourceLines(section?.body ?? "", section?.startLine ?? 1);
 }
 
+function leadingSpaces(raw: string): number {
+  return /^ */u.exec(raw)?.[0].length ?? 0;
+}
+
+/** Recognized block syntax that cannot be a lazy paragraph continuation. */
+function startsMarkdownBlock(line: string): boolean {
+  return /^(?:#{1,6}\s|>|\*\*Acceptance Scenarios:\*\*$)/u.test(line) || isThematicBreak(line);
+}
+
 /** Returns the family's entries, or `null` after recording why none exist. An
  * empty section is a parse failure, so the success shape cannot represent it. */
 function parseEntries<F extends SpecFamily>(
@@ -371,7 +393,8 @@ function parseEntries<F extends SpecFamily>(
 ): NonEmpty<SpecEntry<F>> | null {
   const { section, pattern } = ENTRY_GRAMMARS[family];
   const entries: SpecEntry<F>[] = [];
-  let current: { id: string; content: string[] } | null = null;
+  let current: { id: string; content: string[]; continuationIndent: number } | null = null;
+  let previousBlank = false;
   const finishCurrent = (): void => {
     if (current === null) return;
     entries.push(specEntry<F>(current.id, current.content.join(" ")));
@@ -379,31 +402,51 @@ function parseEntries<F extends SpecFamily>(
   };
   for (const { raw, documentLine } of lines) {
     const line = raw.trim();
+    if (line === "") {
+      previousBlank = true;
+      continue;
+    }
     if (!line.startsWith("-")) {
       // A recognizable structural ID without a "- " bullet would otherwise
       // be silently dropped; fail closed. The JSDoc above owns the full
       // accepted prefix set.
       if (STRUCTURAL_ID.test(raw)) {
+        finishCurrent();
         errors.push(Object.freeze({ kind: "entry-not-bulleted", section, line: documentLine }));
-      } else if (current !== null && line !== "") {
-        // Markdown permits both indented and lazy list-item continuations.
-        // They are requirement content, so they must participate in the same
-        // canonical value and hash as the physical bullet line.
-        current.content.push(line);
+      } else if (current !== null) {
+        const indentedContinuation = leadingSpaces(raw) >= current.continuationIndent;
+        const lazyContinuation = !previousBlank && !startsMarkdownBlock(line);
+        if (indentedContinuation || lazyContinuation) {
+          // A lazy paragraph may continue directly on the next physical line.
+          // After a blank, only content indented beneath the list marker still
+          // belongs to the item; an unindented block closes the Requirement.
+          current.content.push(line);
+        } else {
+          finishCurrent();
+        }
       }
+      previousBlank = false;
       continue;
     }
     if (isThematicBreak(line)) {
       finishCurrent();
+      previousBlank = false;
       continue;
     }
     finishCurrent();
     const matched = pattern.exec(line);
     if (matched === null) {
       errors.push(Object.freeze({ kind: "entry-not-canonical", section, line: documentLine }));
+      previousBlank = false;
       continue;
     }
-    current = { id: matched[1], content: [matched[2]] };
+    const marker = /^\s*-\s+/u.exec(raw);
+    current = {
+      id: matched[1],
+      content: [matched[2]],
+      continuationIndent: marker?.[0].length ?? 2,
+    };
+    previousBlank = false;
   }
   finishCurrent();
   if (entries.length === 0) {
@@ -444,10 +487,10 @@ function acceptanceScenarioLines(lines: readonly SourceLine[], errors: SpecParse
     }
     const subHeading = /^###\s+/u.test(line);
     if (subHeading || isThematicBreak(line)) {
-      // A ###-prefixed structural ID is not a real heading (sections() splits
-      // only on ##, so the line never truncates the section body) — without
-      // this check it would be silently dropped here. Fail closed, never
-      // vanish; the terminator behavior is preserved either way.
+      // A ###-prefixed structural ID is a Markdown heading, but not a `##`
+      // section boundary recognized by sections(); without this check it
+      // would be silently dropped here. Fail closed, never vanish; the
+      // terminator behavior is preserved either way.
       if (subHeading && STRUCTURAL_ID.test(raw)) errors.push(strayId(documentLine));
       if (state.kind === "inside") {
         if (!state.sawBullet) closeBlock(state.headerLine);
@@ -463,7 +506,9 @@ function acceptanceScenarioLines(lines: readonly SourceLine[], errors: SpecParse
     if (line.startsWith("-")) {
       scenarios.push(Object.freeze({ raw, documentLine }));
       state = Object.freeze({ kind: "inside", headerLine: state.headerLine, sawBullet: true });
-    } else if (state.sawBullet && line !== "" && !strayStructuralId) {
+    } else if (state.sawBullet && !strayStructuralId) {
+      // Preserve blanks as grammar input. parseEntries needs that state to
+      // distinguish a direct lazy continuation from a new unindented block.
       scenarios.push(Object.freeze({ raw, documentLine }));
     }
   }

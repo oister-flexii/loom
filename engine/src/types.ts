@@ -175,7 +175,7 @@ export type FindingSeverity = (typeof FINDING_SEVERITIES)[number];
  */
 export interface DraftFinding {
   readonly severity: FindingSeverity;
-  /** Repo-relative path the claim concerns, or null when the reviewer gave none. */
+  /** Unverified reviewer-supplied single-line location hint, or null. */
   readonly file: string | null;
   /** 1-based line, or null. */
   readonly line: number | null;
@@ -638,7 +638,11 @@ export type ManualSpecCheckEvidenceSource = Readonly<{
  */
 export type CapturedSpecCheckVerdict = Extract<SpecCheckVerdict, "PASSED" | "BLOCKED">;
 
+declare const CAPTURED_SPEC_CHECK: unique symbol;
+
 export type CapturedSpecCheck = Readonly<SpecCheckBase & {
+  /** Nominal constructor-origin witness; only core/spec-check mints this type. */
+  readonly [CAPTURED_SPEC_CHECK]: true;
   verdict: CapturedSpecCheckVerdict;
   critical_count: number;
   high_count: number;

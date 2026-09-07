@@ -3,7 +3,8 @@ import {
   unprojectedFloor,
   type SettledFloor,
 } from "../../src/core/requirement-coverage";
-import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { capturedSpecCheck } from "../../src/core/spec-check";
+import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
@@ -197,21 +198,6 @@ let toolCallSeq = 0;
 const writeCall = (path: string) => ({
   role: "assistant",
   content: [{ type: "toolCall", id: `call-${(toolCallSeq += 1)}`, name: "write", arguments: { path } }],
-});
-
-describe("Pi extension wiring contracts", () => {
-  const extensionSource = readFileSync(new URL("../../../pi/extension.ts", import.meta.url), "utf8");
-
-  it("delegates missing spec-check results through the shared settlement aggregate", () => {
-    expect(extensionSource).toContain("settleSpecCheck(reviewedState");
-    expect(extensionSource).not.toContain("reconcileWaveBlock(");
-  });
-
-  it("surfaces startup sweep failures through stack diagnostics and UI warnings", () => {
-    expect(extensionSource).toContain("error.stack ?? error.message");
-    expect(extensionSource).toContain('ctx.ui.notify(`Loom ${message}`, "warning")');
-    expect(extensionSource).toContain("startup continues because authority is checked at consumption");
-  });
 });
 
 describe("parsePiSubagentResults", () => {
@@ -782,10 +768,9 @@ describe("applyFailedPiResult", () => {
     const fixture = graphWithSpecCheckAuthority();
     const store = fakeStore({
       ...fixture.state,
-      spec_check: {
-        wave: 1, run_at: "earlier", verdict: "BLOCKED", critical_count: 1, high_count: 0,
-        critical_findings: ["earlier blocker"], high_findings: [], medium_findings: [],
-      },
+      spec_check: capturedSpecCheck({
+        wave: 1, runAt: "earlier", criticalFindings: ["earlier blocker"],
+      }),
       wave_gates: {
         "1": { impl_complete: false, tests_passed: null, reviews_complete: false, blocked: true },
       },
@@ -1186,10 +1171,9 @@ describe("applySpecCheckPiResult", () => {
     const fixture = graphWithSpecCheckAuthority();
     const store = fakeStore({
       ...fixture.state,
-      spec_check: {
-        wave: 1, run_at: "earlier", verdict: "BLOCKED", critical_count: 1, high_count: 0,
-        critical_findings: ["earlier blocker"], high_findings: [], medium_findings: [],
-      },
+      spec_check: capturedSpecCheck({
+        wave: 1, runAt: "earlier", criticalFindings: ["earlier blocker"],
+      }),
       wave_gates: {
         "1": { impl_complete: false, tests_passed: null, reviews_complete: false, blocked: true },
       },
@@ -1762,10 +1746,7 @@ describe("applyImplementationPiResult", () => {
     });
     const store = fakeStore({
       ...initial,
-      spec_check: {
-        wave: 1, run_at: NOW, verdict: "PASSED", critical_count: 0, high_count: 0,
-        critical_findings: [], high_findings: [], medium_findings: [],
-      },
+      spec_check: capturedSpecCheck({ wave: 1, runAt: NOW, criticalFindings: [] }),
       wave_gates: {
         "1": { impl_complete: true, tests_passed: true, reviews_complete: true, blocked: false },
       },
@@ -1831,16 +1812,7 @@ describe("applyImplementationPiResult", () => {
     });
     const store = fakeStore({
       ...initial,
-      spec_check: {
-        wave: 1,
-        run_at: NOW,
-        verdict: "PASSED",
-        critical_count: 0,
-        high_count: 0,
-        critical_findings: [],
-        high_findings: [],
-        medium_findings: [],
-      },
+      spec_check: capturedSpecCheck({ wave: 1, runAt: NOW, criticalFindings: [] }),
       wave_gates: {
         "1": { impl_complete: true, tests_passed: true, reviews_complete: true, blocked: false },
       },
@@ -2174,10 +2146,7 @@ describe("applyImplementationPiResult", () => {
     });
     const modern = modernize({
       ...base,
-      spec_check: {
-        wave: 1, run_at: NOW, verdict: "PASSED", critical_count: 0, high_count: 0,
-        critical_findings: [], high_findings: [], medium_findings: [],
-      },
+      spec_check: capturedSpecCheck({ wave: 1, runAt: NOW, criticalFindings: [] }),
       wave_gates: {
         "1": { impl_complete: false, tests_passed: true, reviews_complete: true, blocked: false },
       },

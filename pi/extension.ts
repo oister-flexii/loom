@@ -730,6 +730,30 @@ export interface PiCleanupAction {
   readonly run: () => void | Promise<void>;
 }
 
+export type PiStartupSweep = Readonly<{ name: string; run: () => void }>;
+export type PiStartupSweepPorts = Readonly<{
+  writeDiagnostic: (diagnostic: string) => void;
+  notifyWarning: (message: string) => void;
+}>;
+
+/** Run every startup hygiene sweep; failure never suppresses a later sweep. */
+export function runPiStartupSweeps(
+  sweeps: readonly PiStartupSweep[],
+  ports: PiStartupSweepPorts,
+): void {
+  for (const sweep of sweeps) {
+    try {
+      sweep.run();
+    } catch (error) {
+      const message = `session_start sweep failed: ${sweep.name}: ` +
+        `${error instanceof Error ? error.message : String(error)}; startup continues because authority is checked at consumption`;
+      const diagnostic = error instanceof Error ? (error.stack ?? error.message) : String(error);
+      ports.writeDiagnostic(`loom(pi): ${message}\n${diagnostic}\n`);
+      ports.notifyWarning(`Loom ${message}`);
+    }
+  }
+}
+
 /** Run every cleanup action even when an earlier capability/roster operation fails. */
 export async function runPiCleanupActions(
   actions: readonly PiCleanupAction[],
@@ -1645,23 +1669,16 @@ export default function (pi: ExtensionAPI) {
     // grants are independently refused by `consumePiWriteGrant` at the
     // actual authority boundary, so a missed sweep costs one session's
     // cleanup, never a write.
-    for (const sweep of [
+    runPiStartupSweeps([
       {
         name: "sweepStaleSessions",
         run: (): void => { sweepStaleSessions(subagentDir(), Date.now() - STALE_SUBAGENT_TTL_MS); },
       },
       { name: "sweepExpiredPiWriteGrants", run: (): void => sweepExpiredPiWriteGrants() },
-    ]) {
-      try {
-        sweep.run();
-      } catch (error) {
-        const message = `session_start sweep failed: ${sweep.name}: ` +
-          `${error instanceof Error ? error.message : String(error)}; startup continues because authority is checked at consumption`;
-        const diagnostic = error instanceof Error ? (error.stack ?? error.message) : String(error);
-        process.stderr.write(`loom(pi): ${message}\n${diagnostic}\n`);
-        if (ctx.hasUI) ctx.ui.notify(`Loom ${message}`, "warning");
-      }
-    }
+    ], {
+      writeDiagnostic: (diagnostic) => { process.stderr.write(diagnostic); },
+      notifyWarning: (message) => { if (ctx.hasUI) ctx.ui.notify(message, "warning"); },
+    });
   });
 
   // Each Pi subagent is a separate `pi --no-session` process. Parent-session

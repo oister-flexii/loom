@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import fc from "fast-check";
 import { parseSpec, type ParsedSpec, type SpecContentHash } from "../../src/core/parse-spec";
 import { parseSpecCheckOutput, reconcileSpecCheck } from "../../src/core/spec-check";
+import { parseArtifactDigest } from "../../src/core/orchestration-contract";
 import {
   claimDecider,
   claimSeverity,
@@ -49,8 +50,10 @@ const index = ((): ParsedSpec => {
   return parsed.value;
 })();
 
+const parsedDigest = parseArtifactDigest("a".repeat(64));
+if (!parsedDigest.ok) throw new Error("fixture Artifact Digest must parse");
 const indexed: SpecIndexAvailability =
-  Object.freeze({ kind: "indexed", path: "spec.md", contentDigest: "a".repeat(64), index });
+  Object.freeze({ kind: "indexed", path: "spec.md", contentDigest: parsedDigest.value, index });
 
 const KNOWN = ["FR-001", "FR-002", "FR-003", "AS-001", "AS-002", "OOS-001"] as const;
 
@@ -69,9 +72,9 @@ const hexHashArb: fc.Arbitrary<SpecContentHash> = fc
 
 /**
  * A recorded hash of every kind the boundary can produce, for a claim that may
- * or may not be real. `real` is what makes `stable` reachable: a purely random
- * 64-hex string can never equal a content hash, so an arbitrary built only from
- * `hexHashArb` silently excluded one third of `DriftFact` from every property.
+ * or may not be real. `real` is what makes `stable` deliberately reachable: a
+ * random 64-hex value equals a real content hash only with negligible
+ * probability, so `hexHashArb` cannot intentionally cover that `DriftFact` arm.
  */
 const recordedArb = (claim: string): fc.Arbitrary<RecordedHash> => {
   const real = REAL_HASHES.get(claim);

@@ -17,6 +17,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import type { SpecIndexAvailability } from "../core/requirement-coverage";
 import { parseSpec } from "../core/parse-spec";
+import { parseArtifactDigest, type ArtifactDigest } from "../core/orchestration-contract";
 
 /**
  * The one bytes-to-availability projection, shared by both observers.
@@ -25,9 +26,29 @@ import { parseSpec } from "../core/parse-spec";
  * caller-provided document identity; the Wave observer couples it to its
  * authority and the consumer proves that pair against protected state.
  */
+function digestSpecBytes(bytes: Buffer): ArtifactDigest {
+  const parsed = parseArtifactDigest(createHash("sha256").update(bytes).digest("hex"));
+  if (!parsed.ok) throw new Error(`SHA-256 produced an invalid Artifact Digest: ${parsed.error.message}`);
+  return parsed.value;
+}
+
 export function projectSpecBytes(path: string, bytes: Buffer): SpecIndexAvailability {
-  const parsed = parseSpec(bytes.toString("utf8"));
-  const contentDigest = createHash("sha256").update(bytes).digest("hex");
+  const contentDigest = digestSpecBytes(bytes);
+  let markdown: string;
+  try {
+    markdown = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch (error) {
+    return Object.freeze({
+      kind: "unavailable",
+      reason: Object.freeze({
+        kind: "invalid-encoding",
+        path,
+        contentDigest,
+        reason: error instanceof Error ? error.message : String(error),
+      }),
+    });
+  }
+  const parsed = parseSpec(markdown);
   return parsed.ok
     ? Object.freeze({ kind: "indexed", path, contentDigest, index: parsed.value })
     : Object.freeze({

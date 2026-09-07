@@ -71,6 +71,15 @@ export type WaveReviewRegistrationAuthority = Readonly<{
   orphanRecovery?: Readonly<{ previousRunId: string; previousAuthorityDigest: string }>;
 }>;
 
+/** Exact protected snapshot identity used by publication and locked install. */
+export function waveGateAuthorityDigest(
+  wave: number,
+  taskIds: readonly string[],
+  graph: TaskGraph,
+): string {
+  return sha256Hex(JSON.stringify({ wave, taskIds, graph }));
+}
+
 export type WaveTaskRunAuthority = Readonly<{
   taskId: string;
   generation: number;

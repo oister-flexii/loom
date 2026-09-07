@@ -32,11 +32,45 @@ export type AuthoredTask = Readonly<
 
 export type NonEmptyAuthoredTasks = readonly [AuthoredTask, ...AuthoredTask[]];
 
+declare const VALIDATED_AUTHORED_TASK_ROSTER: unique symbol;
+export type ValidatedAuthoredTaskRoster = NonEmptyAuthoredTasks & Readonly<{
+  [VALIDATED_AUTHORED_TASK_ROSTER]: true;
+}>;
+
+export type AuthoredTaskRosterParseResult =
+  | Readonly<{ ok: true; value: ValidatedAuthoredTaskRoster }>
+  | Readonly<{ ok: false; error: string }>;
+
+function taskWaveRosterError(tasks: readonly AuthoredTask[]): string | null {
+  if (tasks.length === 0) return "TaskGraph population requires at least one authored Task";
+  const invalid = tasks.find(({ wave }) => !Number.isSafeInteger(wave) || wave < 1);
+  if (invalid !== undefined) {
+    return `Task ${invalid.id} Wave must be a positive safe integer, got ${JSON.stringify(invalid.wave)}`;
+  }
+  const waves = [...new Set(tasks.map(({ wave }) => wave))].sort((left, right) => left - right);
+  const gap = waves.findIndex((wave, index) => wave !== index + 1);
+  return gap < 0
+    ? null
+    : `Authored Task Waves must be contiguous from 1; expected Wave ${gap + 1}, got ${waves[gap]}`;
+}
+
+/** Parse the authored roster topology before it can become population authority. */
+export function parseAuthoredTaskRoster(tasks: readonly AuthoredTask[]): AuthoredTaskRosterParseResult {
+  const error = taskWaveRosterError(tasks);
+  if (error !== null) return Object.freeze({ ok: false, error });
+  const [first, ...rest] = tasks;
+  if (first === undefined) return Object.freeze({ ok: false, error: "TaskGraph population requires at least one authored Task" });
+  return Object.freeze({
+    ok: true,
+    value: Object.freeze([first, ...rest]) as ValidatedAuthoredTaskRoster,
+  });
+}
+
 export type TaskGraphPopulationCommand = Readonly<{
   planTitle: string;
   validatedPlanFile: string;
   authoredSpecFile?: string;
-  tasks: NonEmptyAuthoredTasks;
+  tasks: ValidatedAuthoredTaskRoster;
   verificationManifest: FrozenVerificationManifest;
   specIndex: SpecIndexAvailability;
   observedSpecFile: string | null;
@@ -46,7 +80,7 @@ export type TaskGraphPopulationCommand = Readonly<{
 }>;
 
 export type TaskGraphPopulationError = Readonly<{
-  kind: "no-tasks" | "non-pending-tasks" | "spec-authority-changed" | "spec-observation-mismatch";
+  kind: "no-tasks" | "invalid-task-waves" | "non-pending-tasks" | "spec-authority-changed" | "spec-observation-mismatch";
   message: string;
 }>;
 
@@ -123,6 +157,8 @@ export function populateTaskGraph(
   if (command.tasks.length === 0) {
     return reject("no-tasks", "TaskGraph population requires at least one authored Task");
   }
+  const waveError = taskWaveRosterError(command.tasks);
+  if (waveError !== null) return reject("invalid-task-waves", waveError);
   if (!command.force && existing.tasks.some(({ status }) => status !== "pending")) {
     return reject(
       "non-pending-tasks",

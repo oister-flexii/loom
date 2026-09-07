@@ -16,6 +16,7 @@ import {
 import { validateTaskExecutionBatch } from "../../../src/handlers/task-execution";
 import type { TaskGraph, Task, WaveGate } from "../../../src/types";
 import { taskFixture, type TaskFixtureInput } from "../../fixtures/task-lifecycle";
+import { capturedSpecCheck } from "../../../src/core/spec-check";
 
 /** Exercise the production pure decision while preserving concise assertions. */
 function validateExecution(
@@ -625,16 +626,11 @@ describe("validate-task-execution — review gate (previous wave)", () => {
     ], {
       current_wave: 2,
       wave_gates: { "1": mkGate({ reviews_complete: false, blocked: true }) },
-      spec_check: {
+      spec_check: capturedSpecCheck({
         wave: 1,
-        run_at: "2026-08-20T00:00:00.000Z",
-        verdict: "BLOCKED",
-        critical_count: 1,
-        high_count: 0,
-        critical_findings: ["spec contract drift"],
-        high_findings: [],
-        medium_findings: [],
-      },
+        runAt: "2026-08-20T00:00:00.000Z",
+        criticalFindings: ["spec contract drift"],
+      }),
     });
 
     const result = validateExecution("T2", state);

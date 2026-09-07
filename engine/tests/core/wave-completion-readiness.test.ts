@@ -20,6 +20,7 @@ import {
   type FrozenVerificationManifest,
 } from "../../src/core/verification-manifest";
 import { evaluateTaskProof } from "../../src/core/proof-obligations";
+import { capturedSpecCheck } from "../../src/core/spec-check";
 import type { ArtifactDigest } from "../../src/core/orchestration-contract";
 import {
   parseNewTestEvidence,
@@ -143,16 +144,7 @@ function graph(overrides: Partial<TaskGraph> = {}): TaskGraph {
     plan_file: null,
     tasks: [task],
     wave_gates: {},
-    spec_check: {
-      wave: 1,
-      run_at: "now",
-      verdict: "PASSED",
-      critical_count: 0,
-      high_count: 0,
-      critical_findings: [],
-      high_findings: [],
-      medium_findings: [],
-    },
+    spec_check: capturedSpecCheck({ wave: 1, runAt: "now", criticalFindings: [] }),
     active_wave_gate: registration,
     ...overrides,
   };

@@ -1,7 +1,6 @@
 /** Persistent Wave Gate program driver: publishes exact review authority,
  * recovers bounded attempts, commits adjudication, and completes one protected
  * Wave through the shared orchestration primitives. */
-import { createHash } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { awaitUserAction, parseAgentRequestAuthority, parseStoredAgentRequestAuthority, canonicalStructuralEquals, parseArtifactDigest, parseOrchestrationRunId, parseRequestId, type AgentRequestAuthority, type AwaitUserAction, type InitialSpawnRequestInput, type SpawnRequest } from '../../../core/orchestration-contract';
 import { defaultRefutationThreshold } from '../../../core/review-panel';
@@ -29,6 +28,7 @@ import { resolveModelProfile, lowerModelProfile } from '../../../core/model-prof
 import {
   prepareWaveReviewBatch,
   readWaveReviewContext,
+  waveGateAuthorityDigest,
   waveSpecCheckDocumentsMatch,
   waveSpecCheckScope,
   decideWaveReviewEpochReplay,
@@ -146,9 +146,7 @@ export function reportUncaughtWaveGateFailure(runId: string, error: unknown): st
   return `internal Wave Gate failure: ${message}`;
 }
 
-export function waveGateAuthorityDigest(wave: number, taskIds: readonly string[], graph: TaskGraph): string {
-  return createHash("sha256").update(JSON.stringify({ wave, taskIds, graph })).digest("hex");
-}
+export { waveGateAuthorityDigest };
 
 export type WaveGateRestartPreparation = Readonly<{
   graph: TaskGraph;
@@ -1355,7 +1353,7 @@ export async function startWaveGateFacade(
       revision: 0,
       runsRoot: handle.identity.runsRoot,
       terminalOutcome: null,
-    });
+    }, registration.taskIds);
     return resumeWaveGateFacade(handle, registration);
   } catch (error) {
     return waveBlocked(handle, reportUncaughtWaveGateFailure(handle.runId, error));
@@ -1390,11 +1388,15 @@ export async function markWaveSpecCheckRetryIssued(
   });
 }
 
+type WaveFacadeSubmissionResult =
+  | Readonly<{ ok: true }>
+  | Readonly<{ ok: false; message: string }>;
+
 export async function applyWaveFacadeSubmission(
   handle: RunDirHandle,
   authority: AgentRequestAuthority,
   raw: string,
-): Promise<Readonly<{ ok: true }> | Readonly<{ ok: false; message: string }>> {
+): Promise<WaveFacadeSubmissionResult> {
   try {
     const packet = handle.readContext(authority.contextDigest);
     if (!packet.ok) return { ok: false, message: packet.error.message };
@@ -1418,7 +1420,7 @@ export async function applyWaveFacadeSubmission(
       const parsed = parseSpecCheckOutput(raw);
       const wave = context.wave;
       const batchEpoch = context.batchEpoch;
-      await manager.update((locked) => {
+      return manager.updateAndReturn<WaveFacadeSubmissionResult>((locked) => {
         const epoch = locked.wave_review_epoch;
         if (locked.current_wave !== wave || locked.active_wave_gate?.runId !== authority.runId ||
             locked.active_wave_gate.authorityDigest !== context.authorityDigest ||
@@ -1430,26 +1432,30 @@ export async function applyWaveFacadeSubmission(
             epoch.specCheckSlotAuthority?.slot_id !== authority.slotId ||
             epoch.specCheckSlotAuthority.attempted !== authority.attempt) {
           const expected = `${locked.current_wave}/${locked.active_wave_gate?.runId ?? "none"}/${locked.active_wave_gate?.authorityDigest ?? "none"}/${epoch?.runId ?? "none"}/${epoch?.wave ?? "none"}/${(epoch?.batchEpoch ?? "none").slice(0, 12)}`;
-          throw new Error(`Wave spec-check request ${authority.requestId} does not belong to the exact current review epoch (expected current_wave/runId/digest/epoch-runId/epoch-wave/epoch-batch: ${expected}; request wave ${wave}, digest ${context.authorityDigest}, runId ${authority.runId}, batch ${batchEpoch.slice(0, 12)})`);
+          const message = `Wave spec-check request ${authority.requestId} does not belong to the exact current review epoch (expected current_wave/runId/digest/epoch-runId/epoch-wave/epoch-batch: ${expected}; request wave ${wave}, digest ${context.authorityDigest}, runId ${authority.runId}, batch ${batchEpoch.slice(0, 12)})`;
+          return { state: locked, value: { ok: false as const, message } };
         }
         // The aggregate command updates captured evidence and its derived Wave
         // block together, using only floor authority from this exact epoch.
-        return settleSpecCheck(locked, {
+        const state = settleSpecCheck(locked, {
           kind: "registered-transcript",
           parsed,
           wave,
           runAt: new Date().toISOString(),
           floor: epochSettledFloor(locked.wave_review_epoch),
         }).state;
+        return { state, value: { ok: true as const } };
       });
-      return { ok: true };
     }
     const taskId = context.subject.taskId;
     if (typeof taskId !== "string") return { ok: false, message: "Wave reviewer request lacks Task identity" };
-    await manager.update((locked) => {
+    return manager.updateAndReturn<WaveFacadeSubmissionResult>((locked) => {
       const target = locked.tasks.find((task) => task.id === taskId);
       if (target === undefined) {
-        throw new Error(`Wave reviewer task ${taskId} is no longer in the protected task graph`);
+        return {
+          state: locked,
+          value: { ok: false as const, message: `Wave reviewer task ${taskId} is no longer in the protected task graph` },
+        };
       }
       const epoch = locked.wave_review_epoch;
       const run = target.review_run;
@@ -1461,7 +1467,13 @@ export async function applyWaveFacadeSubmission(
           context.batchEpoch !== run.head_sha || epoch?.runId !== authority.runId ||
           epoch.wave !== context.wave || epoch.batchEpoch !== context.batchEpoch || slot === undefined ||
           slot.slot_id !== authority.slotId || slot.attempted !== authority.attempt) {
-        throw new Error(`Wave reviewer request ${authority.requestId} does not belong to Task ${taskId}'s exact current Review Packet slot`);
+        return {
+          state: locked,
+          value: {
+            ok: false as const,
+            message: `Wave reviewer request ${authority.requestId} does not belong to Task ${taskId}'s exact current Review Packet slot`,
+          },
+        };
       }
       const resolution = constrainReviewResolutionToScope(
         resolveTaskReviewFindings(raw, authority.role, run, target.review_generation),
@@ -1470,14 +1482,16 @@ export async function applyWaveFacadeSubmission(
       const tasks = locked.tasks.map((task) =>
         task.id === taskId ? applyReviewResolution(task, resolution, slot) : task);
       return {
-        ...locked,
-        tasks,
-        wave_gates: reconcileWaveBlock(locked.wave_gates, tasks, locked.spec_check, context.wave),
+        state: {
+          ...locked,
+          tasks,
+          wave_gates: reconcileWaveBlock(locked.wave_gates, tasks, locked.spec_check, context.wave),
+        },
+        value: { ok: true as const },
       };
     });
-    return { ok: true };
   } catch (error) {
-    return { ok: false, message: error instanceof Error ? error.message : String(error) };
+    return { ok: false, message: reportUncaughtWaveGateFailure(authority.runId, error) };
   }
 }
 

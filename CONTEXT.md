@@ -101,7 +101,7 @@ An immutable review-and-adjudication record outside the wave lifecycle. It binds
 _Avoid_: Synthetic Task, fake Wave, ad-hoc review output
 
 **State File**:
-The single source of truth for orchestration progress (`active_task_graph.json`). Write-protected; only hooks mutate it.
+The single source of truth for orchestration progress (`active_task_graph.json`). Write-protected; Hooks and explicitly whitelisted StateManager-backed CLI helpers are its only mutation paths.
 _Avoid_: Config, manifest, plan file
 
 **Session TaskGraph Pointer Lease Registry**:
@@ -221,7 +221,7 @@ An engine-authored requirement a Task must discharge before its status can becom
 _Avoid_: Checklist item, self-report, completion claim
 
 **Spec Index**:
-A pure deterministic projection of one canonical specification into Functional Requirement (`FR-NNN`), Acceptance Scenario (`AS-NNN`), Out-of-Scope (`OOS-NNN`), and glossary entries with canonical content hashes. It is derived join input, not a second source of truth; malformed or duplicate identifiers fail parsing. Each FR/AS/OOS entry's complete Markdown list-item body — physical bullet plus indented or lazy continuation lines — is one canonical content value and one hash input, so wrapping a mandatory clause cannot remove it from drift authority. Each family is a distinct type and each parser-minted entry's content hash is derived at construction, so the three collections cannot be substituted for one another and engine-produced entries keep content/hash construction in one place. The phantom constructor-origin brand is not forgery-proof: structural spreading can preserve its static type while replacing content, so runtime consumers trust parser provenance rather than the brand as a security boundary. The colon and the contiguous family token are the deliberate prose-disambiguation boundaries: an ID-shaped line without a colon ("FR-002 and FR-003 are related") or with a spaced family token ("F R-002:") is prose, not a malformed identifier, and stays legal; every Markdown marker-run form (`> >`, `- -`, `* *`, `1. 2.`) before a colon-full ID fails closed.
+A pure deterministic projection of one canonical specification into Functional Requirement (`FR-NNN`), Acceptance Scenario (`AS-NNN`), Out-of-Scope (`OOS-NNN`), and glossary entries with canonical content hashes. It is derived join input, not a second source of truth; malformed or duplicate identifiers fail parsing. Each FR/AS/OOS entry's complete Markdown list-item body — physical bullet, directly adjacent lazy paragraph continuations, and blank-separated paragraphs indented beneath the marker — is one canonical content value and one hash input; an unindented block after a blank ends the entry, so wrapping a mandatory clause cannot remove it from drift authority and unrelated prose cannot enter it. Each family is a distinct type and each parser-minted entry's content hash is derived at construction, so the three collections cannot be substituted for one another and engine-produced entries keep content/hash construction in one place. The phantom constructor-origin brand is not forgery-proof: structural spreading can preserve its static type while replacing content, so runtime consumers trust parser provenance rather than the brand as a security boundary. The colon and the contiguous family token are the deliberate prose-disambiguation boundaries: an ID-shaped line without a colon ("FR-002 and FR-003 are related") or with a spaced family token ("F R-002:") is prose, not a malformed identifier, and stays legal; every Markdown marker-run form (`> >`, `- -`, `* *`, `1. 2.`) before a colon-full ID fails closed.
 _Avoid_: TaskGraph, specification database, LLM requirement summary
 
 **Requirement Coverage Projection**:
@@ -273,7 +273,7 @@ A typed durable record that an authorized orchestration side effect completed. R
 _Avoid_: Log line, success flag, checkpoint
 
 **Orchestration Façade**:
-The single parent-facing engine interface for status and registered architecture/refutation/standalone-review/Wave-Gate/remediation programs. A new Wave Gate publishes its recoverable Run Directory program before installing protected `active_wave_gate` authority, so failed program publication leaves the TaskGraph unchanged. It returns only spawn-batch, await-user, blocked, or done at external boundaries.
+The single parent-facing engine interface for status and registered architecture/refutation/standalone-review/Wave-Gate/remediation programs. A new Wave Gate publishes its recoverable Run Directory program before installing protected `active_wave_gate` authority, so failed program publication leaves the TaskGraph unchanged; the locked install re-derives the exact Wave roster and authority digest, so TaskGraph drift after publication leaves only the recoverable Run Directory registration. It returns only spawn-batch, await-user, blocked, or done at external boundaries.
 _Avoid_: Helper collection, workflow script, shell runbook
 
 **Inline-Program Stdin Inheritance**:
@@ -332,7 +332,7 @@ _Avoid_: Constraint (too generic), rule (alone), enforced guideline (advisory ru
 - An **Effect Receipt** makes an authorized side effect reconcilable and idempotent across resume
 - A **Standalone Review Run** feeds identified critical Findings through the same **Refutation Panel** without creating a Task or mutating the State File
 - A **Skill** is loaded into an **Agent** to provide domain expertise
-- **Hooks** enforce invariants on the **State File** — no other actor writes to it
+- **Hooks** and explicitly whitelisted StateManager-backed CLI helpers enforce mutation invariants on the **State File** — no other actor writes to it
 - A **Spec** contains **Clarification Markers** resolved by the clarify **Phase**
 - An **Aggregate** is immutable data; command functions in the **Functional Core** produce new instances
 - The **Imperative Shell** orchestrates: load via **Port** → call **Functional Core** → persist via **Port**

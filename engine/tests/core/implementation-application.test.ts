@@ -17,6 +17,7 @@ import {
   derivePendingTaskProof,
 } from "../../src/core/proof-obligations";
 import { taskFixture } from "../fixtures/task-lifecycle";
+import { capturedSpecCheck } from "../../src/core/spec-check";
 import type { Task, TaskGraph } from "../../src/types";
 
 const digest = (value: string) => value.repeat(64).slice(0, 64);
@@ -100,16 +101,11 @@ function graph(task: Task): TaskGraph {
     wave_gates: {
       "1": { impl_complete: false, tests_passed: true, reviews_complete: true, blocked: true },
     },
-    spec_check: {
+    spec_check: capturedSpecCheck({
       wave: 1,
-      run_at: "2026-08-24T00:00:00.000Z",
-      verdict: "BLOCKED",
-      critical_count: 1,
-      high_count: 0,
-      critical_findings: ["stale spec finding"],
-      high_findings: [],
-      medium_findings: [],
-    },
+      runAt: "2026-08-24T00:00:00.000Z",
+      criticalFindings: ["stale spec finding"],
+    }),
   };
 }
 

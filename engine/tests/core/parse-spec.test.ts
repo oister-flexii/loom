@@ -124,6 +124,55 @@ describe("parseSpec", () => {
     );
   });
 
+  it("keeps blank-separated four-space FR, AS, and OOS paragraphs in content authority", () => {
+    const wrapped = validSpec
+      .replace(
+        "- FR-001: System MUST parse canonical requirement IDs",
+        "- FR-001: System MUST parse canonical requirement IDs\n\n    including indented requirement detail",
+      )
+      .replace(
+        "- AS-001: Given a canonical spec, When it is parsed, Then structural entries are returned",
+        "- AS-001: Given a canonical spec, When it is parsed, Then structural entries are returned\n\n    including an indented outcome",
+      )
+      .replace(
+        "- OOS-001: Symbol-level source indexing",
+        "- OOS-001: Symbol-level source indexing\n\n    including generated symbol databases",
+      );
+    const parsed = parseSpec(wrapped);
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.frs[0].content).toContain("including indented requirement detail");
+    expect(parsed.value.scenarios[0].content).toContain("including an indented outcome");
+    expect(parsed.value.oos[0].content).toContain("including generated symbol databases");
+    for (const entry of [parsed.value.frs[0], parsed.value.scenarios[0], parsed.value.oos[0]]) {
+      expect(entry.contentHash).toBe(specContentHash(entry.content));
+    }
+  });
+
+  it("ends FR, AS, and OOS entries before unindented blocks after a blank", () => {
+    const separated = validSpec
+      .replace(
+        "- FR-001: System MUST parse canonical requirement IDs",
+        "- FR-001: System MUST parse canonical requirement IDs\n\nUnrelated FR section prose",
+      )
+      .replace(
+        "- AS-001: Given a canonical spec, When it is parsed, Then structural entries are returned",
+        "- AS-001: Given a canonical spec, When it is parsed, Then structural entries are returned\n\nUnrelated scenario prose",
+      )
+      .replace(
+        "- OOS-001: Symbol-level source indexing",
+        "- OOS-001: Symbol-level source indexing\n\n### A separate exclusions note",
+      );
+    const parsed = parseSpec(separated);
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.frs[0].content).not.toContain("Unrelated");
+    expect(parsed.value.scenarios[0].content).not.toContain("Unrelated");
+    expect(parsed.value.oos[0].content).not.toContain("separate exclusions note");
+  });
+
   it("makes an empty projection and a swapped family unrepresentable", () => {
     // Compile-time assertions, checked by `tsc` over `tests/`: each expected-
     // error directive below fails the build if its error stops occurring. They

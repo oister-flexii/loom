@@ -97,6 +97,20 @@ describe("projectSpecBytes", () => {
     expect(specIndexDigest(projected)).toBe(createHash("sha256").update(canonical).digest("hex"));
   });
 
+  it("reports invalid UTF-8 with the path and digest of its exact bytes", () => {
+    const bytes = Buffer.from([0xc3, 0x28]);
+    const projected = projectSpecBytes("spec.md", bytes);
+    expect(projected).toMatchObject({
+      kind: "unavailable",
+      reason: {
+        kind: "invalid-encoding",
+        path: "spec.md",
+        contentDigest: createHash("sha256").update(bytes).digest("hex"),
+      },
+    });
+    expect(specIndexDigest(projected)).toBe(createHash("sha256").update(bytes).digest("hex"));
+  });
+
   it("reports a non-canonical document with the path and digest of its exact bytes", () => {
     const bytes = Buffer.from("# nope", "utf8");
     const projected = projectSpecBytes("spec.md", bytes);

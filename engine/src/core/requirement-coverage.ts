@@ -35,6 +35,7 @@ import type {
   SpecParseError,
 } from "./parse-spec";
 import { specParseErrorMessage } from "./parse-spec";
+import type { ArtifactDigest } from "./orchestration-contract";
 
 /**
  * The families a Task may legitimately claim to have completed. `OOS` is
@@ -99,10 +100,17 @@ export type SpecIndexUnavailable =
   | Readonly<{ kind: "no-spec-file" }>
   | Readonly<{ kind: "unreadable"; path: string; reason: string }>
   | Readonly<{
+      kind: "invalid-encoding";
+      path: string;
+      /** Digest of the exact bytes that were not valid UTF-8. */
+      contentDigest: ArtifactDigest;
+      reason: string;
+    }>
+  | Readonly<{
       kind: "unparsed";
       path: string;
       /** Digest of the exact bytes whose parse produced `errors`. */
-      contentDigest: string;
+      contentDigest: ArtifactDigest;
       errors: NonEmpty<SpecParseError>;
     }>;
 
@@ -113,7 +121,7 @@ export type SpecIndexUnavailable =
  * authority by the Wave observation consumer.
  */
 export type SpecIndexAvailability =
-  | Readonly<{ kind: "indexed"; path: string; contentDigest: string; index: ParsedSpec }>
+  | Readonly<{ kind: "indexed"; path: string; contentDigest: ArtifactDigest; index: ParsedSpec }>
   | Readonly<{ kind: "unavailable"; reason: SpecIndexUnavailable }>;
 
 /**
@@ -275,6 +283,8 @@ export function specIndexUnavailableMessage(reason: SpecIndexUnavailable): strin
   return match<SpecIndexUnavailable, string>(reason)
     .with({ kind: "no-spec-file" }, () => "the TaskGraph records no spec_file, so no Spec Index exists to join against")
     .with({ kind: "unreadable" }, ({ path, reason: cause }) => `spec file ${path} could not be read: ${cause}`)
+    .with({ kind: "invalid-encoding" }, ({ path, reason: cause }) =>
+      `spec file ${path} is not valid UTF-8: ${cause}`)
     .with({ kind: "unparsed" }, ({ path, errors }) =>
       `spec file ${path} is not a canonical specification: ${errors.map(specParseErrorMessage).join("; ")}`)
     .exhaustive();
@@ -419,10 +429,12 @@ const safeCount = (raw: unknown): SettledCriticalCount | null =>
     ? raw as SettledCriticalCount
     : null;
 
-const parseSettledCriticalFindings = (raw: unknown): readonly SettledCriticalFinding[] | null =>
-  Array.isArray(raw) && raw.every((finding) => typeof finding === "string" && finding.trim() !== "")
-    ? Object.freeze(raw.map((finding) => settledFinding(finding)))
-    : null;
+const parseSettledCriticalFindings = (raw: unknown): readonly SettledCriticalFinding[] | null => {
+  if (!Array.isArray(raw) ||
+      !raw.every((finding) => typeof finding === "string" && finding.trim() !== "") ||
+      new Set(raw).size !== raw.length) return null;
+  return Object.freeze(raw.map((finding) => settledFinding(finding)));
+};
 
 const hasExactFields = (record: Record<string, unknown>, fields: readonly string[]): boolean => {
   const actual = Object.keys(record).sort();
@@ -497,9 +509,9 @@ export function claimVerdictMessage(verdict: ClaimVerdict): string {
 /**
  * Make one value safe to place in a Markdown table cell.
  *
- * `claim` and `taskId` originate in the decompose payload, which is
- * agent-authored and validated only as non-empty strings. Interpolated raw,
- * one pipe or newline forges extra rows in a table the packet declares
+ * `claim` and `taskId` originate in the agent-authored decompose payload.
+ * Task IDs satisfy the `T\d+` grammar, while claim text is otherwise
+ * unrestricted. Interpolated raw, one pipe or newline forges extra rows in a table the packet declares
  * engine-settled authority — so the untrusted text is neutralized at the one
  * seam where it becomes table structure.
  */
@@ -654,12 +666,15 @@ export function specIndexPath(availability: SpecIndexAvailability): string | nul
     .with({ kind: "indexed" }, ({ path }) => path)
     .with({ kind: "unavailable", reason: { kind: "no-spec-file" } }, () => null)
     .with({ kind: "unavailable", reason: { kind: "unreadable" } }, ({ reason }) => reason.path)
+    .with({ kind: "unavailable", reason: { kind: "invalid-encoding" } }, ({ reason }) => reason.path)
     .with({ kind: "unavailable", reason: { kind: "unparsed" } }, ({ reason }) => reason.path)
     .exhaustive();
 }
 
 /** The digest of every bytes-backed parse outcome; `null` when no bytes were observed. */
-export function specIndexDigest(availability: SpecIndexAvailability): string | null {
+export function specIndexDigest(availability: SpecIndexAvailability): ArtifactDigest | null {
   if (availability.kind === "indexed") return availability.contentDigest;
-  return availability.reason.kind === "unparsed" ? availability.reason.contentDigest : null;
+  return availability.reason.kind === "unparsed" || availability.reason.kind === "invalid-encoding"
+    ? availability.reason.contentDigest
+    : null;
 }

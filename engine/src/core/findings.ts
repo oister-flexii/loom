@@ -154,10 +154,10 @@ function parseFindingFile(raw: unknown): string | null {
   return file === "" || /[\r\n]/.test(file) ? null : file;
 }
 
-/** A line reference is kept only when it is a positive integer. */
+/** A line reference is kept only when it is a positive safe integer. */
 function parseFindingLine(raw: unknown): number | null {
   const line = typeof raw === "string" && /^\d+$/.test(raw.trim()) ? Number(raw.trim()) : raw;
-  return typeof line === "number" && Number.isInteger(line) && line > 0 ? line : null;
+  return typeof line === "number" && Number.isSafeInteger(line) && line > 0 ? line : null;
 }
 
 /** Build drafts from the legacy severity-grouped claim lists, dropping non-findings. */
@@ -394,16 +394,14 @@ function parseStoredFinding(raw: unknown): Finding | null {
     return null;
   }
   if ((reviewGeneration === undefined) !== (packetId === undefined)) return null;
-  return draft === null
-    ? null
-    : {
-        ...draft,
-        id,
-        agent: record.agent.trim(),
-        ...(reviewGeneration === undefined
-          ? {}
-          : { review_generation: reviewGeneration, review_packet_id: packetId as string }),
-      };
+  return draft === null ? null : {
+    ...draft,
+    id,
+    agent: record.agent.trim(),
+    ...(reviewGeneration === undefined
+      ? {}
+      : { review_generation: reviewGeneration, review_packet_id: packetId as string }),
+  };
 }
 
 function parseStoredAssessment(raw: unknown): PriorFindingAssessment | null {

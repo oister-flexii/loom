@@ -108,6 +108,27 @@ describe("parseSpec properties", () => {
     ));
   });
 
+  it("hashes blank-separated indented Requirement paragraphs as item content", () => {
+    fc.assert(fc.property(
+      validSpecArbitrary,
+      fc.tuple(proseArbitrary, proseArbitrary)
+        .filter(([left, right]) => canonicalText(left) !== canonicalText(right)),
+      (markdown, [left, right]) => {
+        const continueFirstRequirement = (continuation: string): string => markdown.replace(
+          /(- FR-001:[^\n]*)/u,
+          `$1\n\n    ${continuation}`,
+        );
+        const first = parseValidSpec(continueFirstRequirement(left)).frs[0];
+        const second = parseValidSpec(continueFirstRequirement(right)).frs[0];
+        expect(first.content).toContain(canonicalText(left));
+        expect(second.content).toContain(canonicalText(right));
+        expect(first.contentHash).toBe(specContentHash(first.content));
+        expect(second.contentHash).toBe(specContentHash(second.content));
+        expect(first.contentHash).not.toBe(second.contentHash);
+      },
+    ));
+  });
+
   it("projects each collection under its own identifier family", () => {
     // The runtime witness of the family branding: `frs`, `scenarios`, and `oos`
     // are mutually non-assignable types, and their contents match.
@@ -121,8 +142,8 @@ describe("parseSpec properties", () => {
 
   it("renders every emitted error as non-empty operator text", () => {
     // `specParseErrorMessage` is total over the union by construction; this
-    // proves the parser never emits an error that renders to nothing, for any
-    // input at all.
+    // samples arbitrary parser inputs and proves every observed failure renders
+    // to text, while the typed renderer supplies compile-time exhaustiveness.
     fc.assert(fc.property(fc.string(), (markdown) => {
       const parsed = parseSpec(markdown);
       if (parsed.ok) return;

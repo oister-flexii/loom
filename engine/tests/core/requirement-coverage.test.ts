@@ -22,6 +22,7 @@ import {
   type SpecIndexAvailability,
 } from "../../src/core/requirement-coverage";
 import { parseSpecCheckOutput, reconcileSpecCheck } from "../../src/core/spec-check";
+import { parseArtifactDigest } from "../../src/core/orchestration-contract";
 
 const RUN_AT = "2026-09-06T00:00:00.000Z";
 /** A spec-check footer reporting either anonymous or exact CRITICAL findings. */
@@ -70,7 +71,9 @@ const index = ((): ParsedSpec => {
   return parsed.value;
 })();
 
-const DIGEST = "a".repeat(64);
+const parsedDigest = parseArtifactDigest("a".repeat(64));
+if (!parsedDigest.ok) throw new Error("fixture Artifact Digest must parse");
+const DIGEST = parsedDigest.value;
 const indexed: SpecIndexAvailability =
   Object.freeze({ kind: "indexed", path: "spec.md", contentDigest: DIGEST, index });
 
@@ -384,7 +387,7 @@ describe("Spec Index observation accessors", () => {
     expect(specIndexDigest(indexed)).toBe(DIGEST);
   });
 
-  it("keeps the path for both failure reasons that have one, and none for no-spec-file", () => {
+  it("keeps the path and digest for every bytes-backed failure", () => {
     // The wave-gate guard compares this against the protected spec_file, so a
     // failed parse or read must still name the document it failed on — a `null`
     // here would let a mismatched observation pass the guard.
@@ -395,6 +398,12 @@ describe("Spec Index observation accessors", () => {
       kind: "unavailable",
       reason: { kind: "unreadable", path: "s.md", reason: "ENOENT" },
     })).toBe("s.md");
+    const invalidEncoding = {
+      kind: "unavailable" as const,
+      reason: { kind: "invalid-encoding" as const, path: "bad.md", contentDigest: DIGEST, reason: "invalid byte" },
+    };
+    expect(specIndexPath(invalidEncoding)).toBe("bad.md");
+    expect(specIndexDigest(invalidEncoding)).toBe(DIGEST);
     expect(specIndexPath({ kind: "unavailable", reason: { kind: "no-spec-file" } })).toBeNull();
     expect(specIndexDigest({ kind: "unavailable", reason: { kind: "no-spec-file" } })).toBeNull();
   });
@@ -405,6 +414,9 @@ describe("specIndexUnavailableMessage", () => {
     expect(specIndexUnavailableMessage({ kind: "no-spec-file" })).toContain("no spec_file");
     expect(specIndexUnavailableMessage({ kind: "unreadable", path: "s.md", reason: "ENOENT" }))
       .toContain("ENOENT");
+    expect(specIndexUnavailableMessage({
+      kind: "invalid-encoding", path: "s.md", contentDigest: DIGEST, reason: "invalid byte sequence",
+    })).toContain("not valid UTF-8");
     expect(specIndexUnavailableMessage(unparsedReason())).toContain("not a canonical specification");
   });
 });

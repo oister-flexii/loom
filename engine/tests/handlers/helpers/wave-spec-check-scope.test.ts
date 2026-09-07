@@ -32,6 +32,7 @@ import {
   type OrchestrationRunId,
 } from "../../../src/core/orchestration-contract";
 import { buildContextPacket, encodeByteSection } from "../../../src/core/context-packets";
+import { capturedSpecCheck } from "../../../src/core/spec-check";
 
 const decodeRequestId = (raw: string) => {
   const parsed = parseRequestId(raw);
@@ -271,16 +272,11 @@ describe("registered Wave spec-check scope", () => {
     expect(run.packet_id).toBe(batch.taskRuns[0]!.packetId);
     expect(run.head_sha).toBe(batch.batchEpoch);
 
-    const acceptedSpecCheck = {
+    const acceptedSpecCheck = capturedSpecCheck({
       wave: 1,
-      run_at: "2026-08-30T00:00:00.000Z",
-      verdict: "PASSED" as const,
-      critical_count: 0,
-      high_count: 0,
-      critical_findings: [],
-      high_findings: [],
-      medium_findings: [],
-    };
+      runAt: "2026-08-30T00:00:00.000Z",
+      criticalFindings: [],
+    });
     await manager.update((locked) => ({
       ...locked,
       spec_check: acceptedSpecCheck,

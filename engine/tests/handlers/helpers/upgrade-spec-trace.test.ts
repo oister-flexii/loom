@@ -8,6 +8,7 @@ import { createRunDirectory } from "../../../src/orchestration/run-directory-han
 import { StateManager, parseTaskGraph } from "../../../src/state-manager";
 import type { TaskGraph } from "../../../src/types";
 import { pendingTaskProof } from "../../fixtures/task-lifecycle";
+import { capturedSpecCheck } from "../../../src/core/spec-check";
 
 const cleanup: string[] = [];
 afterEach(() => {
@@ -210,16 +211,11 @@ describe("upgrade-spec-trace helper", () => {
         wave: 1,
         batchEpoch: "d".repeat(64) as never,
       },
-      spec_check: {
+      spec_check: capturedSpecCheck({
         wave: 1,
-        run_at: "2026-03-22T00:00:00.000Z",
-        verdict: "PASSED",
-        critical_count: 0,
-        high_count: 0,
-        critical_findings: [],
-        high_findings: [],
-        medium_findings: [],
-      },
+        runAt: "2026-03-22T00:00:00.000Z",
+        criticalFindings: [],
+      }),
     };
     chmodSync(statePath, 0o644);
     writeFileSync(statePath, JSON.stringify(graph));
@@ -325,16 +321,11 @@ describe("upgrade-spec-trace helper", () => {
 
   it("preserves a spec-check that does not belong to the retired Wave", async () => {
     const { statePath, graph } = await activeFixture({ marker: "valid" });
-    const unrelatedSpecCheck = {
+    const unrelatedSpecCheck = capturedSpecCheck({
       wave: 2,
-      run_at: "2026-03-22T00:00:00.000Z",
-      verdict: "PASSED" as const,
-      critical_count: 0,
-      high_count: 0,
-      critical_findings: [],
-      high_findings: [],
-      medium_findings: [],
-    };
+      runAt: "2026-03-22T00:00:00.000Z",
+      criticalFindings: [],
+    });
     chmodSync(statePath, 0o644);
     writeFileSync(statePath, JSON.stringify({ ...graph, spec_check: unrelatedSpecCheck }));
     chmodSync(statePath, 0o444);

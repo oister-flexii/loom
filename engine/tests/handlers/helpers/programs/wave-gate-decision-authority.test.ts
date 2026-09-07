@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 /**
  * `waveGateDecisionMismatch` is the guard that stops a Wave advisory decision
@@ -17,6 +17,7 @@ import { canonicalTempDir } from "../../../fixtures/canonical-temp-dir";
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import {
   applyCurrentSpecCheckCaptureRejection,
+  applyWaveFacadeSubmission,
   handleWaveReviewContext,
   installWaveReviewRuns,
   publishWaveAdvisoryDecisionRequest,
@@ -45,9 +46,10 @@ import {
 } from "../../../../src/core/orchestration-contract";
 import type { WaveReviewRegistrationAuthority } from "../../../../src/core/wave-review-authority";
 import { buildContextPacket, encodeByteSection } from "../../../../src/orchestration/context-packets";
-import { openRunDirectory } from "../../../../src/orchestration/run-directory-handle";
+import { openRunDirectory, type RunDirHandle } from "../../../../src/orchestration/run-directory-handle";
 import type { RegisteredWaveGateProgram } from "../../../../src/handlers/helpers/programs/helpers";
 import { parseTaskGraph, StateManager } from "../../../../src/state-manager";
+import { capturedSpecCheck } from "../../../../src/core/spec-check";
 import type { TaskGraph } from "../../../../src/types";
 
 const RUN_ID = "run.wave-decision";
@@ -114,23 +116,111 @@ const registration = (
 const pendingDecisionId = (): string => waveAdvisoryDecisionRequestId(RUN_ID, TASKS);
 
 describe("Wave Gate start effect ordering", () => {
-  it("publishes the program before protected active authority", () => {
-    const source = readFileSync(
-      new URL("../../../../src/handlers/helpers/programs/wave-gate.ts", import.meta.url),
-      "utf8",
-    );
-    const start = source.slice(
-      source.indexOf("export async function startWaveGateFacade"),
-      source.indexOf("export async function markWaveSpecCheckRetryIssued"),
-    );
-    expect(start.indexOf("handle.registerProgram(registration)")).toBeGreaterThan(-1);
-    expect(start.indexOf("manager.registerActiveWaveGate")).toBeGreaterThan(
-      start.indexOf("handle.registerProgram(registration)"),
-    );
+  it("leaves protected bytes unchanged when Run Directory program publication is refused", async () => {
+    const root = canonicalTempDir("loom-wave-publication-refusal-");
+    const runsRoot = join(root, "runs");
+    const runDirectory = join(runsRoot, "run.publication-refusal");
+    const stateDirectory = join(root, ".claude", "state");
+    const statePath = join(stateDirectory, "active_task_graph.json");
+    mkdirSync(runDirectory, { recursive: true });
+    mkdirSync(stateDirectory, { recursive: true });
+    const initial = graph({ active_wave_gate: undefined });
+    writeFileSync(statePath, JSON.stringify(initial));
+    try {
+      const opened = openRunDirectory(runsRoot, runDirectory);
+      expect(opened.ok).toBe(true);
+      if (!opened.ok) return;
+      expect((await opened.value.registerProgram({
+        ...registration({ input: { wave: 2 } }),
+        taskIds: ["T9"],
+      })).ok).toBe(true);
+      const before = readFileSync(statePath);
+      const childEnv: NodeJS.ProcessEnv = { ...process.env, LOOM_STATE_PATH: statePath };
+      delete childEnv.PI_CODING_AGENT;
+      delete childEnv.LOOM_PI_EXTENSION_RUNTIME_REVISION;
+      delete childEnv.LOOM_PI_EXTENSION_RUNTIME_ROOT;
+      const started = spawnSync("bun", [
+        new URL("../../../../src/cli.ts", import.meta.url).pathname,
+        "helper", "orchestration", "start", "wave-gate",
+        "--runs-root", runsRoot, "--run", runDirectory,
+      ], { cwd: root, env: childEnv, input: JSON.stringify({ wave: 1 }), encoding: "utf8" });
+
+      expect(started.status).not.toBe(0);
+      expect(started.stderr).toContain("different program authority");
+      expect(readFileSync(statePath)).toEqual(before);
+      expect(new StateManager(statePath).load().active_wave_gate).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects same-Wave TaskGraph drift after publication without installing stale authority", async () => {
+    const root = canonicalTempDir("loom-wave-start-race-");
+    const statePath = join(root, "active_task_graph.json");
+    const initial = graph({ active_wave_gate: undefined, tasks: [TASKS[0]!] });
+    const taskIds = ["T1"];
+    const authorityDigest = waveGateAuthorityDigest(1, taskIds, initial);
+    const active = {
+      schemaVersion: 1,
+      kind: "active-wave-gate",
+      runId: RUN_ID,
+      wave: 1,
+      authorityDigest,
+      revision: 0,
+      terminalOutcome: null,
+    };
+    writeFileSync(statePath, JSON.stringify({ ...initial, tasks: TASKS }));
+    const before = readFileSync(statePath);
+    try {
+      await expect(new StateManager(statePath).registerActiveWaveGate(active, taskIds))
+        .rejects.toThrow("changed after Run Directory publication");
+      expect(readFileSync(statePath)).toEqual(before);
+      expect(new StateManager(statePath).load().active_wave_gate).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
 describe("Wave Gate internal-failure boundary", () => {
+  it("returns expected submission refusals without classifying them as internal", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const handle = {
+      readContext: () => ({ ok: false, error: { message: "expected context refusal" } }),
+    } as unknown as RunDirHandle;
+    try {
+      const result = await applyWaveFacadeSubmission(
+        handle,
+        { runId: RUN_ID, contextDigest: DIGEST } as AgentRequestAuthority,
+        "",
+      );
+      expect(result).toEqual({ ok: false, message: "expected context refusal" });
+      expect(stderr).not.toHaveBeenCalled();
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
+  it("routes unexpected submission exceptions through stack-preserving diagnostics", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const handle = {
+      readContext: () => { throw new Error("injected context adapter crash"); },
+    } as unknown as RunDirHandle;
+    try {
+      const result = await applyWaveFacadeSubmission(
+        handle,
+        { runId: RUN_ID, contextDigest: DIGEST } as AgentRequestAuthority,
+        "",
+      );
+      expect(result).toEqual({ ok: false, message: "internal Wave Gate failure: injected context adapter crash" });
+      const diagnostic = stderr.mock.calls.map(([text]) => String(text)).join("");
+      expect(diagnostic).toContain("Error: injected context adapter crash");
+      expect(diagnostic).toContain("wave-gate-decision-authority.test.ts");
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
   it("retains stack context and classifies the blocked diagnostic as internal", () => {
     const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const error = new Error("injected reducer defect");
@@ -279,16 +369,11 @@ describe("wave review context authority", () => {
   it("does not let a paused attempt-1 rejection overwrite accepted attempt-2 evidence", () => {
     const batchEpoch = "b".repeat(64);
     const slotId = "wave-slot:spec-check";
-    const acceptedAttemptTwo = {
+    const acceptedAttemptTwo = capturedSpecCheck({
       wave: 1,
-      run_at: "2026-08-28T00:00:02.000Z",
-      verdict: "PASSED" as const,
-      critical_count: 0,
-      high_count: 0,
-      critical_findings: [],
-      high_findings: [],
-      medium_findings: [],
-    };
+      runAt: "2026-08-28T00:00:02.000Z",
+      criticalFindings: [],
+    });
     const lockedAfterAttemptTwo = graph({
       spec_check: acceptedAttemptTwo,
       wave_review_epoch: {
@@ -321,16 +406,11 @@ describe("wave review context authority", () => {
     const batchEpoch = "b".repeat(64);
     const slotId = "wave-slot:spec-check";
     const lockedAttemptOne = graph({
-      spec_check: {
+      spec_check: capturedSpecCheck({
         wave: 1,
-        run_at: "2026-08-28T00:00:00.000Z",
-        verdict: "BLOCKED",
-        critical_count: 1,
-        high_count: 0,
-        critical_findings: ["earlier blocker"],
-        high_findings: [],
-        medium_findings: [],
-      },
+        runAt: "2026-08-28T00:00:00.000Z",
+        criticalFindings: ["earlier blocker"],
+      }),
       wave_gates: {
         "1": { impl_complete: false, tests_passed: null, reviews_complete: false, blocked: true },
       },
@@ -559,16 +639,7 @@ describe("Wave review epoch installation", () => {
       if (specCheckAuthority === undefined) throw new Error("fixture lacks spec-check authority");
       await manager.update((locked) => ({
         ...locked,
-        spec_check: {
-          wave: 1,
-          run_at: "historical",
-          verdict: "PASSED",
-          critical_count: 0,
-          high_count: 0,
-          critical_findings: [],
-          high_findings: [],
-          medium_findings: [],
-        },
+        spec_check: capturedSpecCheck({ wave: 1, runAt: "historical", criticalFindings: [] }),
         wave_review_epoch: {
           runId: specCheckAuthority.runId,
           wave: 1,
