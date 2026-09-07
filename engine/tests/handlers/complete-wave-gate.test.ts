@@ -507,13 +507,11 @@ describe("checkSpecAlignment (pure)", () => {
     expect(gateCheckMessage(result)).toContain("2 critical");
   });
 
-  for (const verdict of ["UNKNOWN", "BLOCKED"] as const) {
-    it(`fails when a zero-critical spec-check verdict is ${verdict}`, () => {
-      const result = checkSpecAlignment(mkState({ spec_check: captured({ verdict }) }), 1);
-      expect(result.passed).toBe(false);
-      expect(gateCheckMessage(result)).toContain(`verdict is ${verdict}`);
-    });
-  }
+  it("fails when a zero-critical spec-check verdict is BLOCKED", () => {
+    const result = checkSpecAlignment(mkState({ spec_check: captured({ verdict: "BLOCKED" }) }), 1);
+    expect(result.passed).toBe(false);
+    expect(gateCheckMessage(result)).toContain("verdict is BLOCKED");
+  });
 
   // The `captured()` helper cannot produce this verdict — an evidence failure
   // carries a cause and NO counts, which is the whole point of the separate

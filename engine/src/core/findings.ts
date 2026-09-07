@@ -32,12 +32,12 @@
  * the invariant is one invariant; splitting them across modules is how it
  * drifted before.
  *
- * Three further lockstep writers live in handlers because none of them is a
- * review step: `updateTaskFindings` (the manual operator override),
- * `fixTaskFindings` (`--fix`), and `sanitizeDecomposedTask` (the decomposition
- * that first admits a task to the graph). The first two derive their views
- * through `claimsOfSeverity` here; `sanitizeDecomposedTask` admits a task with
- * no findings at all, so it writes the empty triple directly. All three are
+ * Three further lockstep writers are not review steps: `updateTaskFindings`
+ * (the manual operator override), `fixTaskFindings` (`--fix`), and `sanitizeTask`
+ * in TaskGraph Population (the decomposition that first admits a Task to the
+ * graph). The first two derive their views through `claimsOfSeverity` here;
+ * `sanitizeTask` admits a Task with no findings at all, so it writes the empty
+ * triple directly. All three are
  * held to the same invariant by `findingsLockstepError` at the load boundary —
  * the enumeration of all seven writers lives on `Task.findings` in types.ts.
  *

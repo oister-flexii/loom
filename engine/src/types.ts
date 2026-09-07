@@ -483,8 +483,8 @@ interface TaskCommonMetadataBase {
    * migrate opportunistically.
    *
    * The coordinated writers keep the three in lockstep, and every one of them
-   * writes all three together: `sanitizeDecomposedTask` (the initializer, in
-   * handlers/helpers/populate-task-graph); `mergeFindings` (legacy/unbound
+   * writes all three together: `sanitizeTask` (the initializer, in
+   * core/task-graph-population); `mergeFindings` (legacy/unbound
    * review), `finalizeReviewRun` (packet-bound review),
    * `applyFindingOutcomes` (panel adjudication), and
    * `preserveAcceptedReviewRunFindings` (incomplete-run retirement), all in
@@ -636,8 +636,10 @@ export type ManualSpecCheckEvidenceSource = Readonly<{
  * field because their Wave epoch is the authority; a manual bypass always
  * carries its attributable reason in the evidence itself.
  */
+export type CapturedSpecCheckVerdict = Extract<SpecCheckVerdict, "PASSED" | "BLOCKED">;
+
 export type CapturedSpecCheck = Readonly<SpecCheckBase & {
-  verdict: Exclude<SpecCheckVerdict, "EVIDENCE_CAPTURE_FAILED">;
+  verdict: CapturedSpecCheckVerdict;
   critical_count: number;
   high_count: number;
   /** `readonly` for the reason `Task.critical_findings` is: a holder that can

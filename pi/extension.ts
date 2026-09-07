@@ -21,7 +21,7 @@ import { shouldBlockDirectEdit } from "../engine/src/core/block-direct-edits";
 import { activeRosterProbe } from "../engine/src/handlers/pre-tool-use/block-direct-edits";
 import { guardStateFileDecision } from "../engine/src/core/guard-state-file";
 import { validatePhaseOrder } from "../engine/src/core/validate-phase-order";
-import { reconcileWaveBlock } from "../engine/src/core/wave-gate-model";
+import { settleSpecCheck } from "../engine/src/core/spec-check";
 // Both harnesses share ONE protected-state read seam, so a Pi gate and a
 // Claude gate cannot disagree about what "no active plan" means.
 import { realPhaseOrderDeps } from "../engine/src/handlers/pre-tool-use/validate-phase-order";
@@ -1632,7 +1632,7 @@ export default function (pi: ExtensionAPI) {
 
   // ─── Session Lifecycle ────────────────────────────────────────────────
 
-  pi.on("session_start", async (_event, _ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
     // Cleanup stale subagent tracking files — the ENGINE's sweep, not a
     // per-file twin: staleness is judged per session GROUP (max mtime across
     // the session's files), and the TTL is the shared STALE_SUBAGENT_TTL_MS,
@@ -1655,9 +1655,11 @@ export default function (pi: ExtensionAPI) {
       try {
         sweep.run();
       } catch (error) {
-        process.stderr.write(
-          `loom(pi): session_start sweep failed: ${sweep.name}: ${error instanceof Error ? error.message : String(error)}\n`,
-        );
+        const message = `session_start sweep failed: ${sweep.name}: ` +
+          `${error instanceof Error ? error.message : String(error)}; startup continues because authority is checked at consumption`;
+        const diagnostic = error instanceof Error ? (error.stack ?? error.message) : String(error);
+        process.stderr.write(`loom(pi): ${message}\n${diagnostic}\n`);
+        if (ctx.hasUI) ctx.ui.notify(`Loom ${message}`, "warning");
       }
     }
   });
@@ -2319,8 +2321,9 @@ export default function (pi: ExtensionAPI) {
                   return next;
                 }, task);
               });
+              const reviewedState: TaskGraph = { ...state, tasks };
               const specAuthorityProblems: string[] = [];
-              let specCheckPatch: Pick<TaskGraph, "spec_check"> | undefined;
+              let settledState = reviewedState;
               if (missingSpecChecks.length > 1) {
                 specAuthorityProblems.push("multiple reserved spec-check slots were missing; no unique authority exists");
               } else if (missingSpecChecks.length === 1) {
@@ -2330,27 +2333,16 @@ export default function (pi: ExtensionAPI) {
                 if (problem !== null || authority === null) {
                   specAuthorityProblems.push(problem ?? "reserved spec-check authority is absent");
                 } else {
-                  specCheckPatch = {
-                    spec_check: {
-                      wave: authority.wave,
-                      run_at: runAt,
-                      verdict: "EVIDENCE_CAPTURE_FAILED" as const,
-                      error: `reserved spec-check result ${missing.index + 1} for spec-check-invoker was missing or mismatched`,
-                      cause: "transcript" as const,
-                    },
-                  };
+                  settledState = settleSpecCheck(reviewedState, {
+                    kind: "capture-failure",
+                    wave: authority.wave,
+                    runAt,
+                    error: `reserved spec-check result ${missing.index + 1} for spec-check-invoker was missing or mismatched`,
+                  }).state;
                 }
               }
-              const specCheck = specCheckPatch?.spec_check;
               return {
-                state: {
-                  ...state,
-                  tasks,
-                  ...(specCheckPatch ?? {}),
-                  ...(specCheck === undefined
-                    ? {}
-                    : { wave_gates: reconcileWaveBlock(state.wave_gates, tasks, specCheck, specCheck.wave) }),
-                },
+                state: settledState,
                 value: Object.freeze({
                   appliedReviewIndexes: Object.freeze(appliedReviewIndexes),
                   specAuthorityProblems: Object.freeze(specAuthorityProblems),

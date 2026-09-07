@@ -1,9 +1,6 @@
-/**
- * Façade program driver volume (A14): the imperative shell's program drivers
- * were one 2,900-line module; this volume owns ONE program's driver (or, for
- * helpers, the shared recovery/git/scope machinery). The public surface is
- * re-exported by index.ts so all existing import sites are unchanged.
- */
+/** Persistent Wave Gate program driver: publishes exact review authority,
+ * recovers bounded attempts, commits adjudication, and completes one protected
+ * Wave through the shared orchestration primitives. */
 import { createHash } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { awaitUserAction, parseAgentRequestAuthority, parseStoredAgentRequestAuthority, canonicalStructuralEquals, parseArtifactDigest, parseOrchestrationRunId, parseRequestId, type AgentRequestAuthority, type AwaitUserAction, type InitialSpawnRequestInput, type SpawnRequest } from '../../../core/orchestration-contract';
@@ -1201,7 +1198,7 @@ export async function restartWaveGateFacade(
     }));
     return resumeWaveGateFacade(nextHandle, prepared.registration);
   } catch (error) {
-    return failed(error instanceof Error ? error.message : String(error));
+    return failed(reportUncaughtWaveGateFailure(nextHandle.runId, error));
   }
 }
 
@@ -1322,7 +1319,7 @@ export async function recoverOrphanedWaveGateFacade(
     });
     return resumeWaveGateFacade(nextHandle, committed.registration);
   } catch (error) {
-    return failed(error instanceof Error ? error.message : String(error));
+    return failed(reportUncaughtWaveGateFailure(nextHandle.runId, error));
   }
 }
 
@@ -1340,6 +1337,15 @@ export async function startWaveGateFacade(
     const taskIds = initial.tasks.filter((task) => task.wave === wave).map(({ id }) => id);
     if (taskIds.length === 0) return waveBlocked(handle, `wave ${wave} has no tasks`);
     const authorityDigest = waveGateAuthorityDigest(wave, taskIds, initial);
+    const registration: RegisteredWaveGateProgram = Object.freeze({
+      schemaVersion: 1, kind: "wave-gate", input: Object.freeze({ wave }),
+      taskIds: Object.freeze(taskIds), authorityDigest,
+    });
+    // Publish the recoverable Run Directory program first. If publication is
+    // refused, protected state remains byte-identical and no unsupported
+    // active_wave_gate can be stranded.
+    const stored = await handle.registerProgram(registration);
+    if (!stored.ok) return failed(stored.error.message);
     await manager.registerActiveWaveGate({
       schemaVersion: 1,
       kind: "active-wave-gate",
@@ -1350,15 +1356,9 @@ export async function startWaveGateFacade(
       runsRoot: handle.identity.runsRoot,
       terminalOutcome: null,
     });
-    const registration: RegisteredWaveGateProgram = Object.freeze({
-      schemaVersion: 1, kind: "wave-gate", input: Object.freeze({ wave }),
-      taskIds: Object.freeze(taskIds), authorityDigest,
-    });
-    const stored = await handle.registerProgram(registration);
-    if (!stored.ok) return failed(stored.error.message);
     return resumeWaveGateFacade(handle, registration);
   } catch (error) {
-    return waveBlocked(handle, error instanceof Error ? error.message : String(error));
+    return waveBlocked(handle, reportUncaughtWaveGateFailure(handle.runId, error));
   }
 }
 

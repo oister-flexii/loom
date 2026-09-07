@@ -3,10 +3,11 @@
  *
  * Distinct from the Wave Gate's observation on purpose. At the gate, a spec
  * that cannot be read is a refusal: evidence must name exact bytes. Here,
- * recording Requirement content hashes is an enhancement over a graph that
- * would otherwise report drift as unverifiable — so a missing, unreadable, or
- * non-canonical specification degrades to a stated reason instead of failing a
- * decompose that is otherwise valid.
+ * recording Requirement content hashes is an enhancement, so a missing,
+ * unreadable, or non-canonical specification degrades to a stated reason instead
+ * of failing an otherwise valid decompose. If a later gate projects the Spec,
+ * absent hashes make drift unverifiable; continued projection failure refuses
+ * settlement as projection-unavailable.
  *
  * The read policy is all that differs between the two observers; the
  * bytes-to-availability projection they share lives in `projectSpecBytes`.

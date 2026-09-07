@@ -548,6 +548,15 @@ describe("parseTaskGraph wave_review_epoch authority", () => {
     ["settled identity/count mismatch", waveReviewEpoch({
       settledSpecCheckFloor: { kind: "settled", count: 2, criticalFindings: ["only one"] },
     })],
+    ["misspelled settled identity field", waveReviewEpoch({
+      settledSpecCheckFloor: { kind: "settled", count: 1, criticalFinding: ["misspelled"] },
+    })],
+    ["surplus historical settled field", waveReviewEpoch({
+      settledSpecCheckFloor: { kind: "settled", count: 1, forged: true },
+    })],
+    ["surplus current settled field", waveReviewEpoch({
+      settledSpecCheckFloor: { kind: "settled", count: 1, criticalFindings: ["required"], forged: true },
+    })],
     ["blank settled identity", waveReviewEpoch({
       settledSpecCheckFloor: { kind: "settled", count: 1, criticalFindings: ["  "] },
     })],
@@ -769,6 +778,17 @@ describe("parseTaskGraph spec_check count and provenance authority", () => {
 
   it.each([1e100, Number.MAX_SAFE_INTEGER + 1])("refuses unsafe captured count %s", (count) => {
     expect(errorOf(graph({ spec_check: captured({ critical_count: count }) }))).toContain("safe integer");
+  });
+
+  it("normalizes historical UNKNOWN into retryable evidence failure", () => {
+    const parsed = parseTaskGraph(graph({ spec_check: captured({ verdict: "UNKNOWN" }) }));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.spec_check).toMatchObject({
+      verdict: "EVIDENCE_CAPTURE_FAILED",
+      cause: "transcript",
+      error: expect.stringContaining("UNKNOWN"),
+    });
   });
 
   it("round-trips a non-empty manual override source", () => {

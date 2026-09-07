@@ -263,6 +263,27 @@ describe("a persisted evidence failure carries its cause across a reload", () =>
     if (!parsed.ok) expect(parsed.errors.join(" ")).toContain("safe integer");
   });
 
+  it("migrates persisted UNKNOWN into retryable evidence failure", () => {
+    const parsed = parseStoredSpecCheck({
+      wave: 5,
+      run_at: "now",
+      verdict: "UNKNOWN",
+      critical_count: 0,
+      high_count: 0,
+      critical_findings: [],
+      high_findings: [],
+      medium_findings: [],
+    });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value).toMatchObject({
+      verdict: "EVIDENCE_CAPTURE_FAILED",
+      cause: "transcript",
+      error: expect.stringContaining("UNKNOWN"),
+    });
+    expect(specCheckNeedsReapplication(parsed.value, 5)).toBe(true);
+  });
+
   it("round-trips attributable manual override provenance", () => {
     const resolution = reconcileSpecCheck(
       parseSpecCheckOutput(transcript(0)),
@@ -332,6 +353,31 @@ describe("settleSpecCheck aggregate command", () => {
     expect(settlement.state.wave_gates["5"]?.blocked).toBe(false);
   });
 
+  it("deeply freezes captured and failed evidence exposed by the aggregate", () => {
+    const captured = settleSpecCheck(state(), {
+      kind: "manual-transcript",
+      parsed: parseSpecCheckOutput(transcript(0)),
+      wave: 5,
+      runAt: "now",
+      authority: manualOverrideFloor("operator override"),
+    });
+    expect(captured.kind).toBe("applied");
+    expect(Object.isFrozen(captured.specCheck)).toBe(true);
+    if (captured.specCheck.verdict !== "EVIDENCE_CAPTURE_FAILED") {
+      expect(Object.isFrozen(captured.specCheck.critical_findings)).toBe(true);
+      expect(Object.isFrozen(captured.specCheck.high_findings)).toBe(true);
+      expect(Object.isFrozen(captured.specCheck.medium_findings)).toBe(true);
+      expect(Object.isFrozen(captured.specCheck.evidence_source)).toBe(true);
+    }
+    const failed = settleSpecCheck(state(), {
+      kind: "capture-failure",
+      wave: 5,
+      runAt: "now",
+      error: "transport lost transcript",
+    });
+    expect(Object.isFrozen(failed.specCheck)).toBe(true);
+  });
+
   it("preserves the aggregate when manual evidence is malformed", () => {
     const original = state();
     const settlement = settleSpecCheck(original, {
@@ -387,5 +433,15 @@ describe("transcript authority invariants", () => {
 
   it.each([1e100, Number.MAX_SAFE_INTEGER + 1])("refuses unsafe persisted floor count %s", (count) => {
     expect(parseSettledFloor({ kind: "settled", count })).toBeNull();
+  });
+
+  it.each([
+    { kind: "settled", count: 1, criticalFinding: ["misspelled"] },
+    { kind: "settled", count: 1, forged: true },
+    { kind: "settled", count: 1, criticalFindings: ["required"], forged: true },
+    { kind: "legacy-settled", count: 1, forged: true },
+    { kind: "unprojected", reason: "missing", forged: true },
+  ])("refuses ambiguous or surplus persisted floor fields: %j", (floor) => {
+    expect(parseSettledFloor(floor)).toBeNull();
   });
 });

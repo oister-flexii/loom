@@ -30,11 +30,13 @@ export type AuthoredTask = Readonly<
   }
 >;
 
+export type NonEmptyAuthoredTasks = readonly [AuthoredTask, ...AuthoredTask[]];
+
 export type TaskGraphPopulationCommand = Readonly<{
   planTitle: string;
   validatedPlanFile: string;
   authoredSpecFile?: string;
-  tasks: readonly AuthoredTask[];
+  tasks: NonEmptyAuthoredTasks;
   verificationManifest: FrozenVerificationManifest;
   specIndex: SpecIndexAvailability;
   observedSpecFile: string | null;
@@ -44,7 +46,7 @@ export type TaskGraphPopulationCommand = Readonly<{
 }>;
 
 export type TaskGraphPopulationError = Readonly<{
-  kind: "non-pending-tasks" | "spec-authority-changed" | "spec-observation-mismatch";
+  kind: "no-tasks" | "non-pending-tasks" | "spec-authority-changed" | "spec-observation-mismatch";
   message: string;
 }>;
 
@@ -116,6 +118,11 @@ export function populateTaskGraph(
   existing: TaskGraph,
   command: TaskGraphPopulationCommand,
 ): TaskGraphPopulationResult {
+  // Defensive even though callers need a non-empty tuple: JavaScript and
+  // persisted/untyped boundaries can still invoke this exported function.
+  if (command.tasks.length === 0) {
+    return reject("no-tasks", "TaskGraph population requires at least one authored Task");
+  }
   if (!command.force && existing.tasks.some(({ status }) => status !== "pending")) {
     return reject(
       "non-pending-tasks",
@@ -141,9 +148,19 @@ export function populateTaskGraph(
   const waveGates = Object.freeze(Object.fromEntries(
     waves.map((wave) => [String(wave), newWaveGate()] as const),
   ));
-  const { active_wave_completion_suite: _staleCompletionSuite, ...existingWithoutCompletionSuite } = existing;
+  const {
+    active_wave_completion_suite: _staleCompletionSuite,
+    active_wave_gate: _staleActiveWaveGate,
+    wave_review_epoch: _staleWaveReviewEpoch,
+    spec_check: _staleSpecCheck,
+    wave_gate_history: _staleWaveGateHistory,
+    wave_reopening_history: _staleWaveReopeningHistory,
+    orphaned_wave_gate_history: _staleOrphanedWaveGateHistory,
+    spec_trace_wave_gate_retirements: _staleSpecTraceRetirements,
+    ...existingWithoutWaveAuthority
+  } = existing;
   const state: TaskGraph = Object.freeze({
-    ...existingWithoutCompletionSuite,
+    ...existingWithoutWaveAuthority,
     spec_trace_version: 2,
     plan_title: command.planTitle,
     plan_file: command.validatedPlanFile,

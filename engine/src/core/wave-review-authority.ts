@@ -613,8 +613,9 @@ export function prepareWaveReviewBatch(
   if (specIndexPath(specCheckObservation.specIndex) !== (graph.spec_file ?? null)) {
     return failure("Spec Index observation does not name the protected spec_file");
   }
-  if (specIndexDigest(specCheckObservation.specIndex) !== null &&
-      specIndexDigest(specCheckObservation.specIndex) !== specCheckDocuments.spec.contentDigest) {
+  const observedSpecIndexDigest = specIndexDigest(specCheckObservation.specIndex);
+  if (observedSpecIndexDigest !== null &&
+      observedSpecIndexDigest !== specCheckDocuments.spec.contentDigest) {
     return failure("Spec Index was parsed from bytes other than the observed spec-check document");
   }
 

@@ -221,7 +221,7 @@ An engine-authored requirement a Task must discharge before its status can becom
 _Avoid_: Checklist item, self-report, completion claim
 
 **Spec Index**:
-A pure deterministic projection of one canonical specification into Functional Requirement (`FR-NNN`), Acceptance Scenario (`AS-NNN`), Out-of-Scope (`OOS-NNN`), and glossary entries with canonical content hashes. It is derived join input, not a second source of truth; malformed or duplicate identifiers fail parsing. Each family is a distinct type and each parser-minted entry's content hash is derived at construction, so the three collections cannot be substituted for one another and engine-produced entries keep content/hash construction in one place. The phantom constructor-origin brand is not forgery-proof: structural spreading can preserve its static type while replacing content, so runtime consumers trust parser provenance rather than the brand as a security boundary. The colon and the contiguous family token are the deliberate prose-disambiguation boundaries: an ID-shaped line without a colon ("FR-002 and FR-003 are related") or with a spaced family token ("F R-002:") is prose, not a malformed identifier, and stays legal; every Markdown marker-run form (`> >`, `- -`, `* *`, `1. 2.`) before a colon-full ID fails closed.
+A pure deterministic projection of one canonical specification into Functional Requirement (`FR-NNN`), Acceptance Scenario (`AS-NNN`), Out-of-Scope (`OOS-NNN`), and glossary entries with canonical content hashes. It is derived join input, not a second source of truth; malformed or duplicate identifiers fail parsing. Each FR/AS/OOS entry's complete Markdown list-item body — physical bullet plus indented or lazy continuation lines — is one canonical content value and one hash input, so wrapping a mandatory clause cannot remove it from drift authority. Each family is a distinct type and each parser-minted entry's content hash is derived at construction, so the three collections cannot be substituted for one another and engine-produced entries keep content/hash construction in one place. The phantom constructor-origin brand is not forgery-proof: structural spreading can preserve its static type while replacing content, so runtime consumers trust parser provenance rather than the brand as a security boundary. The colon and the contiguous family token are the deliberate prose-disambiguation boundaries: an ID-shaped line without a colon ("FR-002 and FR-003 are related") or with a spaced family token ("F R-002:") is prose, not a malformed identifier, and stays legal; every Markdown marker-run form (`> >`, `- -`, `* *`, `1. 2.`) before a colon-full ID fails closed.
 _Avoid_: TaskGraph, specification database, LLM requirement summary
 
 **Requirement Coverage Projection**:
@@ -229,11 +229,11 @@ The pure deterministic join of one Spec Index against the whole protected Task r
 _Avoid_: Coverage report, spec-check result, requirement checklist, LLM verdict
 
 **Spec-check Settlement**:
-The pure TaskGraph aggregate command that consumes validated Wave/manual authority plus a parsed transcript or capture failure and produces exactly one immutable settlement: applied evidence with `spec_check` and its derived Wave block changed together, or a manual-evidence refusal that preserves the graph. Transport shells own byte observation, request/document authority, locking, and persistence; none independently constructs or commits spec-check state.
+The pure TaskGraph aggregate command that consumes validated Wave/manual authority plus a parsed transcript or capture failure and produces exactly one deeply immutable settlement: applied evidence with `spec_check` and its derived Wave block changed together, or a manual-evidence refusal that preserves the graph. Captured evidence has exactly two usable verdicts, `PASSED` and `BLOCKED`; a historical `UNKNOWN` count record parses into retryable transcript evidence failure rather than a third captured state. Transport shells own byte observation, request/document authority, locking, and persistence; none independently constructs or commits spec-check state.
 _Avoid_: Spec-check store, transport-specific settlement, evidence write
 
 **TaskGraph Population**:
-The pure aggregate command that consumes parser-proven authored Tasks, prepared Spec/verification authority, overwrite authority, and one locked TaskGraph and returns either a typed population refusal or the complete reset graph. It owns Task sanitization, Requirement Content Hash stamping, Wave Gate construction, current-Wave reset, and stale completion-suite removal; the Hook owns JSON/CLI parsing, Git/filesystem observation, model checks, locking, and persistence.
+The pure aggregate command that consumes a non-empty parser-proven authored Task roster, prepared Spec/verification authority, overwrite authority, and one locked TaskGraph and returns either a typed population refusal or the complete reset graph. It owns Task sanitization, Requirement Content Hash stamping, Wave Gate construction, current-Wave reset, and removal of every active or historical Wave/epoch/spec-check/completion authority tied to the replaced Tasks; the Hook owns JSON/CLI parsing, Git/filesystem observation, model checks, locking, and persistence.
 _Avoid_: Populate hook policy, task merge, graph initializer
 
 **Requirement Content Hash**:
@@ -273,7 +273,7 @@ A typed durable record that an authorized orchestration side effect completed. R
 _Avoid_: Log line, success flag, checkpoint
 
 **Orchestration Façade**:
-The single parent-facing engine interface for status and registered architecture/refutation/standalone-review/Wave-Gate/remediation programs. It returns only spawn-batch, await-user, blocked, or done at external boundaries.
+The single parent-facing engine interface for status and registered architecture/refutation/standalone-review/Wave-Gate/remediation programs. A new Wave Gate publishes its recoverable Run Directory program before installing protected `active_wave_gate` authority, so failed program publication leaves the TaskGraph unchanged. It returns only spawn-batch, await-user, blocked, or done at external boundaries.
 _Avoid_: Helper collection, workflow script, shell runbook
 
 **Inline-Program Stdin Inheritance**:

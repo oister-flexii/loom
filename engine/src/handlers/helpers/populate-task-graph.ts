@@ -29,6 +29,7 @@ import {
   populateTaskGraph,
   resolvedSpecFile,
   type AuthoredTask,
+  type NonEmptyAuthoredTasks,
   type TaskGraphPopulationCommand,
   type TaskGraphPopulationResult,
 } from "../../core/task-graph-population";
@@ -281,9 +282,9 @@ const handler: HookHandler = async (stdin, args) => {
   }
 
   // Validate decompose output before merging. Scoped to the PAYLOAD: the
-  // findings aggregate is agent-forgeable here and `sanitizeDecomposedTask`
-  // strips it below, so holding this to the load-boundary findings rules would
-  // reject exactly the input that sanitization exists to clean.
+  // findings aggregate is agent-forgeable here and core `sanitizeTask`
+  // strips it during population, so holding this to the load-boundary findings
+  // rules would reject exactly the input that sanitization exists to clean.
   const validation = validateFull(decompose as unknown as Record<string, unknown>, "decompose-payload");
   if (!validation.ok) {
     if (fix) {
@@ -362,23 +363,26 @@ const handler: HookHandler = async (stdin, args) => {
 
   // The Spec Index is observed here, beside the manifest, for the same reason:
   // the locked transform stamps a prepared value and never reads mutable source
-  // bytes itself. Unlike the manifest this one degrades — a project with no
-  // canonical specification still decomposes, and every Requirement it claims
-  // simply reports drift as unverifiable at the gate rather than as stable.
+  // bytes itself. Unlike the manifest this one degrades: if a later Wave Gate
+  // can project the Spec, missing recorded hashes make drift unverifiable; if
+  // projection remains unavailable, settlement blocks as projection-unavailable.
   const observedSpecFile = resolvedSpecFile(existingState.spec_file, decompose.spec_file);
   const specIndex = observeSpecIndex(observedSpecFile);
   if (specIndex.kind === "unavailable") {
     process.stderr.write(
       `Requirement content hashes NOT recorded: ${specIndexUnavailableMessage(specIndex.reason)}\n` +
-      "Wave Gate spec-check will report Requirement drift as unverifiable for these Tasks.\n",
+      "If a later Wave Gate projects the Spec, drift will be unverifiable; continued projection unavailability blocks settlement.\n",
     );
   }
 
+  const [firstTask, ...remainingTasks] = decompose.tasks;
+  if (firstTask === undefined) return { kind: "error", message: "No tasks in decompose JSON" };
+  const tasks: NonEmptyAuthoredTasks = Object.freeze([firstTask, ...remainingTasks]);
   const command: TaskGraphPopulationCommand = Object.freeze({
     planTitle: decompose.plan_title,
     validatedPlanFile,
     ...(decompose.spec_file === undefined ? {} : { authoredSpecFile: decompose.spec_file }),
-    tasks: decompose.tasks,
+    tasks,
     verificationManifest: preparedManifest.value,
     specIndex,
     observedSpecFile,

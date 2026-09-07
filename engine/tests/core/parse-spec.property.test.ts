@@ -87,6 +87,27 @@ describe("parseSpec properties", () => {
     }));
   });
 
+  it("makes every wrapped continuation part of the entry content and hash", () => {
+    fc.assert(fc.property(
+      validSpecArbitrary,
+      fc.tuple(proseArbitrary, proseArbitrary)
+        .filter(([left, right]) => canonicalText(left) !== canonicalText(right)),
+      (markdown, [left, right]) => {
+        const wrapFirstRequirement = (continuation: string): string => markdown.replace(
+          /(- FR-001:[^\n]*)/u,
+          `$1\n  ${continuation}`,
+        );
+        const first = parseValidSpec(wrapFirstRequirement(left)).frs[0];
+        const second = parseValidSpec(wrapFirstRequirement(right)).frs[0];
+        expect(first.content).toContain(canonicalText(left));
+        expect(second.content).toContain(canonicalText(right));
+        expect(first.contentHash).toBe(specContentHash(first.content));
+        expect(second.contentHash).toBe(specContentHash(second.content));
+        expect(first.contentHash).not.toBe(second.contentHash);
+      },
+    ));
+  });
+
   it("projects each collection under its own identifier family", () => {
     // The runtime witness of the family branding: `frs`, `scenarios`, and `oos`
     // are mutually non-assignable types, and their contents match.

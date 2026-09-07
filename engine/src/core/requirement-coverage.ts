@@ -424,6 +424,12 @@ const parseSettledCriticalFindings = (raw: unknown): readonly SettledCriticalFin
     ? Object.freeze(raw.map((finding) => settledFinding(finding)))
     : null;
 
+const hasExactFields = (record: Record<string, unknown>, fields: readonly string[]): boolean => {
+  const actual = Object.keys(record).sort();
+  const expected = [...fields].sort();
+  return actual.length === expected.length && actual.every((field, index) => field === expected[index]);
+};
+
 /** Parse persisted current and historical settled-floor authority. */
 const FLOOR_VARIANTS: Readonly<Record<SettledFloor["kind"], (record: Record<string, unknown>) => SettledFloor | null>> =
   Object.freeze({
@@ -431,8 +437,11 @@ const FLOOR_VARIANTS: Readonly<Record<SettledFloor["kind"], (record: Record<stri
       const count = safeCount(record.count);
       if (count === null) return null;
       if (record.criticalFindings === undefined) {
-        return Object.freeze({ kind: "legacy-settled" as const, count });
+        return hasExactFields(record, ["kind", "count"])
+          ? Object.freeze({ kind: "legacy-settled" as const, count })
+          : null;
       }
+      if (!hasExactFields(record, ["kind", "count", "criticalFindings"])) return null;
       const criticalFindings = parseSettledCriticalFindings(record.criticalFindings);
       return criticalFindings !== null && criticalFindings.length === count
         ? Object.freeze({ kind: "settled" as const, count, criticalFindings })
@@ -440,9 +449,12 @@ const FLOOR_VARIANTS: Readonly<Record<SettledFloor["kind"], (record: Record<stri
     },
     "legacy-settled": (record) => {
       const count = safeCount(record.count);
-      return count === null ? null : Object.freeze({ kind: "legacy-settled" as const, count });
+      return count !== null && hasExactFields(record, ["kind", "count"])
+        ? Object.freeze({ kind: "legacy-settled" as const, count })
+        : null;
     },
-    unprojected: (record) => typeof record.reason === "string" && record.reason.trim() !== ""
+    unprojected: (record) => hasExactFields(record, ["kind", "reason"]) &&
+        typeof record.reason === "string" && record.reason.trim() !== ""
       ? Object.freeze({ kind: "unprojected" as const, reason: record.reason })
       : null,
   });

@@ -118,8 +118,8 @@ function findingsErrorsOf(task: Record<string, unknown>, label: string): string[
  *
  * `state-file` is a graph that `StateManager.load()` must be able to open, so it
  * is held to every load-boundary rule. `decompose-payload` is the
- * AGENT-CONTROLLED stdin the decompose step emits, validated BEFORE
- * `sanitizeDecomposedTask` strips the execution state a planner must never mint
+ * AGENT-CONTROLLED stdin the decompose step emits, validated BEFORE TaskGraph
+ * Population's `sanitizeTask` strips execution state a planner must never mint
  * — findings, review status, test verdicts. Holding that payload to the findings
  * invariants would reject forged state the pipeline exists to clean, turning a
  * successful sanitization into a hard failure.

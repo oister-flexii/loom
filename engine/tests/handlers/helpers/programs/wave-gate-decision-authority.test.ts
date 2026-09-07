@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 /**
  * `waveGateDecisionMismatch` is the guard that stops a Wave advisory decision
@@ -17,12 +18,15 @@ import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import {
   applyCurrentSpecCheckCaptureRejection,
   handleWaveReviewContext,
+  installWaveReviewRuns,
   publishWaveAdvisoryDecisionRequest,
   reportUncaughtWaveGateFailure,
   specCheckSlotBelongsToWaveEpoch,
   waveAdvisoryDecisionRequestId,
+  waveGateAuthorityDigest,
   waveGateDecisionMismatch,
   waveRefutationCommitProblem,
+  waveRequests,
 } from "../../../../src/handlers/helpers/programs/wave-gate";
 import {
   deriveLoomStatusFromParsedGraph,
@@ -35,6 +39,7 @@ import { derivePendingTaskProof } from "../../../../src/core/proof-obligations";
 import { buildFindingBrief } from "../../../../src/core/review-panel";
 import {
   parseRequestId,
+  type AgentRequestAuthority,
   type ArtifactDigest,
   type OrchestrationRunId,
 } from "../../../../src/core/orchestration-contract";
@@ -42,7 +47,7 @@ import type { WaveReviewRegistrationAuthority } from "../../../../src/core/wave-
 import { buildContextPacket, encodeByteSection } from "../../../../src/orchestration/context-packets";
 import { openRunDirectory } from "../../../../src/orchestration/run-directory-handle";
 import type { RegisteredWaveGateProgram } from "../../../../src/handlers/helpers/programs/helpers";
-import { parseTaskGraph } from "../../../../src/state-manager";
+import { parseTaskGraph, StateManager } from "../../../../src/state-manager";
 import type { TaskGraph } from "../../../../src/types";
 
 const RUN_ID = "run.wave-decision";
@@ -107,6 +112,23 @@ const registration = (
 });
 
 const pendingDecisionId = (): string => waveAdvisoryDecisionRequestId(RUN_ID, TASKS);
+
+describe("Wave Gate start effect ordering", () => {
+  it("publishes the program before protected active authority", () => {
+    const source = readFileSync(
+      new URL("../../../../src/handlers/helpers/programs/wave-gate.ts", import.meta.url),
+      "utf8",
+    );
+    const start = source.slice(
+      source.indexOf("export async function startWaveGateFacade"),
+      source.indexOf("export async function markWaveSpecCheckRetryIssued"),
+    );
+    expect(start.indexOf("handle.registerProgram(registration)")).toBeGreaterThan(-1);
+    expect(start.indexOf("manager.registerActiveWaveGate")).toBeGreaterThan(
+      start.indexOf("handle.registerProgram(registration)"),
+    );
+  });
+});
 
 describe("Wave Gate internal-failure boundary", () => {
   it("retains stack context and classifies the blocked diagnostic as internal", () => {
@@ -455,6 +477,117 @@ describe("wave review context authority", () => {
       planFile: null,
     });
     expect(handleWaveReviewContext([packet], packet.digest).kind).toBe("corrupt");
+  });
+});
+
+describe("Wave review epoch installation", () => {
+  it("upgrades a historical floor under lock and clears stale spec-check evidence", async () => {
+    const root = canonicalTempDir("loom-wave-floor-upgrade-");
+    const previousCwd = process.cwd();
+    const runsRoot = join(root, "runs");
+    const runDirectory = join(runsRoot, "run.floor-upgrade");
+    const statePath = join(root, "active_task_graph.json");
+    mkdirSync(join(root, "src"), { recursive: true });
+    mkdirSync(runDirectory, { recursive: true });
+    writeFileSync(join(root, "src", "x.ts"), "export const x = 1;\n");
+    execFileSync("git", ["init", "--quiet"], { cwd: root });
+    execFileSync("git", ["add", "src/x.ts"], { cwd: root });
+    execFileSync("git", [
+      "-c", "user.name=Loom Tests", "-c", "user.email=loom@example.test",
+      "commit", "--quiet", "-m", "fixture",
+    ], { cwd: root });
+    process.chdir(root);
+    try {
+      const pendingTask = {
+        id: "T1",
+        description: "review floor upgrade",
+        agent: "code-implementer-agent",
+        wave: 1,
+        status: "pending" as const,
+        proof: derivePendingTaskProof({ newTestsRequired: false, declaredArtifacts: ["src/x.ts"] }),
+        new_tests_required: false,
+        depends_on: [],
+        file_list: ["src/x.ts"],
+        files_modified: ["src/x.ts"],
+        review_status: "pending" as const,
+        review_generation: 0,
+        findings: [],
+        critical_findings: [],
+        advisory_findings: [],
+      };
+      const beforeActive: TaskGraph = {
+        current_phase: "execute",
+        current_wave: 1,
+        phase_artifacts: {},
+        skipped_phases: [],
+        spec_file: null,
+        plan_file: null,
+        executing_tasks: [],
+        tasks: [pendingTask],
+        wave_gates: {},
+      };
+      const authorityDigest = waveGateAuthorityDigest(1, ["T1"], beforeActive);
+      const registration: RegisteredWaveGateProgram = {
+        schemaVersion: 1,
+        kind: "wave-gate",
+        input: { wave: 1 },
+        taskIds: ["T1"],
+        authorityDigest,
+      };
+      writeFileSync(statePath, JSON.stringify({
+        ...beforeActive,
+        active_wave_gate: {
+          schemaVersion: 1,
+          kind: "active-wave-gate",
+          runId: "run.floor-upgrade",
+          wave: 1,
+          authorityDigest,
+          revision: 0,
+          runsRoot,
+          terminalOutcome: null,
+        },
+      }));
+      const opened = openRunDirectory(runsRoot, runDirectory);
+      expect(opened.ok).toBe(true);
+      if (!opened.ok) return;
+      expect((await opened.value.registerProgram(registration)).ok).toBe(true);
+      const manager = new StateManager(statePath);
+      const batch = waveRequests(opened.value, registration, manager.load(), 1);
+      const specCheckAuthority = batch.requests
+        .map(({ authority }) => authority as AgentRequestAuthority)
+        .find(({ role }) => role === "spec-check-invoker");
+      if (specCheckAuthority === undefined) throw new Error("fixture lacks spec-check authority");
+      await manager.update((locked) => ({
+        ...locked,
+        spec_check: {
+          wave: 1,
+          run_at: "historical",
+          verdict: "PASSED",
+          critical_count: 0,
+          high_count: 0,
+          critical_findings: [],
+          high_findings: [],
+          medium_findings: [],
+        },
+        wave_review_epoch: {
+          runId: specCheckAuthority.runId,
+          wave: 1,
+          batchEpoch: batch.batchEpoch,
+          specCheckDocuments: batch.specCheckDocuments,
+          specCheckSlotAuthority: { slot_id: specCheckAuthority.slotId, attempted: 1 },
+        },
+      }));
+
+      await installWaveReviewRuns(manager, registration, batch);
+
+      const upgraded = manager.load();
+      expect(upgraded.spec_check).toBeUndefined();
+      expect(upgraded.wave_review_epoch?.settledSpecCheckFloor).toEqual(batch.settledFloor);
+      expect(upgraded.tasks[0]?.review_run).toBeDefined();
+    } finally {
+      process.chdir(previousCwd);
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

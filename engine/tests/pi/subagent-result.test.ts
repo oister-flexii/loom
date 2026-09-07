@@ -3,7 +3,7 @@ import {
   unprojectedFloor,
   type SettledFloor,
 } from "../../src/core/requirement-coverage";
-import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
@@ -38,6 +38,7 @@ import {
   parsePiSubagentResults,
   resolveImplementationTaskId,
   writtenPathsOf,
+  type PiReviewAttemptAuthority,
   type PiSubagentResult,
   type TaskGraphStore,
 } from "../../../pi/subagent-result";
@@ -196,6 +197,21 @@ let toolCallSeq = 0;
 const writeCall = (path: string) => ({
   role: "assistant",
   content: [{ type: "toolCall", id: `call-${(toolCallSeq += 1)}`, name: "write", arguments: { path } }],
+});
+
+describe("Pi extension wiring contracts", () => {
+  const extensionSource = readFileSync(new URL("../../../pi/extension.ts", import.meta.url), "utf8");
+
+  it("delegates missing spec-check results through the shared settlement aggregate", () => {
+    expect(extensionSource).toContain("settleSpecCheck(reviewedState");
+    expect(extensionSource).not.toContain("reconcileWaveBlock(");
+  });
+
+  it("surfaces startup sweep failures through stack diagnostics and UI warnings", () => {
+    expect(extensionSource).toContain("error.stack ?? error.message");
+    expect(extensionSource).toContain('ctx.ui.notify(`Loom ${message}`, "warning")');
+    expect(extensionSource).toContain("startup continues because authority is checked at consumption");
+  });
 });
 
 describe("parsePiSubagentResults", () => {
@@ -431,6 +447,46 @@ describe("applyPhaseAgentPiResult", () => {
   });
 });
 
+describe("PiReviewAttemptAuthority", () => {
+  it("mints only explicit legacy or exact slot-bound authority", () => {
+    expect(currentPiReviewAuthority(parsedGraph(graph()), "code-reviewer", "T1")).toEqual({
+      kind: "legacy",
+      taskId: "T1",
+      agentType: "code-reviewer",
+      generation: 0,
+    });
+
+    const base = graph();
+    const modern = parsedGraph(graph({
+      tasks: [{
+        ...base.tasks[0]!,
+        review_generation: 2,
+        review_run: {
+          generation: 2,
+          packet_id: "b".repeat(64),
+          head_sha: "2".repeat(40),
+          expected_agents: ["code-reviewer"],
+          prior_finding_ids: [],
+          evidence: [],
+          slot_authority: [{ agent: "code-reviewer", slot_id: "review-slot:current", attempted: 1 }],
+        },
+      }],
+    }));
+    expect(currentPiReviewAuthority(modern, "code-reviewer", "T1")).toMatchObject({
+      kind: "slot-bound",
+      packetId: "b".repeat(64),
+      slotId: "review-slot:current",
+      attempted: 1,
+    });
+
+    if (Date.now() < 0) {
+      // @ts-expect-error a legacy authority cannot carry one member of slot-bound identity.
+      const mixed: PiReviewAttemptAuthority = { kind: "legacy", taskId: "T1", agentType: "code-reviewer", generation: 0, packetId: null };
+      expect(mixed.kind).toBe("legacy");
+    }
+  });
+});
+
 describe("applyFailedPiResult", () => {
   it("reports a failed phase agent as a processing error without advancing", async () => {
     const store = fakeStore(graph({ current_phase: "architecture" }));
@@ -527,6 +583,7 @@ describe("applyFailedPiResult", () => {
         agentType: "code-reviewer",
         taskId: "T1",
         reviewAuthority: {
+          kind: "slot-bound",
           taskId: "T1",
           agentType: "code-reviewer",
           generation: 1,
@@ -570,6 +627,7 @@ describe("applyFailedPiResult", () => {
         agentType: "code-reviewer",
         taskId: "T1",
         reviewAuthority: {
+          kind: "slot-bound",
           taskId: "T1",
           agentType: "code-reviewer",
           generation: 1,
@@ -613,6 +671,7 @@ describe("applyFailedPiResult", () => {
         agentType: "code-reviewer",
         taskId: "T1",
         reviewAuthority: {
+          kind: "slot-bound",
           taskId: "T1", agentType: "code-reviewer", generation: 1,
           packetId: "c".repeat(64), slotId: "review-slot:old-malformed", attempted: 1,
         },

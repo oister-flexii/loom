@@ -1,13 +1,15 @@
-# PR #43 Remediation — Round 6
+# PR #43 Remediation Plan — Round 7
 
-- **Branch:** `feat/structural-spec-check`
-- **Head reviewed:** `0c699ba56d56db7bd07ccb35778b6a78b1ace4d6`
-- **PR:** #43 — `feat(spec-check): structural Requirement Coverage Projection (#11 phase 3)`
-- **Review Run Directory:** `.claude/reviews/review-and-fix-runs/2026-09-07-pr43-all-4`
-- **Review result:** 4 surviving critical findings, 21 advisories, 0 refuted critical findings
-- **Reviewer evidence:** all seven attempt-1 reviewer captures succeeded. The reproduction, intent, and security Refutation Panel captures all succeeded on attempt 1.
+## Authority
 
-## Exact frozen review scope
+- Branch: `feat/structural-spec-check`
+- Reviewed head: `621b646ab8b815832a34d6400b776c932aca210e`
+- Review Run Directory: `.claude/reviews/review-and-fix-runs/2026-09-07-pr43-all-5`
+- Canonical result: `.claude/reviews/review-and-fix-runs/2026-09-07-pr43-all-5/result.json`
+- Result digest: `3d429b8e9cbe7a86b5d303bf655e9e92dc52bb98080a31cbb16d730e49267c0c`
+- Outcome: 9 surviving critical Findings, 19 advisories, 0 refuted critical Findings.
+
+## Frozen review scope
 
 1. `.claude/plans/2026-09-05-pr-43-remediation-round2.md`
 2. `.claude/plans/2026-09-05-pr-43-remediation.md`
@@ -19,168 +21,174 @@
 8. `engine/src/core/parse-spec.ts`
 9. `engine/src/core/requirement-coverage.ts`
 10. `engine/src/core/spec-check.ts`
-11. `engine/src/core/wave-review-authority.ts`
-12. `engine/src/handlers/helpers/populate-task-graph.ts`
-13. `engine/src/handlers/helpers/programs/wave-gate.ts`
-14. `engine/src/handlers/helpers/store-spec-check.ts`
-15. `engine/src/handlers/subagent-stop/store-spec-check-findings.ts`
-16. `engine/src/linter/programmatic/no-cross-boundary-imports.ts`
-17. `engine/src/orchestration/spec-index-observation.ts`
-18. `engine/src/orchestration/wave-spec-check-documents.ts`
-19. `engine/src/parsers/index.ts`
-20. `engine/src/state-manager.ts`
-21. `engine/src/types.ts`
-22. `engine/tests/core/parse-spec.property.test.ts`
-23. `engine/tests/core/parse-spec.test.ts`
-24. `engine/tests/core/requirement-coverage.property.test.ts`
-25. `engine/tests/core/requirement-coverage.test.ts`
-26. `engine/tests/core/spec-check-floor.test.ts`
-27. `engine/tests/handlers/complete-wave-gate.test.ts`
-28. `engine/tests/handlers/helpers/orchestration.test.ts`
-29. `engine/tests/handlers/helpers/programs/wave-gate-decision-authority.test.ts`
-30. `engine/tests/handlers/helpers/store-spec-check.test.ts`
-31. `engine/tests/handlers/helpers/wave-spec-check-scope.test.ts`
-32. `engine/tests/handlers/populate-task-graph.test.ts`
-33. `engine/tests/handlers/store-spec-check-findings.test.ts`
-34. `engine/tests/handlers/subagent-stop/dispatch-resilience.test.ts`
-35. `engine/tests/orchestration/spec-index-observation.test.ts`
-36. `engine/tests/parsers/parse-spec.property.test.ts`
-37. `engine/tests/pi/subagent-result.test.ts`
-38. `engine/tests/review-round6-core-regressions.test.ts`
-39. `engine/tests/spec-check-command-contract.test.ts`
-40. `engine/tests/spec-template-contract.test.ts`
-41. `engine/tests/state-manager-load-guards.test.ts`
-42. `pi/extension.ts`
-43. `pi/subagent-result.ts`
-44. `scripts/smoke-orchestration-facades.ts`
+11. `engine/src/core/task-graph-population.ts`
+12. `engine/src/core/wave-review-authority.ts`
+13. `engine/src/handlers/helpers/populate-task-graph.ts`
+14. `engine/src/handlers/helpers/programs/wave-gate.ts`
+15. `engine/src/handlers/helpers/store-spec-check.ts`
+16. `engine/src/handlers/subagent-stop/store-spec-check-findings.ts`
+17. `engine/src/linter/programmatic/no-cross-boundary-imports.ts`
+18. `engine/src/orchestration/spec-index-observation.ts`
+19. `engine/src/orchestration/wave-spec-check-documents.ts`
+20. `engine/src/parsers/index.ts`
+21. `engine/src/state-manager.ts`
+22. `engine/src/types.ts`
+23. `engine/tests/core/parse-spec.property.test.ts`
+24. `engine/tests/core/parse-spec.test.ts`
+25. `engine/tests/core/requirement-coverage.property.test.ts`
+26. `engine/tests/core/requirement-coverage.test.ts`
+27. `engine/tests/core/round15.test.ts`
+28. `engine/tests/core/spec-check-floor.test.ts`
+29. `engine/tests/core/task-graph-population.test.ts`
+30. `engine/tests/handlers/complete-wave-gate.test.ts`
+31. `engine/tests/handlers/helpers/orchestration.test.ts`
+32. `engine/tests/handlers/helpers/programs/wave-gate-decision-authority.test.ts`
+33. `engine/tests/handlers/helpers/store-spec-check.test.ts`
+34. `engine/tests/handlers/helpers/wave-spec-check-scope.test.ts`
+35. `engine/tests/handlers/populate-task-graph.test.ts`
+36. `engine/tests/handlers/store-spec-check-findings.test.ts`
+37. `engine/tests/handlers/subagent-stop/dispatch-resilience.test.ts`
+38. `engine/tests/orchestration/spec-index-observation.test.ts`
+39. `engine/tests/parsers/parse-spec.property.test.ts`
+40. `engine/tests/pi/subagent-result.test.ts`
+41. `engine/tests/review-round6-core-regressions.test.ts`
+42. `engine/tests/spec-check-command-contract.test.ts`
+43. `engine/tests/spec-template-contract.test.ts`
+44. `engine/tests/state-manager-load-guards.test.ts`
+45. `pi/extension.ts`
+46. `pi/subagent-result.ts`
+47. `scripts/smoke-orchestration-facades.ts`
 
-## Surviving critical findings — mandatory
+## Mandatory surviving critical Findings
 
-### C1 — altered Requirement Content Hash can be omitted from the settled floor
+### C1 — `code-reviewer-1`: wrapped Spec entries lose content and hash authority
 
-- **Finding:** `code-reviewer-1`
-- **Location:** `engine/src/core/requirement-coverage.ts:343`
-- **Claim:** an `unreadable-record` row is CRITICAL but agent-decided, so count-only floor derivation excludes it and can accept a zero-critical PASSED transcript despite corrupted Requirement-hash authority.
-- **Panel:** upheld by reproduction and security; refuted by intent. It survives the 2-of-3 threshold.
-- **Fix:** derive canonical, identity-bearing settled CRITICAL footer findings from every projected structural CRITICAL—including agent-decided altered-hash rows—plus unclaimed FR/AS and the synthetic no-trace finding. Persist the exact identities beside a safe count in the epoch floor, render the exact `CRITICAL:` lines into the immutable projection, and require every expected identity in captured transcript evidence while allowing additional Agent findings. Parse old count-only floors as an explicit legacy variant and upgrade byte-identical epochs to the current identity-bearing floor under lock. Add example and property coverage for altered hashes, missing identities, extra findings, persistence, and legacy upgrades.
+`parseEntries` currently mints FR/AS/OOS entries from only the physical bullet line. Indented and lazy continuation text can therefore disappear from both projected content and `contentHash`.
 
-### C2 — missing or wrong SPEC_CHECK_WAVE settles another Wave
+**Fix:** collect each canonical list item's complete continuation body, canonicalize the joined content once, and mint the entry from that complete value. Acceptance-block collection must retain continuation lines after its first bullet. Unsupported nested/noncanonical bullets remain fail-closed. Add example and property coverage proving continuation text appears in the projection and any continuation change changes the content hash.
 
-- **Finding:** `code-reviewer-2`
-- **Location:** `engine/src/core/spec-check.ts:272`
-- **Claim:** reconciliation never requires `parsed.wave` or compares it with protected Wave authority.
-- **Panel:** upheld unanimously by reproduction, intent, and security.
-- **Fix:** make the Wave marker mandatory and exact in the shared pure reconciliation boundary before any captured evidence is minted. Reject missing, unsafe, or mismatched markers with typed transcript evidence failure. Exercise the pure core and each settlement adapter through shared aggregate tests.
+### C2 — `silent-failure-hunter-1`: active Wave Gate can be committed before program registration
 
-### C3 — standalone spec-check can pair the live graph with an unrelated newest Spec
+`startWaveGateFacade` writes `active_wave_gate` before `program.json`; a failed registration strands protected state with no registered program.
 
-- **Finding:** `comment-analyzer-1`
-- **Location:** `commands/spec-check.md:83`
-- **Claim:** standalone instructions choose the newest Spec by mtime but read Wave/Task authority from `active_task_graph.json`.
-- **Panel:** upheld by reproduction and security; refuted by intent. It survives.
-- **Fix:** read the live TaskGraph exactly once, take `spec_file`, `current_wave`, and Task scope from that same snapshot, and only use the documented newest-Spec heuristic as an explicit legacy fallback when `spec_file` is null/absent. Update executable command-contract assertions.
+**Fix:** prepare and durably register the program first, then register protected active authority. A failed program registration must leave the TaskGraph byte-identical; an active-registration race may leave only a resumable registered Run Directory, never unsupported protected authority. Add regression coverage for the ordering/failure contract.
 
-### C4 — claimed Acceptance Scenarios escape test-link coverage
+### C3 — `pr-test-analyzer-1`: ambiguous settled-floor records downgrade to legacy authority
 
-- **Finding:** `comment-analyzer-2`
-- **Location:** `commands/spec-check.md:150`
-- **Claim:** projected Step 5 inspects only unclaimed scenarios even though the contract defines severities for claimed scenarios lacking tests.
-- **Panel:** upheld unanimously by reproduction, intent, and security.
-- **Fix:** make Step 5 inspect every claimed AS row from the projection for a real test-name link, then inspect unclaimed scenarios separately without replacing their already-settled CRITICAL finding. Preserve happy/error/edge severity policy and add command-contract tests that fail if claimed AS checks disappear.
+A `settled` record with a misspelled or surplus identity field currently takes the missing-`criticalFindings` compatibility branch and becomes count-only authority.
+
+**Fix:** parse every floor arm against an exact field set. Only exact `{kind,count}` is historical count-only authority; exact `{kind,count,criticalFindings}` is current authority. Reject all surplus/misspelled fields. Add direct and TaskGraph-boundary negative tests.
+
+### C4 — `pr-test-analyzer-2`: historical floor upgrade lacks lock-bound integration coverage
+
+The pure replay decision is covered, but the actual `installWaveReviewRuns` locked transition is not.
+
+**Fix:** add an integration test using a real StateManager and RunDirHandle. Seed an exact historical epoch plus stale count-only `spec_check`, run the real installation, and prove one locked transition replaces it with the identity-bearing floor and clears stale evidence.
+
+### C5 — `type-design-analyzer-1`: persisted `UNKNOWN` is modeled as captured evidence
+
+`CapturedSpecCheck` admits `UNKNOWN`, while Wave Gate retry detection treats every non-failure verdict as settled. A historical UNKNOWN record can suppress bounded recapture while remaining unusable for readiness.
+
+**Fix:** restrict captured evidence to `PASSED | BLOCKED`. Parse a structurally valid historical UNKNOWN count record into an explicit retryable transcript evidence failure, preserving compatibility while making the unusable state unrepresentable after parsing. Add load-boundary and retry tests.
+
+### C6 — `comment-analyzer-1`: glossary delimiter comment overclaims GFM grammar
+
+Panel votes disagreed about the GFM minimum, but the Finding survived. Runtime support for one-hyphen separators is intentional and already tested.
+
+**Fix:** remove the disputed standards claim. Document and test the behavior as Loom's accepted delimiter grammar rather than attributing it to GFM.
+
+### C7 — `comment-analyzer-2`: unavailable Spec Index warning describes only later recovery
+
+Continued projection unavailability blocks with `projection-unavailable`; only a later successful projection without recorded hashes yields unverifiable drift.
+
+**Fix:** rewrite the comment and stderr warning to state both outcomes exactly.
+
+### C8 — `comment-analyzer-3`: manual-store test names the wrong authority arm
+
+The helper uses `manualOverrideFloor`, not `unprojectedFloor`, and the latter would refuse the write.
+
+**Fix:** rewrite the test rationale around attributable manual override authority and remove the false floor-equivalence claim.
+
+### C9 — `comment-analyzer-4`: Findings writer inventory names a nonexistent initializer
+
+Task initialization moved to `sanitizeTask` in `core/task-graph-population.ts`, but three comments still name `sanitizeDecomposedTask` in the old shell module.
+
+**Fix:** update all writer-inventory references to the actual pure aggregate initializer and location.
 
 ## Advisory dispositions
 
-### Accepted (21)
+All advisories are **accepted**. Each claim is sound, correctness-relevant or clarity-improving, practical within the frozen scope, and low-risk when covered by the tests below.
 
-1. **`code-reviewer-3` — accepted.** Manual override provenance is audit authority. Add a captured-evidence source union whose manual variant carries the non-empty reason, persist it through `store-spec-check`, and parse it fail-closed while retaining an explicit legacy/registered absence shape.
-2. **`code-reviewer-4` — accepted.** Persisted floor counts must be non-negative safe integers. Tighten the parser and prove refusal of `1e100` and `MAX_SAFE_INTEGER + 1`.
-3. **`silent-failure-hunter-1` — accepted.** Count-only enforcement can preserve blocking while losing the engine’s actual defects. The C1 identity-bearing floor requires every rendered settled finding verbatim and persists those identities.
-4. **`silent-failure-hunter-2` — accepted.** Enforce `PASSED iff critical_count === 0`; contradictory PASSED/BLOCKED evidence becomes a transcript failure.
-5. **`silent-failure-hunter-3` — accepted.** Duplicate of safe-integer parsing, also covering persisted captured spec-check counts. Use one shared safe-count parser predicate.
-6. **`silent-failure-hunter-4` — accepted.** Preserve unexpected Wave Gate diagnostics rather than collapsing them to ordinary prose: distinguish the outer internal-failure path, emit the full stack/cause to stderr, and retain a clearly typed/prefixed blocked diagnostic while expected domain refusals stay data.
-7. **`pr-test-analyzer-1` — accepted.** Add direct and façade-level regression coverage proving `projection-unavailable` is a decided, non-reapplyable refusal.
-8. **`type-design-analyzer-1` — accepted.** Brand `ManualOverrideFloor` with a module-private unique-symbol witness so ordinary object literals cannot bypass `decideSpecCheckManualOverride`; only the validating smart constructor mints it.
-9. **`type-design-analyzer-2` — accepted.** Make `unprojectedFloor` reject blank reasons at construction so every produced value round-trips through `parseSettledFloor`.
-10. **`comment-analyzer-3` — accepted.** Replace “planned by nobody” with “has no planned completion owner” and explicitly distinguish Requirement Contributions from completion ownership.
-11. **`comment-analyzer-4` — accepted.** Correct `parsedAnchorHashes` documentation: the StateManager rejects non-string values; only malformed strings reach the unreadable-record arm.
-12. **`comment-analyzer-5` — accepted.** Document both missing-hash outcomes: later successful projection yields unverifiable drift; continuing projection failure yields `projection-unavailable` refusal.
-13. **`comment-analyzer-6` — accepted.** Correct the contract-test comment to say a section-label mismatch loudly blocks registered spec-check decoding.
-14. **`architecture-tech-lead-1` — accepted.** Introduce one pure spec-check settlement aggregate command in `core/spec-check.ts`. It consumes validated authority plus a transcript/capture-failure/manual observation and returns one immutable TaskGraph transition that updates `spec_check` and `wave_gates` together. Claude, Pi, Wave façade, and manual helper become load/authorize/observe → command → persist shells. This is downward shared semantic mechanics and does not violate ADR-0005’s per-program driver decision.
-15. **`architecture-tech-lead-2` — accepted.** Extract TaskGraph population policy into `core/task-graph-population.ts`: a pure command consumes parsed authored tasks, prepared manifest/Spec observations, locked TaskGraph, options, and expected Spec identity, returning `Either<PopulationError, TaskGraph>`. The helper retains JSON/CLI parsing, Git/filesystem observations, model checks, locking, diagnostics, and persistence only. Test the pure aggregate directly without temporary repositories.
-16. **`code-simplifier-1` — accepted.** Replace historical `PopulateArgs` commentary with the current CLI authority contract.
-17. **`code-simplifier-2` — accepted.** Simplify `hashesOf` to trust parser-minted `SpecContentHash` values and remove the impossible null branch.
-18. **`code-simplifier-3` — accepted.** Remove duplicate `spec_anchor_hashes` parser cases from the Wave scope suite; retain the stronger table-driven StateManager load-boundary coverage.
-19. **`code-simplifier-4` — accepted.** Define one canonical passing spec-check footer helper/fixture in orchestration tests.
-20. **`code-simplifier-5` — accepted.** Consolidate and order Wave scope test imports before declarations.
-21. **`code-simplifier-6` — accepted.** Reuse one exact passing spec-check footer constant in both façade smoke flows.
+1. **`code-reviewer-2` — accepted.** Route Pi's missing-result recovery through `settleSpecCheck`; one aggregate must own evidence plus Wave-block state.
+2. **`code-reviewer-3` — accepted.** Same correction as C7; operators need both unavailable-projection outcomes.
+3. **`silent-failure-hunter-2` — accepted.** Report unexpected restart exceptions through the existing stack-preserving Wave Gate diagnostic.
+4. **`silent-failure-hunter-3` — accepted.** Apply the same stack-preserving diagnostic to orphan recovery.
+5. **`silent-failure-hunter-4` — accepted.** Apply the same diagnostic to unexpected start exceptions while retaining the external blocked action.
+6. **`silent-failure-hunter-5` — accepted.** Preserve independent best-effort sweeps, but emit full stack diagnostics and an operator-visible warning when UI is available; explicitly state that startup continues and authority remains checked at consumption.
+7. **`pr-test-analyzer-3` — accepted.** A population reset must remove active/terminal Wave, epoch, spec-check, completion-suite, reopening, orphan, and trace-retirement authority tied to replaced Tasks; prove this under `--force`.
+8. **`pr-test-analyzer-4` — accepted.** Generate canonical contiguous Wave sets beginning at 1 in the success property instead of blessing impossible fixtures.
+9. **`type-design-analyzer-2` — accepted.** Replace nullable correlated Pi review fields with a `legacy | slot-bound` discriminated union and test that mixed authority is unrepresentable.
+10. **`type-design-analyzer-3` — accepted.** Require a non-empty authored-Task tuple in `TaskGraphPopulationCommand` and retain a defensive runtime refusal at the exported aggregate boundary.
+11. **`comment-analyzer-5` — accepted.** Rename `NO_FLOOR` to `UNAVAILABLE_FLOOR` and explain why transcript defects short-circuit before projection refusal.
+12. **`comment-analyzer-6` — accepted.** Replace opaque A14/line-count history with the current persistent Wave Gate driver contract.
+13. **`comment-analyzer-7` — accepted.** Remove step-label comments that only narrate the import scanner's immediately visible control flow.
+14. **`architecture-tech-lead-1` — accepted.** Same Pi single-owner aggregate correction as advisory 1.
+15. **`architecture-tech-lead-2` — accepted.** Use private constructors that defensively copy/freeze SpecCheck arrays, nested provenance, evidence, and resolution records; prove deep immutability at `settleSpecCheck`.
+16. **`code-simplifier-1` — accepted.** Same Pi aggregate correction as advisories 1 and 14.
+17. **`code-simplifier-2` — accepted.** Derive the observed Spec Index digest once before comparison.
+18. **`code-simplifier-3` — accepted.** Delete the misleading duplicate `resolvedSpecFile` comparison test; retain the real locked race integration test.
+19. **`code-simplifier-4` — accepted.** Keep only the current shared legacy-authority predicate invariant in JSDoc; remove remediation history.
 
-### Deferred
+## Refuted-Finding audit
 
-None.
+No critical Finding reached the strict-majority refutation threshold, so `refuted_critical_findings` is empty and no critical is excluded from remediation. For audit completeness:
 
-### Dismissed
+- C5 received one intent refutation but reproduction and security upheld it.
+- C6 received one reproduction refutation, one intent uphold, and one security uncertainty.
+- C4 received three uncertain votes; uncertainty preserves the Finding by policy.
+- Every other critical was upheld by at least two lenses.
 
-None.
+## Architecture and implementation order
 
-## Refuted-finding audit
+1. Repair Spec parsing so complete list-item content is the only hash input; update parser properties and the glossary wording.
+2. Tighten persisted floor and SpecCheck ADTs at parse boundaries; add exact-schema, UNKNOWN migration, and deep-freeze tests.
+3. Make `settleSpecCheck` the exclusive Pi recovery transition and replace nullable Pi review authority with its discriminated union.
+4. Make TaskGraph Population accept non-empty authored Tasks and produce a true replacement aggregate with all old Wave authority removed; repair properties and force-reset integration tests.
+5. Reorder Wave Gate start publication, preserve stack diagnostics across start/restart/recovery, and add the historical floor-upgrade lock integration test.
+6. Correct stale operational/test comments, startup UI diagnostics, duplicate digest derivation, and narrating comments; delete only the specifically identified redundant test.
+7. Update `CONTEXT.md` where the domain contract changed: complete Spec entry content, usable captured verdicts, population replacement authority, and registration-before-active publication.
+8. Establish a green focused baseline, then run `distill` in apply mode one move at a time without changing behavior or weakening assertions.
+9. Run final full validation, audit dirty paths against frozen scope, and let registered remediation stage/verify/install the exact index.
 
-`refuted_critical_findings` is empty. The panel considered four critical Findings and all four survived. C1 and C3 received intent-lens refutations based on the previous count-only/mtime policies, but reproduction and security upheld the concrete integrity failures, satisfying the 2-of-3 threshold. C2 and C4 were upheld unanimously.
-
-## Deep interface design
-
-### Spec-check settlement aggregate
-
-- **Input ADT:** exact Wave/time, validated floor authority, and one of registered transcript, manual transcript, or capture-failure observation.
-- **Output ADT:** applied immutable TaskGraph plus resulting `SpecCheck`, or a typed manual-evidence refusal that preserves the original graph.
-- **Hidden invariants:** marker completeness/exact Wave, safe and matching counts, verdict/count consistency, projection availability, settled identity inclusion, evidence-source attribution, and atomic `spec_check`/Wave-block reconciliation.
-- **Shell responsibility:** obtain request/document/manual authority, parse bytes, call the command under lock, persist its returned graph, and render its typed outcome.
-
-### TaskGraph population aggregate
-
-- **Input:** locked graph, validated authored decomposition, validated plan path, prepared verification manifest, observed Spec Index/path, CLI metadata, and overwrite authority.
-- **Output:** `Either<PopulationError, TaskGraph>` with non-pending overwrite and Spec identity races represented as data.
-- **Hidden invariants:** sanitized pending Tasks, parser-derived Requirement hashes, exact Wave gate keys, stale completion-suite removal, fixed current Wave/execution state, and metadata precedence.
-- **Shell responsibility:** parse/validate stdin and flags, observe Git/filesystem data, verify executable-model bindings, acquire the StateManager lock, invoke the pure command, and persist only `Right`.
-
-## Implementation order
-
-1. Add failing core tests for identity-bearing floors, altered-hash enforcement, exact Wave markers, verdict consistency, safe persisted counts, non-empty/opaque authority constructors, manual provenance, and non-reapplication.
-2. Implement the floor/evidence ADTs and pure settlement aggregate; migrate all four transport shells to the aggregate.
-3. Add failing pure population-command tests, extract the aggregate, and reduce `populate-task-graph` to its imperative shell.
-4. Correct standalone Spec authority, claimed-scenario coverage, current comments, and `CONTEXT.md` ubiquitous language.
-5. Apply accepted fixture/test simplifications without weakening behavior.
-6. Run focused tests, typecheck/unused gates, full unit suite, smoke suite, and `git diff --check`.
-7. Run `distill` apply mode over a green baseline one behavior-preserving move at a time, re-running covering tests after each move.
-8. Start registered remediation with the support paths below; let the façade audit, stage, verify, and atomically install the exact index.
-
-## Validation commands
+## Validation
 
 ```bash
-cd engine && env -u PI_CODING_AGENT bunx vitest run \
-  tests/core/requirement-coverage.test.ts \
-  tests/core/requirement-coverage.property.test.ts \
+cd engine
+npm run typecheck
+npx vitest run \
+  tests/core/parse-spec.test.ts \
+  tests/core/parse-spec.property.test.ts \
   tests/core/spec-check-floor.test.ts \
   tests/core/task-graph-population.test.ts \
-  tests/handlers/helpers/store-spec-check.test.ts \
-  tests/handlers/helpers/wave-spec-check-scope.test.ts \
-  tests/handlers/populate-task-graph.test.ts \
-  tests/handlers/store-spec-check-findings.test.ts \
-  tests/handlers/subagent-stop/dispatch-resilience.test.ts \
   tests/handlers/helpers/orchestration.test.ts \
+  tests/handlers/helpers/store-spec-check.test.ts \
+  tests/handlers/populate-task-graph.test.ts \
   tests/pi/subagent-result.test.ts \
+  tests/review-round6-core-regressions.test.ts \
   tests/spec-check-command-contract.test.ts \
-  tests/state-manager-load-guards.test.ts \
-  --testTimeout=20000
-cd engine && npm run typecheck
-cd engine && npm run test:unit
-cd engine && env -u PI_CODING_AGENT npm run test:smoke
+  tests/state-manager-load-guards.test.ts
+npm run test:unit
+env -u PI_CODING_AGENT npm run test:smoke
+cd ..
 git diff --check
 ```
 
-## Registered remediation support paths
+## Remediation support paths
 
-- `engine/src/core/task-graph-population.ts` — new functional-core module required by accepted advisory `architecture-tech-lead-2`; it is not in the frozen review scope because it does not yet exist.
-- `engine/tests/core/task-graph-population.test.ts` — direct no-I/O tests at the new aggregate interface; it is not in the frozen review scope because it does not yet exist.
-- `engine/tests/core/round15.test.ts` — existing compatibility fixture outside the frozen scope; the new verdict/count invariant makes its former `PASSED` plus one-critical record illegal, so the immutability test now uses the equivalent legal `BLOCKED` record without changing its subject.
+The following three paths are outside `result.json.scope` but contain the same stale writer-inventory terminology as C9. Leaving them unchanged would preserve contradictory documentation for the removed initializer, so they are authorized as comment-only remediation support:
 
-The plan file itself and every other planned production/test path are already inside `result.json.scope`; no other support path is authorized.
+- `engine/src/core/findings.ts`
+- `engine/src/handlers/helpers/validate-task-graph.ts`
+- `engine/tests/handlers/validate-task-graph.test.ts`
+
+Every other planned path, including this plan, is already inside `result.json.scope`. No other support path is authorized.

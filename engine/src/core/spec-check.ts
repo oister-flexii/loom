@@ -9,6 +9,7 @@ import type { AgentRequestAuthority } from "./orchestration-contract";
 import {
   parseSpecCheckVerdict,
   type CapturedSpecCheck,
+  type CapturedSpecCheckVerdict,
   type EvidenceFailedSpecCheck,
   type SpecCheck,
   type SpecCheckEvidenceFailureCause,
@@ -230,14 +231,49 @@ export function specCheckNeedsReapplication(specCheck: SpecCheck | undefined, wa
   return specCheck.cause === "transcript";
 }
 
+function frozenEvidenceFailure(
+  wave: number,
+  runAt: string,
+  error: string,
+  cause: SpecCheckEvidenceFailureCause,
+): EvidenceFailedSpecCheck {
+  return Object.freeze({ wave, run_at: runAt, verdict: "EVIDENCE_CAPTURE_FAILED", error, cause });
+}
+
+function frozenCapturedSpecCheck(
+  wave: number,
+  runAt: string,
+  verdict: CapturedSpecCheckVerdict,
+  criticalFindings: readonly string[],
+  highFindings: readonly string[],
+  mediumFindings: readonly string[],
+  evidenceSource?: CapturedSpecCheck["evidence_source"],
+): CapturedSpecCheck {
+  const critical = Object.freeze([...criticalFindings]);
+  const high = Object.freeze([...highFindings]);
+  return Object.freeze({
+    wave,
+    run_at: runAt,
+    verdict,
+    critical_count: critical.length,
+    high_count: high.length,
+    critical_findings: critical,
+    high_findings: high,
+    medium_findings: Object.freeze([...mediumFindings]),
+    ...(evidenceSource === undefined
+      ? {}
+      : { evidence_source: Object.freeze({ ...evidenceSource }) }),
+  });
+}
+
 const evidenceFailure = (
   wave: number,
   runAt: string,
   error: string,
   cause: SpecCheckEvidenceFailureCause,
-): SpecCheckResolution => ({
+): SpecCheckResolution => Object.freeze({
   kind: "evidence-failed",
-  specCheck: { wave, run_at: runAt, verdict: "EVIDENCE_CAPTURE_FAILED", error, cause },
+  specCheck: frozenEvidenceFailure(wave, runAt, error, cause),
 });
 
 /**
@@ -311,7 +347,7 @@ export function reconcileSpecCheck(
       "transcript",
     );
   }
-  const expectedVerdict = parsed.criticalCount === 0 ? "PASSED" : "BLOCKED";
+  const expectedVerdict: CapturedSpecCheckVerdict = parsed.criticalCount === 0 ? "PASSED" : "BLOCKED";
   if (parsed.verdict !== expectedVerdict) {
     return evidenceFailure(
       wave,
@@ -356,22 +392,20 @@ export function reconcileSpecCheck(
       );
     }
   }
-  return {
+  return Object.freeze({
     kind: "captured",
-    specCheck: {
+    specCheck: frozenCapturedSpecCheck(
       wave,
-      run_at: runAt,
-      critical_count: parsed.criticalCount,
-      high_count: highCount,
-      critical_findings: [...parsed.critical],
-      high_findings: [...parsed.high],
-      medium_findings: [...parsed.medium],
-      verdict: parsed.verdict,
-      ...(floorAuthority.kind === "manual-override"
-        ? { evidence_source: { kind: "manual-override" as const, reason: floorAuthority.reason } }
-        : {}),
-    },
-  };
+      runAt,
+      expectedVerdict,
+      parsed.critical,
+      parsed.high,
+      parsed.medium,
+      floorAuthority.kind === "manual-override"
+        ? Object.freeze({ kind: "manual-override" as const, reason: floorAuthority.reason })
+        : undefined,
+    ),
+  });
 }
 
 export type SpecCheckSettlementCommand =
@@ -465,15 +499,12 @@ export function parseStoredSpecCheck(raw: unknown): SpecCheckParseResult {
   if (errors.length > 0 || verdict === null) return { ok: false, errors };
 
   return verdict === "EVIDENCE_CAPTURE_FAILED"
-    ? parseFailedSpecCheck(spec, verdict)
+    ? parseFailedSpecCheck(spec)
     : parseCapturedSpecCheck(spec, verdict);
 }
 
 /** The evidence-failed arm: a cause and an operator message, and no counts. */
-function parseFailedSpecCheck(
-  spec: Record<string, unknown>,
-  verdict: "EVIDENCE_CAPTURE_FAILED",
-): SpecCheckParseResult {
+function parseFailedSpecCheck(spec: Record<string, unknown>): SpecCheckParseResult {
   const errors: string[] = [];
   if (typeof spec.error !== "string" || spec.error.trim() === "") {
     errors.push("spec_check.error must be a non-empty string when evidence capture failed");
@@ -487,7 +518,7 @@ function parseFailedSpecCheck(
   ] as const) {
     if (spec[field] !== undefined) errors.push(`spec_check.${field} must be absent when evidence capture failed`);
   }
-  return errors.length > 0 ? { ok: false, errors } : { ok: true, value: freshEvidenceFailed(spec, verdict) };
+  return errors.length > 0 ? { ok: false, errors } : { ok: true, value: freshEvidenceFailed(spec) };
 }
 
 /** The captured arm: counts that must agree with the findings they summarize. */
@@ -525,9 +556,19 @@ function parseCapturedSpecCheck(
   if (verdict === "BLOCKED" && spec.critical_count === 0) {
     errors.push("spec_check.verdict BLOCKED requires critical_count greater than 0");
   }
-  return errors.length > 0
-    ? { ok: false, errors }
-    : { ok: true, value: freshCaptured(spec, verdict, evidenceSource) };
+  if (errors.length > 0) return { ok: false, errors };
+  if (verdict === "UNKNOWN") {
+    return {
+      ok: true,
+      value: frozenEvidenceFailure(
+        spec.wave as number,
+        spec.run_at as string,
+        "persisted spec_check verdict UNKNOWN is not usable captured evidence - re-run /wave-gate",
+        "transcript",
+      ),
+    };
+  }
+  return { ok: true, value: freshCaptured(spec, verdict, evidenceSource) };
 }
 
 /**
@@ -552,36 +593,31 @@ function parseManualEvidenceSource(raw: unknown): CapturedSpecCheck["evidence_so
 
 function freshCaptured(
   spec: Record<string, unknown>,
-  verdict: Exclude<SpecCheckVerdict, "EVIDENCE_CAPTURE_FAILED">,
+  verdict: CapturedSpecCheckVerdict,
   evidenceSource: CapturedSpecCheck["evidence_source"],
 ): CapturedSpecCheck {
-  return Object.freeze({
-    wave: spec.wave as number,
-    run_at: spec.run_at as string,
+  return frozenCapturedSpecCheck(
+    spec.wave as number,
+    spec.run_at as string,
     verdict,
-    critical_count: spec.critical_count as number,
-    high_count: spec.high_count as number,
-    critical_findings: Object.freeze([...(spec.critical_findings as readonly string[])]),
-    high_findings: Object.freeze([...(spec.high_findings as readonly string[])]),
-    medium_findings: Object.freeze([...(spec.medium_findings as readonly string[])]),
-    ...(evidenceSource === undefined ? {} : { evidence_source: evidenceSource }),
-  });
+    spec.critical_findings as readonly string[],
+    spec.high_findings as readonly string[],
+    spec.medium_findings as readonly string[],
+    evidenceSource,
+  );
 }
 
-function freshEvidenceFailed(
-  spec: Record<string, unknown>,
-  verdict: "EVIDENCE_CAPTURE_FAILED",
-): EvidenceFailedSpecCheck {
-  return Object.freeze({
-    wave: spec.wave as number,
-    run_at: spec.run_at as string,
-    verdict,
-    error: spec.error as string,
-    // Absent is not unknown: every failure written before the floor existed was
-    // a transcript failure, so the historical shape has exactly one meaning and
-    // the parse boundary is where it becomes total.
-    cause: spec.cause === "settled-floor" || spec.cause === "projection-unavailable"
-      ? spec.cause
-      : "transcript",
-  });
+function freshEvidenceFailed(spec: Record<string, unknown>): EvidenceFailedSpecCheck {
+  // Absent is not unknown: every failure written before the floor existed was
+  // a transcript failure, so the historical shape has exactly one meaning and
+  // the parse boundary is where it becomes total.
+  const cause = spec.cause === "settled-floor" || spec.cause === "projection-unavailable"
+    ? spec.cause
+    : "transcript";
+  return frozenEvidenceFailure(
+    spec.wave as number,
+    spec.run_at as string,
+    spec.error as string,
+    cause,
+  );
 }

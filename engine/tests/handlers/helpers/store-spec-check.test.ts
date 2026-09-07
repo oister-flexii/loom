@@ -175,16 +175,15 @@ describe("store-spec-check helper", () => {
   });
 
   it("pins the floor argument: the operator override imposes no floor even when a projection would settle rows", () => {
-    // The round-3 D1 floor argument this pins: the helper's fourth settlement
-    // path states its floor as the shipped `unprojectedFloor` — the operator
-    // supplies the transcript on stdin, there is no packet, and the override
-    // exists to correct a structural verdict a human judged wrong. A regression
+    // The helper's manual settlement path carries separately authorized,
+    // attributable `manualOverrideFloor` authority: the operator supplies the
+    // transcript on stdin, there is no packet, and the override exists to
+    // correct a structural verdict a human judged wrong. A regression
     // to `settledFloorOf(coverageTasks(graph, wave))` would re-project the live
     // graph's count and refuse this honest 0-CRITICAL override against a
-    // number the operator was never shown. Every sibling fixture has a null
-    // spec_file, where both floors are behaviorally identical; this one has a
-    // canonical spec file whose projection settles rows, so only the shipped
-    // floor admits the write.
+    // number the operator was never shown. This fixture has a canonical spec
+    // file whose projection settles rows, so only explicit manual authority
+    // admits the write.
     const specPath = join(tmpDir, "spec.md");
     writeFileSync(specPath, [
       "# Feature: Override floor pin",

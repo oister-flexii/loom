@@ -4,6 +4,7 @@ import { parseSpec } from "../../src/core/parse-spec";
 import {
   populateTaskGraph,
   type AuthoredTask,
+  type NonEmptyAuthoredTasks,
   type TaskGraphPopulationCommand,
 } from "../../src/core/task-graph-population";
 import { defaultVerificationManifest } from "../../src/core/verification-manifest";
@@ -122,6 +123,14 @@ describe("populateTaskGraph aggregate command", () => {
     ]);
   });
 
+  it("defensively refuses an empty authored roster at the exported boundary", () => {
+    const forged = { ...command(), tasks: [] } as unknown as TaskGraphPopulationCommand;
+    expect(populateTaskGraph(graph(), forged)).toMatchObject({
+      ok: false,
+      error: { kind: "no-tasks" },
+    });
+  });
+
   it("returns typed overwrite refusal and preserves the aggregate", () => {
     const existing = graph({
       tasks: [{ ...authoredTask("T0", 1), status: "completed" } as never],
@@ -133,6 +142,34 @@ describe("populateTaskGraph aggregate command", () => {
       error: { kind: "non-pending-tasks", message: expect.stringContaining("--force") },
     });
     expect(existing.tasks[0]?.status).toBe("completed");
+  });
+
+  it("removes every Wave authority tied to Tasks replaced by population", () => {
+    const result = populateTaskGraph(graph({
+      active_wave_completion_suite: { stale: true } as never,
+      active_wave_gate: { stale: true } as never,
+      wave_review_epoch: { stale: true } as never,
+      spec_check: { stale: true } as never,
+      wave_gate_history: [{ stale: true }] as never,
+      wave_reopening_history: [{ stale: true }] as never,
+      orphaned_wave_gate_history: [{ stale: true }] as never,
+      spec_trace_wave_gate_retirements: [{ stale: true }] as never,
+    }), command({ force: true }));
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    for (const field of [
+      "active_wave_completion_suite",
+      "active_wave_gate",
+      "wave_review_epoch",
+      "spec_check",
+      "wave_gate_history",
+      "wave_reopening_history",
+      "orphaned_wave_gate_history",
+      "spec_trace_wave_gate_retirements",
+    ] as const) {
+      expect(result.value.state[field], field).toBeUndefined();
+    }
   });
 
   it("detects locked spec_file drift without stamping hashes from another document", () => {
@@ -158,12 +195,15 @@ describe("populateTaskGraph aggregate command", () => {
     });
   });
 
-  it("derives exactly one pending gate and sanitized Task per generated Wave", () => {
+  it("derives exactly one pending gate and sanitized Task per canonical Wave", () => {
     fc.assert(fc.property(
-      fc.uniqueArray(fc.integer({ min: 1, max: 8 }), { minLength: 1, maxLength: 8 }),
-      (generatedWaves) => {
-        const waves = [...generatedWaves].sort((left, right) => left - right);
-        const tasks = waves.map((wave, index) => authoredTask(`T${index + 1}`, wave));
+      fc.integer({ min: 1, max: 8 }),
+      (waveCount) => {
+        const waves = Array.from({ length: waveCount }, (_, index) => index + 1);
+        const tasks: NonEmptyAuthoredTasks = [
+          authoredTask("T1", 1),
+          ...waves.slice(1).map((wave) => authoredTask(`T${wave}`, wave)),
+        ];
         const result = populateTaskGraph(graph(), command({ tasks }));
         expect(result.ok).toBe(true);
         if (!result.ok) return;

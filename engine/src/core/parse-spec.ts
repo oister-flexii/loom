@@ -371,6 +371,12 @@ function parseEntries<F extends SpecFamily>(
 ): NonEmpty<SpecEntry<F>> | null {
   const { section, pattern } = ENTRY_GRAMMARS[family];
   const entries: SpecEntry<F>[] = [];
+  let current: { id: string; content: string[] } | null = null;
+  const finishCurrent = (): void => {
+    if (current === null) return;
+    entries.push(specEntry<F>(current.id, current.content.join(" ")));
+    current = null;
+  };
   for (const { raw, documentLine } of lines) {
     const line = raw.trim();
     if (!line.startsWith("-")) {
@@ -379,17 +385,27 @@ function parseEntries<F extends SpecFamily>(
       // accepted prefix set.
       if (STRUCTURAL_ID.test(raw)) {
         errors.push(Object.freeze({ kind: "entry-not-bulleted", section, line: documentLine }));
+      } else if (current !== null && line !== "") {
+        // Markdown permits both indented and lazy list-item continuations.
+        // They are requirement content, so they must participate in the same
+        // canonical value and hash as the physical bullet line.
+        current.content.push(line);
       }
       continue;
     }
-    if (isThematicBreak(line)) continue;
+    if (isThematicBreak(line)) {
+      finishCurrent();
+      continue;
+    }
+    finishCurrent();
     const matched = pattern.exec(line);
     if (matched === null) {
       errors.push(Object.freeze({ kind: "entry-not-canonical", section, line: documentLine }));
       continue;
     }
-    entries.push(specEntry<F>(matched[1], matched[2]));
+    current = { id: matched[1], content: [matched[2]] };
   }
+  finishCurrent();
   if (entries.length === 0) {
     errors.push(Object.freeze({ kind: "section-has-no-entries", section }));
     return null;
@@ -441,10 +457,15 @@ function acceptanceScenarioLines(lines: readonly SourceLine[], errors: SpecParse
     }
     // A recognizable structural ID that is not a collected bullet — in or out
     // of an acceptance block — must fail closed, never vanish.
-    if (STRUCTURAL_ID.test(raw) && !isCollectedBullet(raw)) errors.push(strayId(documentLine));
-    if (state.kind !== "inside" || !line.startsWith("-")) continue;
-    scenarios.push(Object.freeze({ raw, documentLine }));
-    state = Object.freeze({ kind: "inside", headerLine: state.headerLine, sawBullet: true });
+    const strayStructuralId = STRUCTURAL_ID.test(raw) && !isCollectedBullet(raw);
+    if (strayStructuralId) errors.push(strayId(documentLine));
+    if (state.kind !== "inside") continue;
+    if (line.startsWith("-")) {
+      scenarios.push(Object.freeze({ raw, documentLine }));
+      state = Object.freeze({ kind: "inside", headerLine: state.headerLine, sawBullet: true });
+    } else if (state.sawBullet && line !== "" && !strayStructuralId) {
+      scenarios.push(Object.freeze({ raw, documentLine }));
+    }
   }
   if (state.kind === "inside" && !state.sawBullet) closeBlock(state.headerLine);
   if (state.kind === "before") errors.push(Object.freeze({ kind: "no-acceptance-block" }));
@@ -472,8 +493,8 @@ function parseGlossary(lines: readonly SourceLine[], errors: SpecParseError[]): 
       errors.push(Object.freeze({ kind: "glossary-column-count", line: documentLine }));
       continue;
     }
-    // Silently skip only the separator row (GFM accepts 1+ hyphens per cell)
-    // and the case-insensitive header shape; any reserved-term data row is
+    // Silently skip only Loom's 1+-hyphen separator row and the
+    // case-insensitive header shape; any reserved-term data row is
     // both dropped from entries and flagged as an error, never silently
     // dropped.
     if (cells.every((cell) => /^:?-{1,}:?$/u.test(cell))) continue;

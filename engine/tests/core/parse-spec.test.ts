@@ -95,6 +95,35 @@ describe("parseSpec", () => {
     expect(Object.isFrozen(parsed.value)).toBe(true);
   });
 
+  it("includes wrapped FR, AS, and OOS continuation text in canonical content and hashes", () => {
+    const wrapped = validSpec
+      .replace(
+        "- FR-001: System MUST parse canonical requirement IDs",
+        "- FR-001: System MUST parse canonical requirement IDs\n  across wrapped lines",
+      )
+      .replace(
+        "- AS-001: Given a canonical spec, When it is parsed, Then structural entries are returned",
+        "- AS-001: Given a canonical spec, When it is parsed, Then structural entries are returned\n  including continuation clauses",
+      )
+      .replace(
+        "- OOS-001: Symbol-level source indexing",
+        "- OOS-001: Symbol-level source indexing\n  and generated semantic indexes",
+      );
+    const parsed = parseSpec(wrapped);
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.frs[0].content).toBe(
+      "System MUST parse canonical requirement IDs across wrapped lines",
+    );
+    expect(parsed.value.scenarios[0].content).toContain("including continuation clauses");
+    expect(parsed.value.oos[0].content).toContain("and generated semantic indexes");
+    expect(parsed.value.frs[0].contentHash).toBe(specContentHash(parsed.value.frs[0].content));
+    expect(parsed.value.frs[0].contentHash).not.toBe(
+      specContentHash("System MUST parse canonical requirement IDs"),
+    );
+  });
+
   it("makes an empty projection and a swapped family unrepresentable", () => {
     // Compile-time assertions, checked by `tsc` over `tests/`: each expected-
     // error directive below fails the build if its error stops occurring. They
@@ -757,14 +786,14 @@ describe("parseSpec", () => {
       .not.toBe(specContentHash("System SHOULD parse specs"));
   });
 
-  it("parses a GFM single-dash delimiter row as a separator, not a data row", () => {
+  it("parses Loom's single-dash delimiter extension as a separator, not a data row", () => {
     const gfm = validSpec.replace(
       "| Spec Index | A deterministic projection of specification entries |",
       "| Spec Index | A deterministic projection of specification entries |\n|-|-|",
     );
     const parsed = parseSpec(gfm);
-    // GFM accepts 1+ hyphens per delimiter cell; a single-dash row is
-    // furniture. Misclassifying it as a data row mints a bogus entry.
+    // Loom intentionally accepts 1+ hyphens per delimiter cell; a single-dash
+    // row is furniture. Misclassifying it as a data row mints a bogus entry.
     expect(parsed).toMatchObject({ ok: true });
     if (parsed.ok) {
       expect(parsed.value.glossary.map(({ term }) => term)).not.toContain("-");

@@ -286,26 +286,31 @@ export type PiSpecCheckAttemptAuthority = Readonly<{
   attempt: WaveSpecCheckSlotAuthority["attempted"];
 }>;
 
-export type PiReviewAttemptAuthority = Readonly<{
+type PiReviewAttemptAuthorityBase = Readonly<{
   taskId: string;
   agentType: string;
-  generation: number;
-  packetId: string | null;
-  slotId: string | null;
-  attempted: 1 | 2 | null;
 }>;
 
+export type PiReviewAttemptAuthority =
+  | Readonly<PiReviewAttemptAuthorityBase & {
+      kind: "legacy";
+      generation: 0;
+      packetId?: never;
+      slotId?: never;
+      attempted?: never;
+    }>
+  | Readonly<PiReviewAttemptAuthorityBase & {
+      kind: "slot-bound";
+      generation: number;
+      packetId: string;
+      slotId: string;
+      attempted: 1 | 2;
+    }>;
+
 /**
- * Whether a Task is EXPLICITLY legacy — no Review Run, no review generation,
- * no retained accepted-review authority, and no issued review packets.
- *
- * Two appliers must agree on this predicate in lockstep:
- * `reviewAuthorityForTask` mints a legacy generation-0 authority for it, and
- * `piReviewAuthorityProblem` accepts unreserved reviewer evidence against it.
- * The predicate was written twice, which is the proof the duplication is
- * live: a new Task field that retires legacy state had to land in both sites
- * or the two appliers would disagree — one minting an authority the other
- * rejects. One helper makes that defect structurally impossible.
+ * Whether a Task is explicitly legacy: no Review Run, review generation,
+ * retained accepted-review authority, or issued Review Packet. Authority
+ * minting and validation must share this one predicate.
  */
 const isExplicitlyLegacyTask = (task: LoomTask): boolean =>
   task.review_run === undefined &&
@@ -321,18 +326,17 @@ function reviewAuthorityForTask(
   if (run === undefined) {
     return isExplicitlyLegacyTask(task)
       ? Object.freeze({
+          kind: "legacy" as const,
           taskId: task.id,
           agentType,
-          generation: 0,
-          packetId: null,
-          slotId: null,
-          attempted: null,
+          generation: 0 as const,
         })
       : null;
   }
   const slot = run.slot_authority?.find((candidate) => candidate.agent === agentType);
   if (slot === undefined) return null;
   return Object.freeze({
+    kind: "slot-bound" as const,
     taskId: task.id,
     agentType,
     generation: run.generation,
@@ -364,13 +368,18 @@ export function piReviewAuthorityProblem(
       ? null
       : "reviewer has no exact current or retained review-generation authority";
   }
-  return currentAuthority !== null &&
-      currentAuthority.taskId === reservedAuthority.taskId &&
-      currentAuthority.agentType === reservedAuthority.agentType &&
-      currentAuthority.generation === reservedAuthority.generation &&
-      currentAuthority.packetId === reservedAuthority.packetId &&
-      currentAuthority.slotId === reservedAuthority.slotId &&
-      currentAuthority.attempted === reservedAuthority.attempted
+  const sameBase = currentAuthority !== null &&
+    currentAuthority.kind === reservedAuthority.kind &&
+    currentAuthority.taskId === reservedAuthority.taskId &&
+    currentAuthority.agentType === reservedAuthority.agentType &&
+    currentAuthority.generation === reservedAuthority.generation;
+  const matches = sameBase && currentAuthority !== null &&
+    (currentAuthority.kind === "legacy" ||
+      (reservedAuthority.kind === "slot-bound" &&
+       currentAuthority.packetId === reservedAuthority.packetId &&
+       currentAuthority.slotId === reservedAuthority.slotId &&
+       currentAuthority.attempted === reservedAuthority.attempted));
+  return matches
     ? null
     : "failed reviewer reservation does not match exact current Task/Review Run slot authority";
 }

@@ -263,7 +263,6 @@ export function extractImports(
     const line = lines[i];
     const trimmed = line.trim();
 
-    // Track block comments
     if (inBlockComment) {
       if (trimmed.includes("*/")) inBlockComment = false;
       continue;
@@ -274,14 +273,12 @@ export function extractImports(
     }
     if (trimmed.startsWith("//")) continue;
 
-    // Try TS/JS import first
     const tsMatch = tsImportRe.exec(line);
     if (tsMatch && isPlausibleSpecifier(tsMatch[1])) {
       imports.push({ line: i + 1, specifier: tsMatch[1], text: line });
       continue;
     }
 
-    // Try Java import
     const javaMatch = javaImportRe.exec(line);
     if (javaMatch) {
       imports.push({ line: i + 1, specifier: javaMatch[1], text: line });
@@ -342,16 +339,12 @@ export function checkBoundaryViolation(
   resolvedImport: string,
   boundaries: readonly BoundaryRule[]
 ): string | null {
-  // Normalize file path to forward slashes
   const normalizedFile = filePath.split(sep).join("/");
-
-  // Find applicable boundary rule for this file
   const boundary = boundaries.find((b) => underPrefix(normalizedFile, b.module));
   if (!boundary) {
     return null; // No boundary rule applies — allow
   }
 
-  // Check deny list first (takes priority over allow)
   for (const denied of boundary.deny) {
     if (underPrefix(resolvedImport, denied)) {
       return `Module "${boundary.module}" must not import from "${denied}" — violates bounded context boundary`;
@@ -375,7 +368,6 @@ export function checkBoundaryViolation(
     }
   }
 
-  // Check allow list — import must match at least one entry
   const isAllowed = boundary.allow.some((allowed) => underPrefix(resolvedImport, allowed));
   if (!isAllowed) {
     return `Module "${boundary.module}" may only import from [${boundary.allow.join(", ")}] — "${resolvedImport}" is not allowed`;

@@ -365,7 +365,38 @@ describe("populate-task-graph — protected verification manifest authority", ()
     const dir = tempDir();
     const plan = modelFreePlan(dir);
     const statePath = writeState(dir, plan, [existingTask("T1", "completed")], {
+      current_wave: 1,
       verification_manifest: defaultVerificationManifest(),
+      active_wave_gate: {
+        schemaVersion: 1,
+        kind: "active-wave-gate",
+        runId: "run.stale-population",
+        wave: 1,
+        authorityDigest: "a".repeat(64),
+        revision: 0,
+        terminalOutcome: null,
+      } as TaskGraph["active_wave_gate"],
+      wave_review_epoch: {
+        runId: "run.stale-population",
+        wave: 1,
+        batchEpoch: "b".repeat(64),
+        specCheckDocuments: {
+          spec: { path: null, contentDigest: null },
+          plan: { path: plan, contentDigest: "c".repeat(64) },
+        },
+        specCheckSlotAuthority: { slot_id: "wave-slot:stale", attempted: 1 },
+        settledSpecCheckFloor: { kind: "unprojected", reason: "stale population" },
+      } as TaskGraph["wave_review_epoch"],
+      spec_check: {
+        wave: 1,
+        run_at: "before",
+        verdict: "PASSED",
+        critical_count: 0,
+        high_count: 0,
+        critical_findings: [],
+        high_findings: [],
+        medium_findings: [],
+      },
     });
     const manifestPath = writeManifest(dir, manifestDocument("npm"));
     const expected = freezeVerificationManifest(readFileSync(manifestPath));
@@ -376,6 +407,9 @@ describe("populate-task-graph — protected verification manifest authority", ()
     const after = JSON.parse(stateBytes(statePath)) as TaskGraph;
     expect(after.verification_manifest).toEqual(expected.value);
     expect(after.active_wave_completion_suite).toBeUndefined();
+    expect(after.active_wave_gate).toBeUndefined();
+    expect(after.wave_review_epoch).toBeUndefined();
+    expect(after.spec_check).toBeUndefined();
   });
 
   it("rejects decompose attempts to inject or override manifest authority", async () => {
@@ -714,8 +748,9 @@ describe("populate-task-graph — engine-derived Requirement content hashes", ()
   });
 
   it("records nothing rather than guessing when the spec does not project, and says why", async () => {
-    // A project without a canonical specification still decomposes; drift is
-    // then reported as unverifiable at the gate, never as stable. The REASON is
+    // A project without a canonical specification still decomposes. A later
+    // successful projection reports unrecorded hashes as unverifiable; continued
+    // projection failure blocks settlement. The REASON is
     // what distinguishes this from a missing file, so assert it: without that,
     // this test and the one below assert the identical thing.
     const stderr: string[] = [];
@@ -730,7 +765,8 @@ describe("populate-task-graph — engine-derived Requirement content hashes", ()
       spy.mockRestore();
     }
     expect(stderr.join("")).toContain("is not a canonical specification");
-    expect(stderr.join("")).toContain("drift as unverifiable");
+    expect(stderr.join("")).toContain("drift will be unverifiable");
+    expect(stderr.join("")).toContain("continued projection unavailability blocks settlement");
   });
 
   it("records nothing when the spec file does not exist, and says so distinctly", async () => {
@@ -755,7 +791,7 @@ describe("populate-task-graph — engine-derived Requirement content hashes", ()
   it("cannot be pre-stamped by the decompose payload", async () => {
     // Decompose says WHICH Requirements a Task completes; the specification's
     // own bytes say what they SAID. An authored hash is dropped like every
-    // other field `sanitizeDecomposedTask` does not pick.
+    // other field core `sanitizeTask` does not pick.
     const dir = tempDir();
     const plan = modelFreePlan(dir);
     writeManifest(dir);
@@ -854,12 +890,4 @@ describe("populate-task-graph — one spec_file precedence", () => {
     expect(graph.tasks.some(({ id }) => id === "T1")).toBe(false);
   });
 
-  it("makes the in-lock guard compare like for like", () => {
-    // The guard fires exactly when the two derivations disagree, which is the
-    // only condition under which the prepared Spec Index describes another
-    // document. Same inputs must always agree; changed inputs must not.
-    expect(resolvedSpecFile("a.md", "x.md")).toBe(resolvedSpecFile("a.md", "x.md"));
-    expect(resolvedSpecFile("a.md", "x.md")).not.toBe(resolvedSpecFile("b.md", "x.md"));
-    expect(resolvedSpecFile(null, "x.md")).not.toBe(resolvedSpecFile("b.md", "x.md"));
-  });
 });

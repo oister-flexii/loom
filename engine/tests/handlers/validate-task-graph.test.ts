@@ -1040,8 +1040,8 @@ describe("validateFull agrees with the load boundary about the findings aggregat
   });
 
   it("does NOT apply the findings rules to the agent-controlled decompose payload", () => {
-    // populate-task-graph validates the payload BEFORE sanitizeDecomposedTask
-    // strips the execution state a planner must never mint. Holding it to the
+    // populate-task-graph validates the payload BEFORE TaskGraph Population's
+    // sanitizeTask strips execution state a planner must never mint. Holding it to the
     // findings invariants would reject exactly the forged input that
     // sanitization exists to clean, turning a successful strip into a hard fail.
     const forged = graph({ findings: [], critical_findings: ["planted"], advisory_findings: [] });
