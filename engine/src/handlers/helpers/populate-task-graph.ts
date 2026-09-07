@@ -59,7 +59,7 @@ type ManifestFile =
   | Readonly<{ kind: "default"; value: FrozenVerificationManifest }>
   | Readonly<{ kind: "error"; error: string }>;
 
-function defaultManifestIfMissing(path: string, error: unknown): ManifestFile | null {
+function defaultManifestIfMissing(path: string, error: unknown): ManifestFile {
   if ((error as NodeJS.ErrnoException).code === "ENOENT") {
     return { kind: "default", value: defaultVerificationManifest() };
   }
@@ -87,8 +87,7 @@ function readManifestFile(manifestPath: string): ManifestFile {
       return { kind: "error", error: `${manifestPath} must be a regular non-symlink file` };
     }
   } catch (error) {
-    const missing = defaultManifestIfMissing(manifestPath, error);
-    if (missing !== null) return missing;
+    return defaultManifestIfMissing(manifestPath, error);
   }
   try {
     return { kind: "bytes", value: Uint8Array.from(readRunBytesNoFollow(manifestPath)) };

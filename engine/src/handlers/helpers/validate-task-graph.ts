@@ -35,6 +35,7 @@ import {
   orphanExecutionReservationError,
   taskDependencyErrors,
   taskGraphLifecycleErrors,
+  parseTaskGraph,
   taskIdError,
   taskUnionError,
 } from "../../state-manager";
@@ -132,7 +133,11 @@ export function validateFull(
   scope: ValidationScope = "state-file",
 ): ValidationResult {
   const errors: string[] = [];
-  if (scope === "state-file") errors.push(...taskGraphLifecycleErrors(json));
+  if (scope === "state-file") {
+    const decoded = parseTaskGraph(json);
+    if (!decoded.ok) errors.push(decoded.error);
+    errors.push(...taskGraphLifecycleErrors(json));
+  }
 
   // Required top-level fields — path fields must be real strings, not merely
   // truthy, or a garbage value silently disarms downstream plan-based checks
@@ -143,9 +148,9 @@ export function validateFull(
   if (!json.tasks) errors.push("Missing required field: tasks");
   if (
     json.current_wave !== undefined &&
-    (typeof json.current_wave !== "number" || !Number.isInteger(json.current_wave) || json.current_wave < 1)
+    (typeof json.current_wave !== "number" || !Number.isSafeInteger(json.current_wave) || json.current_wave < 1)
   ) {
-    errors.push(`current_wave must be an integer >= 1 when present, got ${JSON.stringify(json.current_wave)}`);
+    errors.push(`current_wave must be an integer >= 1 within the safe-integer range when present, got ${JSON.stringify(json.current_wave)}`);
   }
 
   const tasks = json.tasks;
@@ -193,7 +198,7 @@ export function validateFull(
 
     const wave = task.wave as number | undefined;
     if (wave === undefined) errors.push(`Task ${tid}: missing 'wave'`);
-    else if (!Number.isInteger(wave) || wave < 1) errors.push(`Task ${tid}: wave must be integer >= 1`);
+    else if (!Number.isSafeInteger(wave) || wave < 1) errors.push(`Task ${tid}: wave must be integer >= 1 within the safe-integer range`);
 
     const deps = task.depends_on;
     if (deps !== undefined && deps !== null && !Array.isArray(deps)) {
@@ -269,7 +274,7 @@ export function validateFull(
 
   // Check wave contiguity — waves must be consecutive (1,2,3 not 1,3,5)
   const waves = [...new Set(validTaskRecords.map((task) => task.wave as number))]
-    .filter((w): w is number => typeof w === "number" && Number.isInteger(w))
+    .filter((w): w is number => typeof w === "number" && Number.isSafeInteger(w))
     .sort((a, b) => a - b);
   for (let i = 1; i < waves.length; i++) {
     if (waves[i] !== waves[i - 1] + 1) {
@@ -283,7 +288,7 @@ export function validateFull(
     const maxWave = waves[waves.length - 1];
     const nonImplTasks = validTaskRecords.filter((task) => task.agent !== "adr-writer-agent");
     const implWaves = [...new Set(nonImplTasks.map((task) => task.wave as number))]
-      .filter((w): w is number => typeof w === "number" && Number.isInteger(w));
+      .filter((w): w is number => typeof w === "number" && Number.isSafeInteger(w));
     const maxImplWave = implWaves.length > 0 ? Math.max(...implWaves) : 0;
 
     for (const t of adrTasks) {
@@ -586,7 +591,7 @@ export interface FixReport {
  * the operator's stderr rather than only the file.
  */
 const currentWaveIsValid = (value: unknown): boolean =>
-  typeof value === "number" && Number.isInteger(value) && value >= 1;
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 1;
 
 function pushDataLoss(notes: string[], dataLoss: string[], note: string): void {
   notes.push(note);

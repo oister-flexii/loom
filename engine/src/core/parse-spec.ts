@@ -283,9 +283,9 @@ function withoutFences(markdown: string): Readonly<{ text: string; unterminated:
       // indentation is the boundary: a four-space paragraph is legitimate
       // item content and must survive into the Requirement hash.
       const indentation = leadingSpaces(line);
-      const indentedListMarker = indentation >= 4 && /^(?:[-+*]|\d+[.)]) +/u.test(line.trimStart());
+      const indentedStructuralId = indentation >= 4 && STRUCTURAL_ID.test(line);
       if (previousBlank && indentation >= 4 &&
-          (activeListContentIndent === null || indentation < activeListContentIndent || indentedListMarker)) {
+          (activeListContentIndent === null || indentation < activeListContentIndent || indentedStructuralId)) {
         out.push("");
         previousBlank = true;
         continue;
@@ -293,8 +293,9 @@ function withoutFences(markdown: string): Readonly<{ text: string; unterminated:
       const listMarker = /^ {0,3}(?:[-+*]|\d+[.)]) +/u.exec(line);
       if (listMarker !== null) {
         activeListContentIndent = listMarker[0].length;
-      } else if (line.trim() !== "" && previousBlank &&
-          (activeListContentIndent === null || indentation < activeListContentIndent)) {
+      } else if (line.trim() !== "" && activeListContentIndent !== null &&
+          indentation < activeListContentIndent &&
+          (previousBlank || startsMarkdownBlock(line.trim()))) {
         activeListContentIndent = null;
       }
       out.push(line);
@@ -379,9 +380,15 @@ function leadingSpaces(raw: string): number {
   return /^ */u.exec(raw)?.[0].length ?? 0;
 }
 
+/** Any Markdown list marker; only `- ID: content` is a canonical Spec entry. */
+function startsMarkdownListItem(line: string): boolean {
+  return /^(?:[-+*]|\d+[.)])\s+/u.test(line);
+}
+
 /** Recognized block syntax that cannot be a lazy paragraph continuation. */
 function startsMarkdownBlock(line: string): boolean {
-  return /^(?:#{1,6}\s|>|\*\*Acceptance Scenarios:\*\*$)/u.test(line) || isThematicBreak(line);
+  return /^(?:#{1,6}\s|>|\*\*Acceptance Scenarios:\*\*$)/u.test(line) ||
+    startsMarkdownListItem(line) || isThematicBreak(line);
 }
 
 /** Returns the family's entries, or `null` after recording why none exist. An
@@ -406,7 +413,17 @@ function parseEntries<F extends SpecFamily>(
       previousBlank = true;
       continue;
     }
-    if (!line.startsWith("-")) {
+    const canonicalEntry = pattern.exec(line);
+    const directlyAdjacentCanonicalEntry = !previousBlank && canonicalEntry !== null;
+    if (current !== null && leadingSpaces(raw) >= current.continuationIndent &&
+        !directlyAdjacentCanonicalEntry) {
+      // Indentation owned by the current item remains Requirement content,
+      // including nested list clauses after a blank.
+      current.content.push(line);
+      previousBlank = false;
+      continue;
+    }
+    if (!line.startsWith("-") && !startsMarkdownListItem(line)) {
       // A recognizable structural ID without a "- " bullet would otherwise
       // be silently dropped; fail closed. The JSDoc above owns the full
       // accepted prefix set.
@@ -414,17 +431,20 @@ function parseEntries<F extends SpecFamily>(
         finishCurrent();
         errors.push(Object.freeze({ kind: "entry-not-bulleted", section, line: documentLine }));
       } else if (current !== null) {
-        const indentedContinuation = leadingSpaces(raw) >= current.continuationIndent;
         const lazyContinuation = !previousBlank && !startsMarkdownBlock(line);
-        if (indentedContinuation || lazyContinuation) {
+        if (lazyContinuation) {
           // A lazy paragraph may continue directly on the next physical line.
-          // After a blank, only content indented beneath the list marker still
-          // belongs to the item; an unindented block closes the Requirement.
           current.content.push(line);
         } else {
           finishCurrent();
         }
       }
+      previousBlank = false;
+      continue;
+    }
+    if (!line.startsWith("-") && STRUCTURAL_ID.test(raw)) {
+      finishCurrent();
+      errors.push(Object.freeze({ kind: "entry-not-bulleted", section, line: documentLine }));
       previousBlank = false;
       continue;
     }
@@ -434,16 +454,15 @@ function parseEntries<F extends SpecFamily>(
       continue;
     }
     finishCurrent();
-    const matched = pattern.exec(line);
-    if (matched === null) {
+    if (canonicalEntry === null) {
       errors.push(Object.freeze({ kind: "entry-not-canonical", section, line: documentLine }));
       previousBlank = false;
       continue;
     }
     const marker = /^\s*-\s+/u.exec(raw);
     current = {
-      id: matched[1],
-      content: [matched[2]],
+      id: canonicalEntry[1],
+      content: [canonicalEntry[2]],
       continuationIndent: marker?.[0].length ?? 2,
     };
     previousBlank = false;
@@ -503,7 +522,7 @@ function acceptanceScenarioLines(lines: readonly SourceLine[], errors: SpecParse
     const strayStructuralId = STRUCTURAL_ID.test(raw) && !isCollectedBullet(raw);
     if (strayStructuralId) errors.push(strayId(documentLine));
     if (state.kind !== "inside") continue;
-    if (line.startsWith("-")) {
+    if (line.startsWith("-") && leadingSpaces(raw) < 4) {
       scenarios.push(Object.freeze({ raw, documentLine }));
       state = Object.freeze({ kind: "inside", headerLine: state.headerLine, sawBullet: true });
     } else if (state.sawBullet && !strayStructuralId) {

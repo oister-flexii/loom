@@ -42,7 +42,6 @@ export type AuthoredTaskRosterParseResult =
   | Readonly<{ ok: false; error: string }>;
 
 function taskWaveRosterError(tasks: readonly AuthoredTask[]): string | null {
-  if (tasks.length === 0) return "TaskGraph population requires at least one authored Task";
   const invalid = tasks.find(({ wave }) => !Number.isSafeInteger(wave) || wave < 1);
   if (invalid !== undefined) {
     return `Task ${invalid.id} Wave must be a positive safe integer, got ${JSON.stringify(invalid.wave)}`;
@@ -56,10 +55,10 @@ function taskWaveRosterError(tasks: readonly AuthoredTask[]): string | null {
 
 /** Parse the authored roster topology before it can become population authority. */
 export function parseAuthoredTaskRoster(tasks: readonly AuthoredTask[]): AuthoredTaskRosterParseResult {
-  const error = taskWaveRosterError(tasks);
-  if (error !== null) return Object.freeze({ ok: false, error });
   const [first, ...rest] = tasks;
   if (first === undefined) return Object.freeze({ ok: false, error: "TaskGraph population requires at least one authored Task" });
+  const error = taskWaveRosterError(tasks);
+  if (error !== null) return Object.freeze({ ok: false, error });
   return Object.freeze({
     ok: true,
     value: Object.freeze([first, ...rest]) as ValidatedAuthoredTaskRoster,

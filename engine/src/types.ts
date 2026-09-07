@@ -239,21 +239,34 @@ export interface ReviewRunSlotAuthority {
  * In-progress, packet-bound review run. Every expected reviewer must cover every
  * prior finding exactly once before any prior finding can leave the active set.
  */
-export interface ReviewRun {
-  readonly generation: number;
-  readonly packet_id: string;
-  readonly head_sha: string;
-  readonly expected_agents: readonly [string, ...string[]];
-  readonly prior_finding_ids: readonly string[];
-  readonly evidence: readonly ReviewRunEvidence[];
+type ReviewRunBase = Readonly<{
+  generation: number;
+  packet_id: string;
+  head_sha: string;
+  expected_agents: readonly [string, ...string[]];
+  prior_finding_ids: readonly string[];
+  evidence: readonly ReviewRunEvidence[];
   /** Present on engine-owned Wave runs; ordered exactly like expected_agents. */
-  readonly slot_authority?: readonly [ReviewRunSlotAuthority, ...ReviewRunSlotAuthority[]];
-  /** Exact Wave authority that issued this byte snapshot. */
-  readonly workspace_scope?: readonly string[];
-  readonly workspace_head_sha?: string;
-  readonly wave_gate_run_id?: string;
-  readonly wave_gate_authority_digest?: string;
-}
+  slot_authority?: readonly [ReviewRunSlotAuthority, ...ReviewRunSlotAuthority[]];
+}>;
+
+type ReviewRunWorkspaceAuthority =
+  | Readonly<{
+      workspace_scope?: never;
+      workspace_head_sha?: never;
+      wave_gate_run_id?: never;
+      wave_gate_authority_digest?: never;
+    }>
+  | Readonly<{
+      /** Exact Wave authority that issued this byte snapshot. */
+      workspace_scope: readonly string[];
+      workspace_head_sha: string;
+      wave_gate_run_id: string;
+      wave_gate_authority_digest: string;
+    }>;
+
+/** Workspace authority is either wholly absent on an unbound/legacy run or complete. */
+export type ReviewRun = Readonly<ReviewRunBase & ReviewRunWorkspaceAuthority>;
 
 /** Review authority retained after a roster closes. It is the immutable source
  * for completion integrity and completed-Wave reopening; graph summaries are
@@ -734,9 +747,10 @@ export type CompletedWaveGateRegistration =
       completionSuite: AcceptedWaveCompletionReceipt;
     }>;
 
-/** Immutable audit evidence for an active authority whose authoritative Run
- * Directory was proven absent before a replacement was installed. This is not
- * terminal Wave history: the replacement still owns the same active Wave. */
+/** Immutable audit of a completed Wave reopened because exact workspace
+ * bytes drifted, or because legacy completion authority could not prove those
+ * bytes. This is completed-Wave history; orphaned active-run replacement is
+ * modeled separately by `OrphanedWaveGateRetirement`. */
 export type WaveReopeningAudit = Readonly<{
   schemaVersion: 1;
   kind: "completed-wave-reopened-for-review-integrity";

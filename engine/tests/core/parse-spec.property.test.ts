@@ -129,6 +129,27 @@ describe("parseSpec properties", () => {
     ));
   });
 
+  it("hashes blank-separated nested Requirement clauses as item content", () => {
+    fc.assert(fc.property(
+      validSpecArbitrary,
+      fc.tuple(proseArbitrary, proseArbitrary)
+        .filter(([left, right]) => canonicalText(left) !== canonicalText(right)),
+      (markdown, [left, right]) => {
+        const nestFirstRequirement = (continuation: string): string => markdown.replace(
+          /(- FR-001:[^\n]*)/u,
+          `$1\n\n    - ${continuation}`,
+        );
+        const first = parseValidSpec(nestFirstRequirement(left)).frs[0];
+        const second = parseValidSpec(nestFirstRequirement(right)).frs[0];
+        expect(first.content).toContain(`- ${canonicalText(left)}`);
+        expect(second.content).toContain(`- ${canonicalText(right)}`);
+        expect(first.contentHash).toBe(specContentHash(first.content));
+        expect(second.contentHash).toBe(specContentHash(second.content));
+        expect(first.contentHash).not.toBe(second.contentHash);
+      },
+    ));
+  });
+
   it("projects each collection under its own identifier family", () => {
     // The runtime witness of the family branding: `frs`, `scenarios`, and `oos`
     // are mutually non-assignable types, and their contents match.

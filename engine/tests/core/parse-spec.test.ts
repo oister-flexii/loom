@@ -150,6 +150,61 @@ describe("parseSpec", () => {
     }
   });
 
+  it("keeps blank-separated nested FR, AS, and OOS clauses in content authority", () => {
+    const nested = validSpec
+      .replace(
+        "- FR-001: System MUST parse canonical requirement IDs",
+        "- FR-001: System MUST parse canonical requirement IDs\n\n    - including nested requirement detail",
+      )
+      .replace(
+        "- AS-001: Given a canonical spec, When it is parsed, Then structural entries are returned",
+        "- AS-001: Given a canonical spec, When it is parsed, Then structural entries are returned\n\n    - including a nested outcome",
+      )
+      .replace(
+        "- OOS-001: Symbol-level source indexing",
+        "- OOS-001: Symbol-level source indexing\n\n    1. including generated symbol databases",
+      );
+    const parsed = parseSpec(nested);
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.frs[0].content).toContain("- including nested requirement detail");
+    expect(parsed.value.scenarios[0].content).toContain("- including a nested outcome");
+    expect(parsed.value.oos[0].content).toContain("1. including generated symbol databases");
+    for (const entry of [parsed.value.frs[0], parsed.value.scenarios[0], parsed.value.oos[0]]) {
+      expect(entry.contentHash).toBe(specContentHash(entry.content));
+    }
+  });
+
+  it.each(["* adjacent item", "+ adjacent item", "1. adjacent item"])(
+    "rejects adjacent noncanonical list item %s instead of absorbing it as lazy Requirement text",
+    (item) => {
+      const parsed = parseSpec(validSpec.replace(
+        "- FR-001: System MUST parse canonical requirement IDs",
+        `- FR-001: System MUST parse canonical requirement IDs\n${item}`,
+      ));
+      expect(parsed).toMatchObject({ ok: false });
+      if (!parsed.ok) {
+        expect(parsed.errors).toContainEqual(expect.objectContaining({
+          kind: "entry-not-canonical",
+          section: "Functional Requirements",
+        }));
+      }
+    },
+  );
+
+  it("ignores indented code after a heading terminates a Requirement list item", () => {
+    const parsed = parseSpec(validSpec.replace(
+      "- FR-001: System MUST parse canonical requirement IDs",
+      "- FR-001: System MUST parse canonical requirement IDs\n### Examples\n\n    FR-999: literal code sample",
+    ));
+    expect(parsed).toMatchObject({ ok: true });
+    if (parsed.ok) {
+      expect(parsed.value.frs.map(({ id }) => id)).toEqual(["FR-001", "FR-002"]);
+      expect(parsed.value.frs[0].content).not.toContain("FR-999");
+    }
+  });
+
   it("ends FR, AS, and OOS entries before unindented blocks after a blank", () => {
     const separated = validSpec
       .replace(

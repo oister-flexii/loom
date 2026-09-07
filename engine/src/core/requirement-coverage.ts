@@ -116,7 +116,8 @@ export type SpecIndexUnavailable =
 
 /**
  * A Spec Index observation. Every bytes-backed outcome carries the digest of
- * the exact bytes parsed; digest-less variants mean no bytes were observed.
+ * the exact bytes observed; only the `indexed` arm proves they parsed.
+ * Digest-less variants mean no bytes were observed.
  * The path is caller-supplied document identity and is proved against protected
  * authority by the Wave observation consumer.
  */

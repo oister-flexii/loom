@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
@@ -742,6 +742,66 @@ describe("Pi extension review tool_result integration", () => {
     expect(warnings).toEqual([
       expect.stringContaining("Loom session_start sweep failed: stale-sessions: registry unavailable"),
     ]);
+  });
+
+  it("continues startup sweeps when both diagnostic ports throw", async () => {
+    const extensionSpecifier = "../../pi/extension.ts";
+    const module = await import(/* @vite-ignore */ extensionSpecifier) as {
+      runPiStartupSweeps: (
+        sweeps: readonly { name: string; run: () => void }[],
+        ports: { writeDiagnostic: (diagnostic: string) => void; notifyWarning: (message: string) => void },
+      ) => void;
+    };
+    const calls: string[] = [];
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      expect(() => module.runPiStartupSweeps([
+        { name: "broken", run: () => { calls.push("broken"); throw new Error("sweep exploded"); } },
+        { name: "later", run: () => { calls.push("later"); } },
+      ], {
+        writeDiagnostic: () => { throw new Error("stderr port exploded"); },
+        notifyWarning: () => { throw new Error("UI port exploded"); },
+      })).not.toThrow();
+
+      expect(calls).toEqual(["broken", "later"]);
+      const fallback = stderr.mock.calls.map(([text]) => String(text)).join("");
+      expect(fallback).toContain("sweep exploded");
+      expect(fallback).toContain("diagnostic writer failed: stderr port exploded");
+      expect(fallback).toContain("warning notifier failed: UI port exploded");
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
+  it("runs both production startup sweeps through the real session_start event", async () => {
+    const stale = join(subagentDir, "event-stale.active");
+    const grants = join(subagentDir, "pi-write-grants");
+    const malformedGrant = join(grants, "event-malformed.json");
+    mkdirSync(grants, { recursive: true });
+    writeFileSync(stale, "stale\n");
+    const old = new Date(Date.now() - 2 * 24 * 60 * 60_000);
+    utimesSync(stale, old, old);
+    writeFileSync(malformedGrant, "{not-json");
+    const notifications: Array<{ message: string; level: string }> = [];
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      const pi = await extension();
+      await pi.emit("session_start", {}, {
+        hasUI: true,
+        ui: { notify: (message: string, level: string) => notifications.push({ message, level }) },
+        sessionManager: { getSessionId: () => "019fca39-f989-7510-8e62-50dadbcad4ef" },
+      });
+
+      expect(existsSync(stale), "stale session roster was swept").toBe(false);
+      expect(existsSync(malformedGrant), "malformed grant was swept").toBe(false);
+      expect(stderr.mock.calls.map(([text]) => String(text)).join(""))
+        .toContain("removing malformed write grant");
+      expect(notifications).toEqual([]);
+    } finally {
+      stderr.mockRestore();
+      rmSync(stale, { force: true });
+      rmSync(malformedGrant, { force: true });
+    }
   });
 
   it("makes rejected child write grants an unconditional direct-edit denial", async () => {

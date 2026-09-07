@@ -1,14 +1,14 @@
-# PR #43 Remediation — Fresh review round 8
+# PR #43 Remediation — Fresh review round 9
 
 ## Authority
 
 - Branch: `feat/structural-spec-check`
-- Reviewed head: `44be0fd6da1878d034770cb1c3d0ad47c75e0490`
+- Reviewed head: `7c6e9096fb1979fb59c803ebded2f3fdceb0c6e1`
 - Pull request: https://github.com/peterstorm/loom/pull/43
-- Standalone Review Run: `.claude/reviews/review-and-fix-runs/2026-09-07-pr43-all-6`
-- Canonical result: `.claude/reviews/review-and-fix-runs/2026-09-07-pr43-all-6/result.json`
-- Result digest: `f9efb4e6f83444ffe7d6d00180e14d9135cd9aec4e8aacdb978202adb7252973`
-- Adjudication: 12 surviving critical Findings, 17 advisories, 1 refuted critical Finding.
+- Standalone Review Run: `.claude/reviews/review-and-fix-runs/2026-09-07-pr43-all-7`
+- Canonical result: `.claude/reviews/review-and-fix-runs/2026-09-07-pr43-all-7/result.json`
+- Result digest: `604a5ea68f7322cb119fea0c319f049a4659e7c84bb3e85f5e50435e7a79e887`
+- Adjudication: 6 surviving critical Findings, 21 advisories, 0 refuted critical Findings.
 
 ## Frozen review scope
 
@@ -36,6 +36,7 @@
 - `engine/src/parsers/index.ts`
 - `engine/src/state-manager.ts`
 - `engine/src/types.ts`
+- `engine/tests/core/implementation-application.test.ts`
 - `engine/tests/core/parse-spec.property.test.ts`
 - `engine/tests/core/parse-spec.test.ts`
 - `engine/tests/core/requirement-coverage.property.test.ts`
@@ -43,17 +44,23 @@
 - `engine/tests/core/round15.test.ts`
 - `engine/tests/core/spec-check-floor.test.ts`
 - `engine/tests/core/task-graph-population.test.ts`
+- `engine/tests/core/wave-completion-readiness.test.ts`
 - `engine/tests/handlers/complete-wave-gate.test.ts`
 - `engine/tests/handlers/helpers/orchestration.test.ts`
 - `engine/tests/handlers/helpers/programs/wave-gate-decision-authority.test.ts`
 - `engine/tests/handlers/helpers/store-spec-check.test.ts`
+- `engine/tests/handlers/helpers/upgrade-spec-trace.test.ts`
 - `engine/tests/handlers/helpers/wave-spec-check-scope.test.ts`
+- `engine/tests/handlers/pi-stop-toctou.test.ts`
 - `engine/tests/handlers/populate-task-graph.test.ts`
+- `engine/tests/handlers/pre-tool-use/validate-task-execution.test.ts`
 - `engine/tests/handlers/store-spec-check-findings.test.ts`
 - `engine/tests/handlers/subagent-stop/dispatch-resilience.test.ts`
+- `engine/tests/handlers/task-execution-attempt-registration.test.ts`
 - `engine/tests/handlers/validate-task-graph.test.ts`
 - `engine/tests/orchestration/spec-index-observation.test.ts`
 - `engine/tests/parsers/parse-spec.property.test.ts`
+- `engine/tests/pi-extension-review-events.test.ts`
 - `engine/tests/pi/subagent-result.test.ts`
 - `engine/tests/review-round6-core-regressions.test.ts`
 - `engine/tests/spec-check-command-contract.test.ts`
@@ -65,65 +72,65 @@
 
 ## Surviving critical Findings and mandatory fixes
 
-1. **`code-reviewer-1` — stale Wave Gate start authority.** Move `waveGateAuthorityDigest` into the Wave authority functional core. Require `StateManager.registerActiveWaveGate` to consume the published Task roster and, while holding the State File lock, re-derive both the exact current-Wave roster and digest before installing active authority. A mismatch preserves the registered Run Directory but leaves protected state byte-identical.
-2. **`code-reviewer-2` — valid four-space continuation removed.** Make fence/code-furniture stripping list-context-aware so a blank-separated, properly indented continuation remains available to the entry parser and participates in content/hash authority.
-3. **`code-reviewer-3` — unrelated block absorbed after blank.** Model entry continuation state explicitly: lazy continuation is legal only before a blank; after a blank only properly indented list-item content remains attached. Markdown block boundaries finish the entry.
-4. **`silent-failure-hunter-1` — duplicate settled identities.** Reject duplicate persisted settled Finding identities and reconcile required identities as a multiset so even forged typed inputs cannot substitute a required occurrence.
-5. **`silent-failure-hunter-2` — malformed persisted locations pass load.** Install parser-produced Finding, Refuted Finding, and Resolved Finding values during TaskGraph migration rather than retaining raw records after using normalized drafts only as predicates. Legacy omitted/object/numeric locations normalize to `null`; downstream panel code receives the exact `string | null` and positive-safe-integer-or-null shapes promised by `Task`. Add load-boundary regressions for these cases.
-6. **`pr-test-analyzer-1` — publication-failure test is source inspection only.** Replace the source-order assertion with behavior: a refused/divergent Run Directory registration leaves State File bytes unchanged.
-7. **`pr-test-analyzer-2` — no same-Wave start race test.** Simulate publication from snapshot A followed by same-Wave TaskGraph mutation B and prove locked active registration rejects without installing stale authority.
-8. **`type-design-analyzer-1` — UNKNOWN migration can create a causeless block.** At the TaskGraph parse boundary, migrate historical `UNKNOWN` evidence and reconcile its Wave block from the migrated evidence plus review Findings, preserving legitimate review blocks while clearing obsolete spec-check-only blocks.
-9. **`type-design-analyzer-2` — unrelated prose enters content/hash.** Covered by the explicit continuation grammar in fixes 2–3; add FR/AS/OOS examples and properties for blank-line termination.
-10. **`comment-analyzer-1` — State File ownership documentation is false.** Update `CONTEXT.md` to name Hooks and explicitly whitelisted StateManager-backed helpers as the mutation boundary.
-11. **`comment-analyzer-3` — DraftFinding path guarantee is overstated.** Document `file` as an unverified reviewer-supplied single-line location hint; do not falsely claim repository-relative validation.
-12. **`comment-analyzer-4` — continuation comment overstates implementation.** Replace it with the exact modeled continuation grammar implemented by fixes 2–3.
+1. **`code-reviewer-1` — nested list clauses disappear from Requirement content/hash.** Keep a blank-separated indented list marker when the current Requirement list item owns its indentation; only top-level indented code is blanked. Add FR/AS/OOS examples proving nested clauses remain canonical content and hash input.
+2. **`silent-failure-hunter-1` — a diagnostic-port exception aborts Pi startup sweeps.** Make sweep execution and each reporting port independently failure-isolated. Continue every registered sweep even when the sweep, diagnostic writer, or warning notifier throws; preserve all available causes in best-effort diagnostics without rethrowing from `session_start`.
+3. **`silent-failure-hunter-2` — unsafe review generations can stop monotonic advancement.** Require non-negative safe integers for Task review generations, Review Run generations, accepted review authority generations, Finding provenance generations, and resolution generations. Add load-boundary and core regressions at `Number.MAX_SAFE_INTEGER + 1`.
+4. **`comment-analyzer-1` — WaveReopeningAudit documentation names orphan replacement.** Rewrite the JSDoc to describe completed-Wave reopening after exact workspace drift or unverifiable legacy workspace authority; keep orphaned active-run replacement exclusively on `OrphanedWaveGateRetirement`.
+5. **`comment-analyzer-2` — withoutFences documentation contradicts nested-marker behavior.** Fixed with Finding 1: implementation and JSDoc will agree that indentation owned by an open Requirement survives, including nested list markers.
+6. **`architecture-tech-lead-1` — operator validation accepts protected authority the loader rejects.** Make state-file `validateFull` invoke the exported complete `parseTaskGraph` decoder, so every active/terminal Wave Gate, Wave review epoch, completion-suite, verification-manifest, history, and relational rule enforced by `StateManager.load` is also enforced by the operator validator. Preserve decompose-specific authored-policy checks separately. Add mutation regressions for malformed top-level protected fields.
 
 ## Advisory dispositions
 
-All 17 advisories are **accepted**: each claim is sound, in scope, and has a complete low-risk implementation.
+### Accepted — 19
 
-1. **`silent-failure-hunter-3` — accepted.** Decode Spec bytes with fatal UTF-8. Add an `invalid-encoding` unavailable variant carrying path, exact-byte digest, and cause; never hash replacement text as canonical content.
-2. **`silent-failure-hunter-4` — accepted.** Decode State File bytes with fatal UTF-8 before JSON parsing and report contextual corruption.
-3. **`silent-failure-hunter-5` — accepted.** Return expected Wave submission authority refusals as typed results from the locked transform; route genuinely unexpected exceptions through `reportUncaughtWaveGateFailure` so stacks survive.
-4. **`pr-test-analyzer-3` — accepted.** Add parser examples/properties proving blank-line and heading termination and indented continuation behavior.
-5. **`pr-test-analyzer-4` — accepted.** Replace the Pi source-substring assertion with a real `tool_result` integration scenario that omits a reserved spec-check result and observes persisted `EVIDENCE_CAPTURE_FAILED` plus Wave block reconciliation.
-6. **`pr-test-analyzer-5` — accepted.** Extract the startup sweep sequence behind injected actions/reporting and test that one failing sweep is surfaced with stack/UI diagnostics while later cleanup still executes.
-7. **`type-design-analyzer-3` — accepted.** Add a parser-produced authored-Task roster type for TaskGraph Population. The constructor proves non-empty tasks, positive safe Wave numbers, and contiguous Wave numbering before the aggregate can mint Wave Gates; keep a defensive runtime refusal for untyped JavaScript calls.
-8. **`type-design-analyzer-4` — accepted.** Add a module-private nominal constructor-origin witness to `CapturedSpecCheck`; only the spec-check smart constructors/parsers may return the exported type. Update tests to construct captured evidence through the parser.
-9. **`type-design-analyzer-5` — accepted.** Brand bytes-backed Spec Index digests as `ArtifactDigest` and construct them through one digest helper before authority comparison.
-10. **`comment-analyzer-5` — accepted.** Correct the Markdown-cell safety rationale: Task IDs satisfy `T\d+`; claim text is the unrestricted injection concern.
-11. **`comment-analyzer-6` — accepted.** Describe accidental SHA-256 collision as negligibly probable, not impossible.
-12. **`comment-analyzer-7` — accepted.** State that fast-check samples arbitrary generated cases; the typed renderer supplies exhaustiveness.
-13. **`comment-analyzer-8` — accepted.** Describe `###` accurately as a Markdown heading that is not a `##` section boundary recognized by `sections()`.
-14. **`code-simplifier-1` — accepted.** Delete historical removal narration from the current import-capability map.
-15. **`code-simplifier-2` — accepted.** Introduce one local passing-proof fixture in orchestration tests and replace the repeated construction without weakening assertions.
-16. **`code-simplifier-3` — accepted.** Let the spec-check transcript fixture accept either a count or exact Finding identities and derive the footer once.
-17. **`code-simplifier-4` — accepted.** Rename `settled` to `legacySettled` so compatibility state is explicit.
+1. **`code-reviewer-2` — accepted.** Adjacent `*`, `+`, and ordered list items are Markdown block boundaries, not lazy Requirement text. Recognize them as noncanonical entry items and fail closed in entry-only sections.
+2. **`silent-failure-hunter-3` — accepted.** Preserve legacy omitted Finding locations as `null`, but reject explicitly present location fields unless they are already parser-canonical (`string | null` and positive safe integer | null). Do not silently erase malformed explicit evidence.
+3. **`pr-test-analyzer-1` — accepted.** Add a heading-terminated Requirement followed by indented code and prove code furniture is ignored rather than diagnosed as an unbulleted Requirement.
+4. **`pr-test-analyzer-2` — accepted.** Extend load-boundary location normalization/rejection regressions across active, refuted, and resolved Finding containers.
+5. **`pr-test-analyzer-3` — accepted.** Drive the real Pi `session_start` event and assert the production startup sweep roster/wiring executes, so direct-helper tests cannot mask removed or miswired registration.
+6. **`type-design-analyzer-1` — accepted.** Reject Finding IDs whose numeric suffix cannot safely participate in ordinal minting, and guard constructors from unsafe start/end ordinals. Add huge-suffix and high-water-mark regressions.
+7. **`type-design-analyzer-2` — accepted.** Model Review Run workspace authority as a discriminated all-or-none union. The persisted parser rejects every partial combination, including `workspace_head_sha` without `workspace_scope`.
+8. **`type-design-analyzer-3` — accepted.** Require positive safe integers at every TaskGraph Wave boundary (`Task.wave`, `current_wave`, registrations, histories, and reopening audits), matching TaskGraph Population authority.
+9. **`comment-analyzer-3` — accepted.** Replace the `parseManualEvidenceSource` docblock with its real responsibility: parse and freeze only the nested optional manual-override source.
+10. **`comment-analyzer-4` — accepted.** Correct `nextOrdinal` commentary to name kept, refuted, and resolved histories.
+11. **`comment-analyzer-5` — accepted.** Rename the stale “three writers” banner to describe the review-path writers without an incorrect count.
+12. **`comment-analyzer-6` — accepted.** State that a merged claim enters exactly the one derived severity view matching its severity.
+13. **`comment-analyzer-7` — accepted.** Explain that whitespace rejection is a deliberate conservative filter for the line-regex extractor, not a JavaScript grammar claim.
+14. **`comment-analyzer-8` — accepted.** Say bytes-backed outcomes carry the digest of observed bytes; only the indexed arm proves successful parsing.
+15. **`comment-analyzer-9` — accepted.** Remove the temporary Round 3/D4 archaeology while retaining the durable one-lift/two-serialization rationale.
+16. **`code-simplifier-1` — accepted.** Narrow `defaultManifestIfMissing` to `ManifestFile` and remove the impossible catch-path null branch without changing `inspectManifestDirectory`’s meaningful null state.
+17. **`code-simplifier-2` — accepted.** Check roster emptiness once in `parseAuthoredTaskRoster`; let Wave-topology validation own only safe positive/contiguous Wave rules.
+18. **`code-simplifier-3` — accepted.** Remove redundant `bytes: null` from the `ObservedDocument` absent variant.
+19. **`code-simplifier-4` — accepted.** Reuse `specCheckAuthorityProblem` for shared locked capability checks in Wave submission, retaining packet-context authority digest, batch epoch, and current-byte checks locally.
 
-## Refuted Finding audit — do not fix
+### Deferred — 2
 
-- **`comment-analyzer-2`** — “CompletableEntry JSDoc says excluded-item completion claims are unrepresentable.” Refuted by the strict majority (`intent`, `security`). `CompletableEntry` names only valid typed completion targets; untrusted raw claim strings remain representable specifically so classification can return the fail-closed `excluded-requirement` verdict without admitting OOS into `CompletableEntry`. The reproduction lens upheld only the surface mismatch; no code or comment change will be made for this Finding.
+20. **`architecture-tech-lead-2` — deferred.** A pure aggregate decision for the entire 600-line `resumeWaveGateFacade` would redesign the per-program façade seam. ADR-0005 explicitly accepts the Wave Gate driver’s program-essential length and directs only shared computations downward; no concrete duplicated cross-program computation is identified here. Revisit only through a dedicated deepen/ADR session, not inline remediation.
+21. **`architecture-tech-lead-3` — deferred.** Consolidating Pi reservation, grant, roster, pointer, and cleanup maps into one session-runtime aggregate changes multiple asynchronous handler interfaces and lifecycle ownership. The finding identifies real locality friction but no current invariant violation; a safe change requires a dedicated design tree, migration strategy, and event-order model beyond this reviewed feature’s scope.
+
+## Refuted Finding audit
+
+None. All six critical Findings were upheld independently by reproduction, intent, and security lenses.
 
 ## Architecture and implementation order
 
-1. Parser entry-boundary model and fatal Spec decoding, with example/property regressions.
-2. Settled-floor uniqueness/multiset reconciliation, strict persisted Finding locations, UNKNOWN Wave-block migration, and nominal captured evidence.
-3. Core-owned Wave authority digest plus lock-time registration command and behavioral publication/race tests.
-4. Parsed authored-Task roster authority and population regressions.
-5. Typed Wave submission refusals and stack-preserving unexpected-failure boundary.
-6. Pi missing-result and startup-sweep behavioral integration tests.
-7. Documentation corrections and accepted test-fixture simplifications.
-8. Focused tests and typecheck; then required `distill` apply-mode with a green baseline and one move at a time.
-9. Full unit and smoke suites, scope audit, registered remediation, exact verified-index installation, commit, and normal push.
+1. Repair Markdown ownership/block-boundary parsing and add example/property regressions.
+2. Harden safe-integer invariants for review generations, Waves, and Finding ordinals; make Review Run workspace authority all-or-none.
+3. Tighten persisted Finding locations while preserving legacy omitted fields; cover active/refuted/resolved containers.
+4. Route state-file validation through `parseTaskGraph` and add protected-authority mutation tests.
+5. Isolate Pi startup sweep/reporting failures and test the real `session_start` wiring.
+6. Reuse spec-check capability authority and apply the accepted state-space/dead-branch simplifications.
+7. Correct durable documentation and comments.
+8. Run focused tests and typecheck; then perform the required `distill` apply-mode pass from a green baseline, one move at a time.
+9. Run the full unit and smoke suites, audit scope/index cleanliness, install only through registered remediation, commit the verified index, and push normally.
 
-The Wave Gate remains one aggregate. No horizontal façade-driver framework is introduced (ADR-0005). Pure authority derivation and migration decisions stay in core modules; Run Directory, State File, byte decoding, and Pi UI effects remain in thin shells (ADR-0004 and FC/IS).
+The functional core owns parsing and authority decisions. Filesystem, State File, and Pi event/UI effects remain in imperative shells. No horizontal façade-driver framework is introduced, preserving ADR-0005.
 
 ## Planned changed paths
 
-In frozen scope:
+All planned production and regression paths are already in the frozen scope:
 
 - `.claude/plans/2026-09-07-pr-remediation.md`
-- `CONTEXT.md`
 - `engine/src/core/findings.ts`
 - `engine/src/core/parse-spec.ts`
 - `engine/src/core/requirement-coverage.ts`
@@ -132,56 +139,40 @@ In frozen scope:
 - `engine/src/core/wave-review-authority.ts`
 - `engine/src/handlers/helpers/populate-task-graph.ts`
 - `engine/src/handlers/helpers/programs/wave-gate.ts`
+- `engine/src/handlers/helpers/validate-task-graph.ts`
 - `engine/src/linter/programmatic/no-cross-boundary-imports.ts`
-- `engine/src/orchestration/spec-index-observation.ts`
+- `engine/src/orchestration/wave-spec-check-documents.ts`
 - `engine/src/state-manager.ts`
 - `engine/src/types.ts`
+- `engine/tests/core/findings.test.ts` if needed; this path is outside frozen scope and must be registered as support before remediation installation.
 - `engine/tests/core/parse-spec.property.test.ts`
 - `engine/tests/core/parse-spec.test.ts`
-- `engine/tests/core/requirement-coverage.property.test.ts`
-- `engine/tests/core/requirement-coverage.test.ts`
-- `engine/tests/core/spec-check-floor.test.ts`
 - `engine/tests/core/task-graph-population.test.ts`
-- `engine/tests/handlers/complete-wave-gate.test.ts`
-- `engine/tests/handlers/helpers/orchestration.test.ts`
 - `engine/tests/handlers/helpers/programs/wave-gate-decision-authority.test.ts`
 - `engine/tests/handlers/populate-task-graph.test.ts`
-- `engine/tests/orchestration/spec-index-observation.test.ts`
-- `engine/tests/pi/subagent-result.test.ts`
+- `engine/tests/handlers/validate-task-graph.test.ts`
+- `engine/tests/handlers/validate-task-graph.property.test.ts`
+- `engine/tests/pi-extension-review-events.test.ts`
 - `engine/tests/state-manager-load-guards.test.ts`
 - `pi/extension.ts`
-- `pi/subagent-result.ts`
 
-Registered support paths outside frozen scope:
-
-- `engine/tests/pi-extension-review-events.test.ts` — real Pi extension event integration for missing reserved spec-check settlement.
-- `engine/tests/core/implementation-application.test.ts` — migrate a captured-evidence fixture through the nominal smart constructor.
-- `engine/tests/core/wave-completion-readiness.test.ts` — migrate a captured-evidence fixture through the nominal smart constructor.
-- `engine/tests/handlers/helpers/upgrade-spec-trace.test.ts` — migrate a captured-evidence fixture through the nominal smart constructor.
-- `engine/tests/handlers/pi-stop-toctou.test.ts` — migrate captured-evidence fixtures through the nominal smart constructor.
-- `engine/tests/handlers/pre-tool-use/validate-task-execution.test.ts` — migrate a captured-evidence fixture through the nominal smart constructor.
-- `engine/tests/handlers/task-execution-attempt-registration.test.ts` — migrate a captured-evidence fixture through the nominal smart constructor.
+Any additional regression path outside frozen scope must be added to the fresh remediation run’s `supportPaths`; the parent will never stage manually.
 
 ## Validation
 
-Run with `PI_CODING_AGENT`, `LOOM_PI_EXTENSION_RUNTIME_REVISION`, and `LOOM_PI_EXTENSION_RUNTIME_ROOT` unset where tests launch runtime-sensitive children.
+Run runtime-sensitive tests with `PI_CODING_AGENT`, `LOOM_PI_EXTENSION_RUNTIME_REVISION`, and `LOOM_PI_EXTENSION_RUNTIME_ROOT` unset.
 
 ```bash
 cd engine
 env -u PI_CODING_AGENT -u LOOM_PI_EXTENSION_RUNTIME_REVISION -u LOOM_PI_EXTENSION_RUNTIME_ROOT npx vitest run \
+  tests/core/findings.test.ts \
   tests/core/parse-spec.test.ts \
   tests/core/parse-spec.property.test.ts \
-  tests/core/requirement-coverage.test.ts \
-  tests/core/requirement-coverage.property.test.ts \
-  tests/core/spec-check-floor.test.ts \
   tests/core/task-graph-population.test.ts \
   tests/state-manager-load-guards.test.ts \
-  tests/handlers/complete-wave-gate.test.ts \
+  tests/handlers/validate-task-graph.test.ts \
   tests/handlers/helpers/programs/wave-gate-decision-authority.test.ts \
-  tests/handlers/helpers/orchestration.test.ts \
   tests/handlers/populate-task-graph.test.ts \
-  tests/orchestration/spec-index-observation.test.ts \
-  tests/pi/subagent-result.test.ts \
   tests/pi-extension-review-events.test.ts
 npm run typecheck
 env -u PI_CODING_AGENT -u LOOM_PI_EXTENSION_RUNTIME_REVISION -u LOOM_PI_EXTENSION_RUNTIME_ROOT npm run test:unit
@@ -190,4 +181,4 @@ cd ..
 git diff --check
 ```
 
-Validation must pass before the remediation façade is started. The parent will not manually stage files.
+Validation must pass before registered remediation starts. No manual staging or protected-state mutation is permitted.

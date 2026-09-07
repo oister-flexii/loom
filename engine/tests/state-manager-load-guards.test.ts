@@ -297,30 +297,72 @@ describe("stored Finding location authority", () => {
     line: null,
     claim: "load boundary must prove locations",
   };
+  const legacyFinding = (({ file: _file, line: _line, ...rest }) => rest)(finding);
+  const refutation = (storedFinding: unknown) => ({
+    finding: storedFinding,
+    refutations: [{ lens: "intent", reason: "not reproducible" }],
+  });
+  const resolution = (storedFinding: unknown) => ({
+    finding: storedFinding,
+    resolution: {
+      kind: "resolved_by_remediation",
+      generation: 1,
+      packet_id: PACKET,
+      head_sha: HEAD,
+      expected_agents: ["code-reviewer"],
+      assessments: [{
+        finding_id: typeof storedFinding === "object" && storedFinding !== null && "id" in storedFinding
+          ? String(storedFinding.id)
+          : finding.id,
+        verdict: "resolved_by_remediation",
+        reason: "fixed",
+        agent: "code-reviewer",
+      }],
+    },
+  });
 
-  it.each([
-    ["omitted file", (({ file: _file, ...rest }) => rest)(finding)],
-    ["numeric file", { ...finding, file: 42 }],
-    ["object line", { ...finding, line: {} }],
-    ["unsafe line", { ...finding, line: Number.MAX_SAFE_INTEGER + 1 }],
-  ])("installs parser-normalized locations for a finding with %s", (_label, malformed) => {
+  it("normalizes omitted legacy locations in every Finding-bearing container", () => {
     const parsed = parseTaskGraph(graph({
       tasks: [{
         ...validTask,
-        review_status: "blocked",
+        findings: [legacyFinding],
+        critical_findings: [finding.claim],
+        advisory_findings: [],
+        refuted_findings: [refutation({ ...legacyFinding, id: "code-reviewer-2" })],
+        resolved_findings: [resolution({ ...legacyFinding, id: "code-reviewer-3" })],
+      }],
+    }));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.tasks[0]?.findings?.[0]).toMatchObject({ file: null, line: null });
+    expect(parsed.value.tasks[0]?.refuted_findings?.[0]?.finding).toMatchObject({ file: null, line: null });
+    expect(parsed.value.tasks[0]?.resolved_findings?.[0]?.finding).toMatchObject({ file: null, line: null });
+  });
+
+  it.each([
+    ["numeric file", { ...finding, file: 42 }],
+    ["object line", { ...finding, line: {} }],
+    ["unsafe line", { ...finding, line: Number.MAX_SAFE_INTEGER + 1 }],
+    ["numeric-string line", { ...finding, line: "42" }],
+  ])("rejects an explicitly noncanonical active Finding with %s", (_label, malformed) => {
+    expect(errorOf(graph({
+      tasks: [{
+        ...validTask,
         findings: [malformed],
         critical_findings: [finding.claim],
         advisory_findings: [],
       }],
-      wave_gates: { "1": { impl_complete: false, tests_passed: null, reviews_complete: false, blocked: true } },
-    }));
-    expect(parsed.ok).toBe(true);
-    if (!parsed.ok) return;
-    expect(parsed.value.tasks[0]?.findings?.[0]).toMatchObject({
-      file: null,
-      line: null,
-      claim: finding.claim,
-    });
+    }))).toContain("not a well-formed finding");
+  });
+
+  it.each([
+    ["refuted", (malformed: unknown) => refutation(malformed)],
+    ["resolved", (malformed: unknown) => resolution(malformed)],
+  ])("rejects malformed explicit locations nested in %s findings", (container, envelope) => {
+    const field = container === "refuted" ? "refuted_findings" : "resolved_findings";
+    expect(errorOf(graph({
+      tasks: [{ ...validTask, [field]: [envelope({ ...finding, file: 42 })] }],
+    }))).toContain("not a well-formed");
   });
 });
 
@@ -912,15 +954,55 @@ const waveGateRecord = {
   blocked: false,
 } as const;
 
+describe("parseTaskGraph safe generation and Wave boundaries", () => {
+  const unsafe = Number.MAX_SAFE_INTEGER + 1;
+
+  it.each([
+    ["Task Wave", { tasks: [{ ...validTask, wave: unsafe }] }],
+    ["current Wave", { current_wave: unsafe }],
+    ["Wave review epoch", { wave_review_epoch: waveReviewEpoch({ wave: unsafe }) }],
+    ["active Wave Gate", { current_wave: unsafe, active_wave_gate: activeWaveGate({ wave: unsafe }) }],
+    ["completed Wave history", { wave_gate_history: [completedEntry({ wave: unsafe })] }],
+  ])("rejects an unsafe %s", (_label, fields) => {
+    expect(errorOf(graph(fields))).toMatch(/safe|wave_review_epoch/u);
+  });
+
+  it("rejects unsafe Task and accepted-authority review generations", () => {
+    expect(errorOf(graph({ tasks: [{ ...validTask, review_generation: unsafe }] }))).toContain("safe integer");
+    expect(errorOf(graph({ tasks: [{
+      ...validTask,
+      accepted_review_authority: {
+        generation: unsafe,
+        packet_id: PACKET,
+        head_sha: HEAD,
+        scope: ["src/x.ts"],
+      },
+    }] }))).toContain("accepted_review_authority");
+  });
+
+  it("rejects every partial Review Run workspace-authority combination", () => {
+    for (const partial of [
+      { workspace_head_sha: HEAD },
+      { wave_gate_run_id: "run.wave" },
+      { wave_gate_authority_digest: DIGEST("a") },
+      { workspace_scope: ["src/x.ts"], workspace_head_sha: HEAD },
+    ]) {
+      expect(errorOf(graph({
+        tasks: [reviewedTask({ review_run: { ...reviewedTask().review_run, ...partial } })],
+      }))).toContain("workspace");
+    }
+  });
+});
+
 describe("parseTaskGraph wave_gates load boundary", () => {
   it("accepts canonical positive integer keys (String(wave))", () => {
     expect(parseTaskGraph(graph({ wave_gates: { "1": waveGateRecord } })).ok).toBe(true);
   });
 
   it("rejects non-canonical wave_gates keys — even when the gate value is valid", () => {
-    for (const wave of ["01", "abc", "-1", "1.0", "0", "1e2"]) {
+    for (const wave of ["01", "abc", "-1", "1.0", "0", "1e2", String(Number.MAX_SAFE_INTEGER + 1)]) {
       const err = errorOf(graph({ wave_gates: { [wave]: waveGateRecord } }));
-      expect(err).toContain("wave_gates key must be a canonical positive integer wave number");
+      expect(err).toContain("wave_gates key must be a canonical positive safe-integer wave number");
     }
   });
 

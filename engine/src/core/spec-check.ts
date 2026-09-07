@@ -600,16 +600,7 @@ function parseCapturedSpecCheck(
   return { ok: true, value: freshCaptured(spec, verdict, evidenceSource) };
 }
 
-/**
- * Rebuild the parsed value instead of casting the caller's own object.
- *
- * Returning `raw` under a proven type aliases it: the caller still holds a
- * mutable reference, so a later `raw.critical_count = 99` silently invalidates
- * the count/findings-length equality proven immediately above — and the type
- * says nothing happened. `types.ts` documents this exact bug class beside
- * `CapturedSpecCheck`'s `readonly` findings. Freezing a freshly built record
- * makes the proof survive its own return, as every sibling parser here does.
- */
+/** Parse and freeze only the optional nested manual-override evidence source. */
 function parseManualEvidenceSource(raw: unknown): CapturedSpecCheck["evidence_source"] | null {
   if (raw === undefined) return undefined;
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;

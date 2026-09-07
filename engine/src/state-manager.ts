@@ -512,9 +512,9 @@ function parseWaveSpecCheckSlotAuthority(
 
 /** Parse the exact request-batch authority persisted beside an active Wave Gate. */
 function parseWaveNumber(value: unknown, label: string): { ok: true; value: number } | { ok: false; error: string } {
-  return typeof value === "number" && Number.isInteger(value) && value >= 1
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1
     ? { ok: true, value }
-    : { ok: false, error: `${label} must be an integer >= 1` };
+    : { ok: false, error: `${label} must be an integer >= 1 within the safe-integer range` };
 }
 
 function parseIntegerBound(
@@ -1033,8 +1033,8 @@ function taskShapeError(
   if (!KNOWN_AGENTS.has(t.agent)) {
     return `tasks[${index}] ("${id}"): unknown agent ${JSON.stringify(t.agent)}`;
   }
-  if (typeof t.wave !== "number" || !Number.isInteger(t.wave) || t.wave < 1) {
-    return `tasks[${index}] ("${id}"): wave must be an integer >= 1, got ${JSON.stringify(t.wave)}`;
+  if (typeof t.wave !== "number" || !Number.isSafeInteger(t.wave) || t.wave < 1) {
+    return `tasks[${index}] ("${id}"): wave must be an integer >= 1 within the safe-integer range, got ${JSON.stringify(t.wave)}`;
   }
   if (!Array.isArray(t.depends_on) || t.depends_on.some((d) => typeof d !== "string")) {
     return `tasks[${index}] ("${id}"): depends_on must be an array of strings`;
@@ -1331,7 +1331,7 @@ function taskPacketError(
         !["generation", "packet_id", "head_sha", "scope"].every((field) => fields.includes(field))) {
       return `tasks[${index}] ("${id}"): accepted_review_authority has an invalid field set`;
     }
-    if (typeof authority.generation !== "number" || !Number.isInteger(authority.generation) || authority.generation < 0 ||
+    if (typeof authority.generation !== "number" || !Number.isSafeInteger(authority.generation) || authority.generation < 0 ||
         typeof authority.packet_id !== "string" || !/^[0-9a-f]{64}$/.test(authority.packet_id) ||
         !isExactGitSha(authority.head_sha)) {
       return `tasks[${index}] ("${id}"): accepted_review_authority has invalid generation, packet_id, or head_sha`;
@@ -1438,8 +1438,8 @@ function taskStatusError(
     return `${label}: review_status ${JSON.stringify(t.review_status)} is not one of ${REVIEW_STATUSES.join(", ")}`;
   }
   if (t.review_generation !== undefined && (
-    typeof t.review_generation !== "number" || !Number.isInteger(t.review_generation) || t.review_generation < 0
-  )) return `${label}: review_generation must be a non-negative integer`;
+    typeof t.review_generation !== "number" || !Number.isSafeInteger(t.review_generation) || t.review_generation < 0
+  )) return `${label}: review_generation must be a non-negative safe integer`;
   if (t.review_run !== undefined && t.review_generation === undefined) return `${label}: review_run requires review_generation`;
   if (t.review_run !== undefined && t.review_status !== "pending" && t.review_status !== "evidence_capture_failed") {
     return `${label}: an in-progress review_run requires pending or evidence_capture_failed status`;
@@ -1716,7 +1716,7 @@ function parseWaveReopeningHistory(raw: unknown): ParseResult<readonly WaveReope
     }
     const runId = parseOrchestrationRunId(audit.runId);
     const authorityDigest = parseArtifactDigest(audit.authorityDigest);
-    if (!runId.ok || !authorityDigest.ok || typeof audit.wave !== "number" || !Number.isInteger(audit.wave) || audit.wave < 1 ||
+    if (!runId.ok || !authorityDigest.ok || typeof audit.wave !== "number" || !Number.isSafeInteger(audit.wave) || audit.wave < 1 ||
         !Array.isArray(audit.reopenedTaskIds) || audit.reopenedTaskIds.length === 0 ||
         audit.reopenedTaskIds.some((id) => taskIdError(id, `wave_reopening_history[${index}].reopenedTaskIds`) !== null) ||
         new Set(audit.reopenedTaskIds).size !== audit.reopenedTaskIds.length ||
@@ -1836,8 +1836,8 @@ function taskGraphScalarFieldError(obj: Record<string, unknown>): string | null 
     return `github_issue must be an integer >= 1 when present, got ${JSON.stringify(obj.github_issue)}`;
   }
   if (obj.current_wave !== undefined &&
-      (typeof obj.current_wave !== "number" || !Number.isInteger(obj.current_wave) || obj.current_wave < 1)) {
-    return `current_wave must be an integer >= 1 when present, got ${JSON.stringify(obj.current_wave)}`;
+      (typeof obj.current_wave !== "number" || !Number.isSafeInteger(obj.current_wave) || obj.current_wave < 1)) {
+    return `current_wave must be an integer >= 1 within the safe-integer range when present, got ${JSON.stringify(obj.current_wave)}`;
   }
   return null;
 }
@@ -2026,8 +2026,8 @@ function parseTaskGraphWaveGates(obj: Record<string, unknown>): ParseResult<Reco
     // "-1", "1.0") would load here and persist, even though every writer
     // and reader only ever uses String(wave); reject it at the boundary so
     // the record-key domain matches the type's wave-number semantics.
-    if (!/^(0|[1-9]\d*)$/.test(wave) || Number(wave) < 1) {
-      return parseErr(`wave_gates key must be a canonical positive integer wave number, got ${JSON.stringify(wave)}`);
+    if (!/^(0|[1-9]\d*)$/.test(wave) || !Number.isSafeInteger(Number(wave)) || Number(wave) < 1) {
+      return parseErr(`wave_gates key must be a canonical positive safe-integer wave number, got ${JSON.stringify(wave)}`);
     }
     const err = waveGateError(gate, wave);
     if (err !== null) return parseErr(err);

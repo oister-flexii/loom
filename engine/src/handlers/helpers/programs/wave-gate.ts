@@ -22,7 +22,7 @@ import { buildFindingBrief } from '../../../core/review-panel';
 import { applyReviewResolution, constrainReviewResolutionToScope, resolveTaskReviewFindings } from '../../../core/review-output';
 import type { ReviewRunSlotAuthority, Task, TaskGraph } from '../../../types';
 import { anyActiveSubagent } from '../../../machine';
-import { parseSpecCheckOutput, settleSpecCheck, specCheckNeedsReapplication } from '../../../core/spec-check';
+import { parseSpecCheckOutput, settleSpecCheck, specCheckAuthorityProblem, specCheckNeedsReapplication } from '../../../core/spec-check';
 import { reconcileWaveBlock } from '../../../core/wave-gate-model';
 import { resolveModelProfile, lowerModelProfile } from '../../../core/model-profiles';
 import {
@@ -811,7 +811,7 @@ export async function installWaveReviewRuns(
           slot_authority: slotAuthority,
           workspace_scope: currentWorkspace.scope,
           workspace_head_sha: taskRun.workspaceHeadSha ?? taskRun.headSha,
-          wave_gate_run_id: registration.input.wave === null ? undefined : (batch.requests[0]!.authority as AgentRequestAuthority).runId,
+          wave_gate_run_id: specCheckAuthority.runId,
           wave_gate_authority_digest: registration.authorityDigest,
         },
       };
@@ -1409,12 +1409,13 @@ export async function applyWaveFacadeSubmission(
     }
     const manager = new StateManager(TASK_GRAPH_PATH);
     if (authority.role === "spec-check-invoker") {
-      if (context.specCheckDocuments === null) {
+      const specCheckDocuments = context.specCheckDocuments;
+      if (specCheckDocuments === null) {
         return { ok: false, message: "Wave spec-check request predates byte-bound document authority" };
       }
       const currentObservation = observeWaveSpecCheckDocuments(
-        context.specCheckDocuments.spec.path,
-        context.specCheckDocuments.plan.path,
+        specCheckDocuments.spec.path,
+        specCheckDocuments.plan.path,
       );
       const currentDocuments = currentObservation.authority;
       const parsed = parseSpecCheckOutput(raw);
@@ -1422,15 +1423,15 @@ export async function applyWaveFacadeSubmission(
       const batchEpoch = context.batchEpoch;
       return manager.updateAndReturn<WaveFacadeSubmissionResult>((locked) => {
         const epoch = locked.wave_review_epoch;
-        if (locked.current_wave !== wave || locked.active_wave_gate?.runId !== authority.runId ||
-            locked.active_wave_gate.authorityDigest !== context.authorityDigest ||
-            epoch?.runId !== authority.runId || epoch.wave !== wave || epoch.batchEpoch !== batchEpoch ||
-            locked.spec_file !== context.specCheckDocuments?.spec.path ||
-            locked.plan_file !== context.specCheckDocuments?.plan.path ||
-            !waveSpecCheckDocumentsMatch(epoch.specCheckDocuments, context.specCheckDocuments) ||
-            !waveSpecCheckDocumentsMatch(currentDocuments, context.specCheckDocuments) ||
-            epoch.specCheckSlotAuthority?.slot_id !== authority.slotId ||
-            epoch.specCheckSlotAuthority.attempted !== authority.attempt) {
+        const capabilityProblem = specCheckAuthorityProblem(
+          locked,
+          authority,
+          specCheckDocuments,
+        );
+        if (capabilityProblem !== null || locked.current_wave !== wave ||
+            locked.active_wave_gate?.authorityDigest !== context.authorityDigest ||
+            epoch?.wave !== wave || epoch.batchEpoch !== batchEpoch ||
+            !waveSpecCheckDocumentsMatch(currentDocuments, specCheckDocuments)) {
           const expected = `${locked.current_wave}/${locked.active_wave_gate?.runId ?? "none"}/${locked.active_wave_gate?.authorityDigest ?? "none"}/${epoch?.runId ?? "none"}/${epoch?.wave ?? "none"}/${(epoch?.batchEpoch ?? "none").slice(0, 12)}`;
           const message = `Wave spec-check request ${authority.requestId} does not belong to the exact current review epoch (expected current_wave/runId/digest/epoch-runId/epoch-wave/epoch-batch: ${expected}; request wave ${wave}, digest ${context.authorityDigest}, runId ${authority.runId}, batch ${batchEpoch.slice(0, 12)})`;
           return { state: locked, value: { ok: false as const, message } };

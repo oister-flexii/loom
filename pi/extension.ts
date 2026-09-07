@@ -736,7 +736,7 @@ export type PiStartupSweepPorts = Readonly<{
   notifyWarning: (message: string) => void;
 }>;
 
-/** Run every startup hygiene sweep; failure never suppresses a later sweep. */
+/** Run every startup hygiene sweep; neither sweep nor reporting-port failure suppresses a later sweep. */
 export function runPiStartupSweeps(
   sweeps: readonly PiStartupSweep[],
   ports: PiStartupSweepPorts,
@@ -745,11 +745,33 @@ export function runPiStartupSweeps(
     try {
       sweep.run();
     } catch (error) {
-      const message = `session_start sweep failed: ${sweep.name}: ` +
-        `${error instanceof Error ? error.message : String(error)}; startup continues because authority is checked at consumption`;
+      const cause = error instanceof Error ? error.message : String(error);
+      const message = `session_start sweep failed: ${sweep.name}: ${cause}; ` +
+        "startup continues because authority is checked at consumption";
       const diagnostic = error instanceof Error ? (error.stack ?? error.message) : String(error);
-      ports.writeDiagnostic(`loom(pi): ${message}\n${diagnostic}\n`);
-      ports.notifyWarning(`Loom ${message}`);
+      const reportingFailures: string[] = [];
+      try {
+        ports.writeDiagnostic(`loom(pi): ${message}\n${diagnostic}\n`);
+      } catch (reportError) {
+        reportingFailures.push(
+          `diagnostic writer failed: ${reportError instanceof Error ? reportError.message : String(reportError)}`,
+        );
+      }
+      try {
+        ports.notifyWarning(`Loom ${message}${cleanupFailureSuffix(reportingFailures)}`);
+      } catch (reportError) {
+        reportingFailures.push(
+          `warning notifier failed: ${reportError instanceof Error ? reportError.message : String(reportError)}`,
+        );
+      }
+      if (reportingFailures.length > 0) {
+        try {
+          process.stderr.write(`loom(pi): ${message}${cleanupFailureSuffix(reportingFailures)}\n`);
+        } catch {
+          // Both injected reporting capabilities and the final process fallback
+          // are best-effort hygiene only; the next sweep remains mandatory.
+        }
+      }
     }
   }
 }

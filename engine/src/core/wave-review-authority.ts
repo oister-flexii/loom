@@ -483,9 +483,8 @@ export function readWaveReviewContext(
  * `waveSpecCheckScope` (packet serialization) and `coverageTasks` (projection
  * join input) differ for good reasons — description, `inCurrentWave`, and
  * `anchorHashes` diverge — but these four field expressions are the same
- * mapping written at two seams. Round 3's D4 fix had to touch both mappers,
- * which is the proof the duplication is live: a domain change to the Task→row
- * shape required two edits, and a field carried by one serialization could be
+ * mapping written at two seams. A domain change to the Task→row shape would
+ * otherwise require two edits, and a field carried by one serialization could be
  * dropped by the other. One lift makes that defect structurally impossible —
  * a new field lands here once, and both serializations derive from it.
  */

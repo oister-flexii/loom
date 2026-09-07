@@ -212,9 +212,10 @@ export const DEFAULT_BOUNDARIES: readonly BoundaryRule[] = [
  *
  * The regex is line-based, so prose describing an import still matches — a
  * diagnostic like `` `must not import from "${denied}"` `` captured
- * `${denied}` and reported the message string as a cross-boundary import. A
- * real specifier never contains a template interpolation, whitespace, or a
- * newline, so those are the tells.
+ * `${denied}` and reported the message string as a cross-boundary import.
+ * This line-regex extractor deliberately rejects whitespace and template
+ * interpolation as conservative tells; that is not a claim about every string
+ * JavaScript grammar permits as a module specifier.
  */
 function isPlausibleSpecifier(specifier: string | undefined): specifier is string {
   return specifier !== undefined &&

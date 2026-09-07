@@ -11,7 +11,6 @@ type ObservedDocument =
   | Readonly<{
       kind: "absent";
       authority: Readonly<{ path: null; contentDigest: null }>;
-      bytes: null;
     }>
   | Readonly<{
       kind: "observed";
@@ -29,7 +28,6 @@ function observeDocument(path: string | null): ObservedDocument {
     return Object.freeze({
       kind: "absent",
       authority: Object.freeze({ path: null, contentDigest: null }),
-      bytes: null,
     });
   }
   let bytes: Buffer;
