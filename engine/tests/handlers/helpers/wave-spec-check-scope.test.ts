@@ -11,9 +11,8 @@ import {
   waveSpecCheckScope,
 } from "../../../src/handlers/helpers/programs/wave-gate";
 import type { RegisteredWaveGateProgram } from "../../../src/handlers/helpers/programs/helpers";
-import type { TaskGraph } from "../../../src/types";
+import type { TaskGraph, WaveReviewEpochAuthority } from "../../../src/types";
 import { parseTaskGraph, StateManager } from "../../../src/state-manager";
-import type { AgentRequestAuthority } from "../../../src/core/orchestration-contract";
 import { taskFixture } from "../../fixtures/task-lifecycle";
 import { WAVE_REVIEW_AGENTS } from "../../../src/core/model-profiles";
 import {
@@ -22,23 +21,23 @@ import {
   type WaveRequestBatch,
 } from "../../../src/core/wave-review-authority";
 import { parseSettledFloor, type SettledFloor } from "../../../src/core/requirement-coverage";
-import type { WaveReviewEpochAuthority } from "../../../src/types";
 import { observeWaveSpecCheckDocuments } from "../../../src/orchestration/wave-spec-check-documents";
 import { projectSpecBytes } from "../../../src/orchestration/spec-index-observation";
 import {
   parseArtifactDigest,
   parseOrchestrationRunId,
   parseRequestId,
+  type AgentRequestAuthority,
   type ArtifactDigest,
   type OrchestrationRunId,
 } from "../../../src/core/orchestration-contract";
+import { buildContextPacket, encodeByteSection } from "../../../src/core/context-packets";
 
 const decodeRequestId = (raw: string) => {
   const parsed = parseRequestId(raw);
   if (!parsed.ok) throw new Error(parsed.error.message);
   return parsed.value;
 };
-import { buildContextPacket, encodeByteSection } from "../../../src/core/context-packets";
 
 const cleanup: string[] = [];
 afterEach(() => { for (const path of cleanup.splice(0)) rmSync(path, { recursive: true, force: true }); });
@@ -621,7 +620,7 @@ describe("Requirement Coverage Projection in the spec-check packet", () => {
     expect(rendered).toContain("never a pass");
   });
 
-  it("reports an altered recorded hash as corrupt authority, end to end through the packet", () => {
+  it("reports and floors an altered recorded hash end to end through the packet", () => {
     const rendered = coverageSectionOf(specFileIn(spec), [taskFixture({
       id: "T1", description: "claims FR-001", agent: "code-implementer-agent", wave: 1,
       status: "pending", depends_on: [], spec_anchors: ["FR-001"], spec_contributions: [],
@@ -630,6 +629,7 @@ describe("Requirement Coverage Projection in the spec-check packet", () => {
     })]);
     expect(rendered).toContain("have been altered");
     expect(rendered).not.toContain("no hash was recorded");
+    expect(rendered).toMatch(/CRITICAL: Task "T1" claim "FR-001" .*have been altered/u);
   });
 
   it("reports drift when the specification changed after the hashes were recorded", () => {
@@ -829,24 +829,6 @@ describe("wave-review-authority spec-check scope decoding", () => {
   });
 });
 
-describe("a non-string recorded hash is rejected at the load boundary", () => {
-  it.each([42, null, {}, []])("refuses corrupt persisted value %j", (value) => {
-    const parsed = parseTaskGraph({
-      spec_trace_version: 2, current_phase: "execute", current_wave: 1, phase_artifacts: {},
-      skipped_phases: [], spec_file: null, plan_file: null, wave_gates: {},
-      tasks: [taskFixture({
-        id: "T1", description: "claims FR-001", agent: "code-implementer-agent", wave: 1,
-        status: "pending", depends_on: [], spec_anchors: ["FR-001"], spec_contributions: [],
-        file_list: ["src/a.ts"], files_modified: ["src/a.ts"],
-        spec_anchor_hashes: { "FR-001": value } as unknown as Readonly<Record<string, string>>,
-      })],
-    });
-    expect(parsed.ok).toBe(false);
-    if (parsed.ok) return;
-    expect(parsed.error).toContain('spec_anchor_hashes["FR-001"] must be a string');
-  });
-});
-
 describe("an installed epoch is replayed only when it is the same epoch", () => {
   const DIGEST = (fill: string): ArtifactDigest => {
     const parsed = parseArtifactDigest(fill.repeat(64));
@@ -884,8 +866,17 @@ describe("an installed epoch is replayed only when it is the same epoch", () => 
     ...(floor === undefined ? {} : { settledSpecCheckFloor: floor }),
   });
   const settled = (count: number): SettledFloor => {
-    const parsed = parseSettledFloor({ kind: "settled", count });
+    const parsed = parseSettledFloor({
+      kind: "settled",
+      count,
+      criticalFindings: Array.from({ length: count }, (_, at) => `required ${at + 1}`),
+    });
     if (parsed === null) throw new Error("fixture settled floor must parse");
+    return parsed;
+  };
+  const legacySettled = (count: number): SettledFloor => {
+    const parsed = parseSettledFloor({ kind: "settled", count });
+    if (parsed === null) throw new Error("fixture legacy floor must parse");
     return parsed;
   };
   const replay = (existing: WaveReviewEpochAuthority | undefined, floor: SettledFloor) =>
@@ -905,8 +896,10 @@ describe("an installed epoch is replayed only when it is the same epoch", () => 
       .toEqual({ kind: "different" });
   });
 
-  it("classifies an epoch installed before floor recording as an explicit upgrade", () => {
+  it("classifies historical floor authority as an explicit upgrade", () => {
     expect(replay(epoch(), settled(3))).toEqual({ kind: "upgrade-floor" });
+    expect(replay(epoch(legacySettled(3)), settled(3))).toEqual({ kind: "upgrade-floor" });
+    expect(replay(epoch(legacySettled(2)), settled(3))).toEqual({ kind: "different" });
   });
 
   it("classifies an absent installed epoch as different", () => {

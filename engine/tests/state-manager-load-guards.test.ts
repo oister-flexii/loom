@@ -482,16 +482,25 @@ describe("parseTaskGraph wave_review_epoch authority", () => {
   });
 
   it.each([
-    ["settled", { kind: "settled", count: 3 }],
-    ["unprojected", { kind: "unprojected", reason: "the TaskGraph records no spec_file" }],
-  ])("round-trips and freezes a %s Requirement Coverage floor", (_label, floor) => {
+    [
+      "identity-bearing settled",
+      { kind: "settled", count: 2, criticalFindings: ["required one", "required two"] },
+      { kind: "settled", count: 2, criticalFindings: ["required one", "required two"] },
+    ],
+    ["historical count-only", { kind: "settled", count: 3 }, { kind: "legacy-settled", count: 3 }],
+    [
+      "unprojected",
+      { kind: "unprojected", reason: "the TaskGraph records no spec_file" },
+      { kind: "unprojected", reason: "the TaskGraph records no spec_file" },
+    ],
+  ])("parses and freezes a %s Requirement Coverage floor", (_label, floor, expected) => {
     const parsed = parseTaskGraph(graph({
       current_wave: 1,
       wave_review_epoch: waveReviewEpoch({ settledSpecCheckFloor: floor }),
     }));
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;
-    expect(parsed.value.wave_review_epoch?.settledSpecCheckFloor).toEqual(floor);
+    expect(parsed.value.wave_review_epoch?.settledSpecCheckFloor).toEqual(expected);
     expect(isDeeplyFrozen(parsed.value.wave_review_epoch?.settledSpecCheckFloor)).toBe(true);
   });
 
@@ -535,6 +544,13 @@ describe("parseTaskGraph wave_review_epoch authority", () => {
     ["settled floor with no count", waveReviewEpoch({ settledSpecCheckFloor: { kind: "settled" } })],
     ["negative settled floor", waveReviewEpoch({ settledSpecCheckFloor: { kind: "settled", count: -1 } })],
     ["non-integer settled floor", waveReviewEpoch({ settledSpecCheckFloor: { kind: "settled", count: 1.5 } })],
+    ["unsafe settled floor", waveReviewEpoch({ settledSpecCheckFloor: { kind: "settled", count: 1e100 } })],
+    ["settled identity/count mismatch", waveReviewEpoch({
+      settledSpecCheckFloor: { kind: "settled", count: 2, criticalFindings: ["only one"] },
+    })],
+    ["blank settled identity", waveReviewEpoch({
+      settledSpecCheckFloor: { kind: "settled", count: 1, criticalFindings: ["  "] },
+    })],
     ["unprojected floor with no reason", waveReviewEpoch({ settledSpecCheckFloor: { kind: "unprojected" } })],
     ["unprojected floor with a blank reason", waveReviewEpoch({ settledSpecCheckFloor: { kind: "unprojected", reason: "  " } })],
   ])("refuses %s", (_label, epoch) => {
@@ -731,6 +747,51 @@ describe("parseTaskGraph protected completion authority", () => {
         active_wave_completion_suite,
       })).ok).toBe(false);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// persisted spec-check evidence
+// ---------------------------------------------------------------------------
+
+describe("parseTaskGraph spec_check count and provenance authority", () => {
+  const captured = (overrides: Record<string, unknown> = {}) => ({
+    wave: 1,
+    run_at: "now",
+    verdict: "PASSED",
+    critical_count: 0,
+    high_count: 0,
+    critical_findings: [],
+    high_findings: [],
+    medium_findings: [],
+    ...overrides,
+  });
+
+  it.each([1e100, Number.MAX_SAFE_INTEGER + 1])("refuses unsafe captured count %s", (count) => {
+    expect(errorOf(graph({ spec_check: captured({ critical_count: count }) }))).toContain("safe integer");
+  });
+
+  it("round-trips a non-empty manual override source", () => {
+    const source = { kind: "manual-override", reason: "operator accepted false-positive" };
+    const parsed = parseTaskGraph(graph({ spec_check: captured({ evidence_source: source }) }));
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) expect(parsed.value.spec_check).toMatchObject({ evidence_source: source });
+  });
+
+  it.each([
+    { kind: "manual-override", reason: "  " },
+    { kind: "registered", reason: "invented" },
+    { kind: "manual-override", reason: "valid", surplus: true },
+  ])("refuses malformed evidence source %j", (evidence_source) => {
+    expect(errorOf(graph({ spec_check: captured({ evidence_source }) }))).toContain("evidence_source");
+  });
+
+  it.each([
+    ["PASSED", 1, ["critical"]],
+    ["BLOCKED", 0, []],
+  ])("refuses contradictory %s/count evidence", (verdict, critical_count, critical_findings) => {
+    expect(errorOf(graph({ spec_check: captured({ verdict, critical_count, critical_findings }) })))
+      .toContain("spec_check.verdict");
   });
 });
 

@@ -18,6 +18,7 @@ import {
   applyCurrentSpecCheckCaptureRejection,
   handleWaveReviewContext,
   publishWaveAdvisoryDecisionRequest,
+  reportUncaughtWaveGateFailure,
   specCheckSlotBelongsToWaveEpoch,
   waveAdvisoryDecisionRequestId,
   waveGateDecisionMismatch,
@@ -106,6 +107,23 @@ const registration = (
 });
 
 const pendingDecisionId = (): string => waveAdvisoryDecisionRequestId(RUN_ID, TASKS);
+
+describe("Wave Gate internal-failure boundary", () => {
+  it("retains stack context and classifies the blocked diagnostic as internal", () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const error = new Error("injected reducer defect");
+    try {
+      expect(reportUncaughtWaveGateFailure(RUN_ID, error))
+        .toBe("internal Wave Gate failure: injected reducer defect");
+      const diagnostic = stderr.mock.calls.map(([text]) => String(text)).join("");
+      expect(diagnostic).toContain(`uncaught internal Wave Gate failure in ${RUN_ID}`);
+      expect(diagnostic).toContain("Error: injected reducer defect");
+      expect(diagnostic).toContain("wave-gate-decision-authority.test.ts");
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+});
 
 describe("Wave review registration authority", () => {
   it("requires an exact concrete Wave", () => {
@@ -259,14 +277,6 @@ describe("wave review context authority", () => {
         specCheckSlotAuthority: { slot_id: slotId, attempted: 2 },
       } as TaskGraph["wave_review_epoch"],
     });
-    const attemptOneFailure = {
-      wave: 1,
-      run_at: "2026-08-28T00:00:01.000Z",
-      verdict: "EVIDENCE_CAPTURE_FAILED" as const,
-      error: "attempt 1 capture rejected",
-      cause: "transcript" as const,
-    };
-
     const transition = applyCurrentSpecCheckCaptureRejection(
       lockedAfterAttemptTwo,
       { runId: RUN_ID, slotId, attempt: 1 },
@@ -276,7 +286,8 @@ describe("wave review context authority", () => {
         authorityDigest: DIGEST as ArtifactDigest,
         specCheckDocuments: DOCUMENTS,
       },
-      attemptOneFailure,
+      "attempt 1 capture rejected",
+      "2026-08-28T00:00:01.000Z",
     );
 
     expect(transition.applied).toBe(false);
@@ -326,7 +337,8 @@ describe("wave review context authority", () => {
         authorityDigest: DIGEST as ArtifactDigest,
         specCheckDocuments: DOCUMENTS,
       },
-      failure,
+      failure.error,
+      failure.run_at,
     );
 
     expect(transition.applied).toBe(true);

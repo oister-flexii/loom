@@ -1146,7 +1146,7 @@ describe("applySpecCheckPiResult", () => {
     expect(store.current().wave_gates["1"]?.blocked).toBe(false);
   });
 
-  it("uses locked current_wave when the transcript omits its Wave despite a stale load", async () => {
+  it("files a missing-Wave transcript refusal under locked authority despite a stale load", async () => {
     const stale = graphWithSpecCheckAuthority(1).state;
     const currentFixture = graphWithSpecCheckAuthority(3);
     let current = currentFixture.state;
@@ -1170,8 +1170,13 @@ describe("applySpecCheckPiResult", () => {
     });
 
     expect(loadCount).toBe(1);
-    expect(store.current().spec_check).toMatchObject({ wave: 3, verdict: "BLOCKED" });
-    expect(store.current().wave_gates["3"]).toMatchObject({ blocked: true });
+    expect(store.current().spec_check).toMatchObject({
+      wave: 3,
+      verdict: "EVIDENCE_CAPTURE_FAILED",
+      cause: "transcript",
+      error: expect.stringContaining("SPEC_CHECK_WAVE marker not found"),
+    });
+    expect(store.current().wave_gates["3"]).toMatchObject({ blocked: false });
     expect(store.current().wave_gates["1"]).toBeUndefined();
   });
 

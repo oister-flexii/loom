@@ -31,7 +31,7 @@ import {
 } from "../engine/src/core/review-output";
 import {
   parseSpecCheckOutput,
-  reconcileSpecCheck,
+  settleSpecCheck,
   type ParsedSpecCheckOutput,
 } from "../engine/src/core/spec-check";
 import {
@@ -39,7 +39,6 @@ import {
   waveSpecCheckDocumentsMatch,
 } from "../engine/src/core/wave-review-authority";
 import { observeWaveSpecCheckDocuments } from "../engine/src/orchestration/wave-spec-check-documents";
-import { reconcileWaveBlock } from "../engine/src/core/wave-gate-model";
 import {
   parseSpecArtifactDirectory,
   phaseArtifactUpdates,
@@ -1705,22 +1704,7 @@ export function piSpecCheckAuthorityProblem(
   return decision.kind === "accepted" ? null : decision.problem;
 }
 
-function commitPiSpecCheck(
-  state: TaskGraph,
-  specCheck: NonNullable<TaskGraph["spec_check"]>,
-  value: PiResultOutcome,
-): Readonly<{ state: TaskGraph; value: PiResultOutcome }> {
-  return {
-    state: {
-      ...state,
-      spec_check: specCheck,
-      wave_gates: reconcileWaveBlock(state.wave_gates, state.tasks, specCheck, specCheck.wave),
-    },
-    value,
-  };
-}
-
-/** Pure spec-check command under exact locked Wave slot authority. */
+/** Pure spec-check authority adapter around the shared aggregate command. */
 function reducePiSpecCheckResult(
   state: TaskGraph,
   authority: PiSpecCheckAttemptAuthority | null | undefined,
@@ -1734,33 +1718,19 @@ function reducePiSpecCheckResult(
     return { state, value: outcome([`loom(pi): ${diagnostic}`], [diagnostic]) };
   }
   const wave = authorityDecision.authority.wave;
-  if (observation.kind === "capture-failed") {
-    const specCheck = {
-      wave,
-      run_at: now,
-      verdict: "EVIDENCE_CAPTURE_FAILED" as const,
-      error: observation.error,
-      cause: "transcript" as const,
-    };
-    return commitPiSpecCheck(
-      state,
-      specCheck,
-      outcome([`loom(pi): ${observation.error} — marking spec-check evidence_capture_failed`]),
-    );
-  }
-
-  // Every transport enforces the epoch-recorded floor through the same
-  // `reconcileSpecCheck`; none re-projects mutable graph inputs at capture.
-  const resolution = reconcileSpecCheck(observation.findings, wave, now,
-    epochSettledFloor(state.wave_review_epoch));
-  if (resolution.kind === "evidence-failed") {
-    return commitPiSpecCheck(
-      state,
-      resolution.specCheck,
-      outcome([`loom(pi): ${resolution.specCheck.error} — marking spec-check evidence_capture_failed`]),
-    );
-  }
-  return commitPiSpecCheck(state, resolution.specCheck, outcome());
+  const settlement = observation.kind === "capture-failed"
+    ? settleSpecCheck(state, { kind: "capture-failure", wave, runAt: now, error: observation.error })
+    : settleSpecCheck(state, {
+        kind: "registered-transcript",
+        parsed: observation.findings,
+        wave,
+        runAt: now,
+        floor: epochSettledFloor(state.wave_review_epoch),
+      });
+  const value = settlement.specCheck.verdict === "EVIDENCE_CAPTURE_FAILED"
+    ? outcome([`loom(pi): ${settlement.specCheck.error} — marking spec-check evidence_capture_failed`])
+    : outcome();
+  return { state: settlement.state, value };
 }
 
 /**

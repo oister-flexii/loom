@@ -35,6 +35,12 @@ const ENGINE = fileURLToPath(new URL("../../../", import.meta.url));
 const PACKAGE_ROOT = fileURLToPath(new URL("../../../../", import.meta.url));
 const CURRENT_RUNTIME = captureLoomRuntimeIdentity(PACKAGE_ROOT);
 const CLI = join(ENGINE, "src", "cli.ts");
+const PASSING_SPEC_CHECK_FOOTER = [
+  "SPEC_CHECK_WAVE: 1",
+  "SPEC_CHECK_CRITICAL_COUNT: 0",
+  "SPEC_CHECK_HIGH_COUNT: 0",
+  "SPEC_CHECK_VERDICT: PASSED",
+].join("\n");
 const cleanup: string[] = [];
 
 afterEach(async () => {
@@ -1312,7 +1318,7 @@ describe("orchestration CLI", () => {
     const staleSubmission = runCli([
       "submit", "--runs-root", runsRoot, "--run", runDir,
       "--request", staleSpec.requestId, "--slot", staleSpec.slotId, "--attempt", "1",
-    ], "SPEC_CHECK_WAVE: 1\nSPEC_CHECK_CRITICAL_COUNT: 0\nSPEC_CHECK_HIGH_COUNT: 0\nSPEC_CHECK_VERDICT: PASSED", root);
+    ], PASSING_SPEC_CHECK_FOOTER, root);
     expect(staleSubmission.status).not.toBe(0);
     expect(staleSubmission.stderr).toContain("does not belong to the exact current review epoch");
     expect((JSON.parse(readFileSync(statePath, "utf8")) as { spec_check?: unknown }).spec_check).toBeUndefined();
@@ -1532,7 +1538,7 @@ describe("orchestration CLI", () => {
     const afterSpec = runCli([
       "submit", "--runs-root", runsRoot, "--run", runDir,
       "--request", specAuthority.requestId, "--slot", specAuthority.slotId, "--attempt", "2",
-    ], "SPEC_CHECK_WAVE: 1\nSPEC_CHECK_CRITICAL_COUNT: 0\nSPEC_CHECK_HIGH_COUNT: 0\nSPEC_CHECK_VERDICT: PASSED", root);
+    ], PASSING_SPEC_CHECK_FOOTER, root);
     expect(afterSpec.status, afterSpec.stderr).toBe(0);
     const freshPanel = JSON.parse(afterSpec.stdout) as { kind: string; requests: readonly { authority: AgentRequestAuthority }[] };
     expect(freshPanel.kind, afterSpec.stdout).toBe("spawn-batch");
@@ -1649,8 +1655,6 @@ describe("orchestration CLI", () => {
       "HIGH: a spec gap claim that breaks count reconciliation",
       "SPEC_CHECK_VERDICT: BLOCKED",
     ].join("\n");
-    const specPassOutput = "SPEC_CHECK_WAVE: 1\nSPEC_CHECK_CRITICAL_COUNT: 0\nSPEC_CHECK_HIGH_COUNT: 0\nSPEC_CHECK_VERDICT: PASSED";
-
     // --- epoch 1: every attempt-1 transcript is captured but unusable, so the
     // gate issues attempt-2 retries for the reviewers. Applying those captured
     // retries closes the packets, and the recursion that follows derives the
@@ -1752,7 +1756,7 @@ describe("orchestration CLI", () => {
     const afterSpec = runCli([
       "submit", "--runs-root", runsRoot, "--run", runDir,
       "--request", retryAuthority.requestId, "--slot", retryAuthority.slotId, "--attempt", "2",
-    ], specPassOutput, root);
+    ], PASSING_SPEC_CHECK_FOOTER, root);
     expect(afterSpec.status, afterSpec.stderr).toBe(0);
     expect(afterSpec.stdout).not.toContain("could not be reconciled");
     const finalAction = JSON.parse(afterSpec.stdout) as { kind: string };
@@ -1876,16 +1880,26 @@ describe("orchestration CLI", () => {
     // The epoch records the floor the packet rendered: FR-404 is an unknown
     // Requirement, and FR-001 and AS-001 go unclaimed. Three settled rows.
     const epochFloor = (JSON.parse(readFileSync(statePath, "utf8")) as {
-      wave_review_epoch?: { settledSpecCheckFloor?: { kind: string; count?: number } };
+      wave_review_epoch?: {
+        settledSpecCheckFloor?: { kind: string; count?: number; criticalFindings?: readonly string[] };
+      };
     }).wave_review_epoch?.settledSpecCheckFloor;
-    expect(epochFloor).toEqual({ kind: "settled", count: 3 });
+    expect(epochFloor).toMatchObject({
+      kind: "settled",
+      count: 3,
+      criticalFindings: expect.arrayContaining([
+        expect.stringContaining('claim "FR-404"'),
+        "FR-001 has no planned completion owner",
+        "AS-001 has no planned completion owner",
+      ]),
+    });
 
     const opened = openRunDirectory(runsRoot, runDir);
     if (!opened.ok) throw new Error(opened.error.message);
     const specCheck = initial.requests
       .find(({ authority }) => authority.role === "spec-check-invoker" && authority.attempt === 1)!.authority;
     expect((await opened.value.captureTranscript(specCheck, [...Buffer.from(
-      "SPEC_CHECK_WAVE: 1\nSPEC_CHECK_CRITICAL_COUNT: 0\nSPEC_CHECK_HIGH_COUNT: 0\nSPEC_CHECK_VERDICT: PASSED")])).ok).toBe(true);
+      PASSING_SPEC_CHECK_FOOTER)])).ok).toBe(true);
 
     const firstResume = runCli(["resume", "--runs-root", runsRoot, "--run", runDir], "", root);
     expect(firstResume.status, firstResume.stderr).toBe(0);
@@ -1948,7 +1962,7 @@ describe("orchestration CLI", () => {
     });
     for (const { authority } of initial.requests.filter(({ authority }) => authority.requestId !== rejected.requestId)) {
       const task = authority.role === "spec-check-invoker"
-        ? "SPEC_CHECK_WAVE: 1\nSPEC_CHECK_CRITICAL_COUNT: 0\nSPEC_CHECK_HIGH_COUNT: 0\nSPEC_CHECK_VERDICT: PASSED"
+        ? PASSING_SPEC_CHECK_FOOTER
         : (() => {
             const graph = JSON.parse(readFileSync(statePath, "utf8")) as { tasks: readonly { review_run?: { generation: number; packet_id: string } }[] };
             const run = graph.tasks[0]!.review_run!;

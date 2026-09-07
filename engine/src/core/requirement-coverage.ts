@@ -323,94 +323,125 @@ export function claimSeverity(verdict: ClaimVerdict): ClaimSeverity {
 declare const SETTLED_CRITICAL_COUNT: unique symbol;
 export type SettledCriticalCount = number & { readonly [SETTLED_CRITICAL_COUNT]: true };
 
+declare const SETTLED_CRITICAL_FINDING: unique symbol;
+export type SettledCriticalFinding = string & { readonly [SETTLED_CRITICAL_FINDING]: true };
+
+const settledFinding = (finding: string): SettledCriticalFinding => finding as SettledCriticalFinding;
+const footerIdentity = (value: string): string => JSON.stringify(value).replace(/\|/gu, "\\u007c");
+
 /**
- * The exact number of CRITICAL findings the projection settles, and therefore
- * the floor the spec-check Agent's own report may not go under.
- *
- * Counts what the command instructs the Agent to emit: every CRITICAL row, plus
- * every Requirement and Acceptance Scenario nobody claims. Derived here so the
- * engine and the Agent are counting the same thing.
+ * The exact engine-derived CRITICAL lines the Agent must preserve in its
+ * footer. Identity, not cardinality alone, binds captured evidence to the
+ * structural defects rendered into its immutable packet.
  */
+export function settledCriticalFindings(
+  coverage: RequirementCoverage,
+): readonly SettledCriticalFinding[] {
+  if (coverage.kind === "unavailable") return Object.freeze([]);
+  const rowFindings = coverage.rows
+    .filter(({ verdict }) => claimSeverity(verdict) === "CRITICAL")
+    .map((row) => settledFinding(
+      `Task ${footerIdentity(row.taskId)} claim ${footerIdentity(row.claim)} — ${claimVerdictMessage(row.verdict)}`,
+    ));
+  const syntheticFinding = coverage.rows.length === 0 && !coverage.tracesByContribution
+    ? [settledFinding("Current Wave has no Requirement Completion Claims or valid Requirement Contributions")]
+    : [];
+  const unclaimedRequirements = coverage.unclaimed.map((id) =>
+    settledFinding(`${id} has no planned completion owner`));
+  const unclaimedScenarios = coverage.unclaimedScenarios.map((id) =>
+    settledFinding(`${id} has no planned completion owner`));
+  return Object.freeze([
+    ...rowFindings,
+    ...syntheticFinding,
+    ...unclaimedRequirements,
+    ...unclaimedScenarios,
+  ]);
+}
+
+/** The number and identities are derived from one projection expression. */
 export function settledCriticalCount(coverage: RequirementCoverage): SettledCriticalCount {
-  if (coverage.kind === "unavailable") return 0 as SettledCriticalCount;
-  // By DECIDER, not by severity. Severity says how bad a structural fact is;
-  // the decider says who owes the verdict. Counting by severity swept in
-  // `agent`-decided rows — an altered recorded hash grades CRITICAL, yet the
-  // command tells the Agent to assess it and emit PASS or FAIL — so the floor
-  // demanded a marker line no instruction produces and no compliant transcript
-  // could clear it. The floor may contain only what the command instructs the
-  // Agent to emit as a `CRITICAL:` line.
-  const engineCriticals = coverage.rows.filter((row) =>
-    claimDecider(row.verdict) === "engine" && claimSeverity(row.verdict) === "CRITICAL").length;
-  // A Wave that traces nowhere at all renders one synthetic CRITICAL and the
-  // floor covers it. A Wave that traces only through Requirement Contributions
-  // is a legitimate shape in this domain — it renders as such and must NOT be
-  // floored, or the Agent would have to substantiate a finding that is false.
-  const syntheticCritical = coverage.rows.length === 0 && !coverage.tracesByContribution ? 1 : 0;
-  return (engineCriticals + syntheticCritical + coverage.unclaimed.length +
-    coverage.unclaimedScenarios.length) as SettledCriticalCount;
+  return settledCriticalFindings(coverage).length as SettledCriticalCount;
 }
 
 /**
  * The settled floor as it travels to a settlement path.
  *
- * A closed ADT rather than `number | null`, and non-optional wherever it is
- * consumed, for one reason: an unfloored settlement must be unrepresentable.
- * The nullable default it replaces meant a caller that never passed an argument
- * settled unenforced — which is exactly how a fourth settlement path shipped
- * silently while a hand-maintained list of three claimed totality. A list is
- * not a closure; a required parameter is.
- *
- * `unprojected` is a real, honest state — no spec file, a specification that no
- * longer parses, or a capture the Agent received no packet for — and it carries
- * WHY, so the absence is stated rather than inferred from a missing argument.
+ * Current floors carry the exact engine-derived CRITICAL lines rendered into
+ * the Agent packet. `legacy-settled` is a parsed compatibility state for an
+ * epoch written before identities were persisted; it remains count-enforced
+ * for its original packet and upgrades on the next byte-identical install.
  */
 export type SettledFloor =
-  | Readonly<{ kind: "settled"; count: SettledCriticalCount }>
+  | Readonly<{
+      kind: "settled";
+      count: SettledCriticalCount;
+      criticalFindings: readonly SettledCriticalFinding[];
+    }>
+  | Readonly<{ kind: "legacy-settled"; count: SettledCriticalCount }>
   | Readonly<{ kind: "unprojected"; reason: string }>;
 
-/**
- * Settlement authority accepted only from the separately authorized manual
- * helper. It is deliberately not a `SettledFloor`, so it cannot be persisted on
- * a Wave epoch and then used to bypass registered projection enforcement.
- */
-export type ManualOverrideFloor = Readonly<{ kind: "manual-override"; reason: string }>;
+declare const MANUAL_OVERRIDE_FLOOR: unique symbol;
+/** Parser-minted authority from the separately authorized manual helper. */
+export type ManualOverrideFloor = Readonly<{
+  kind: "manual-override";
+  reason: string;
+  readonly [MANUAL_OVERRIDE_FLOOR]: true;
+}>;
 export type SpecCheckFloorAuthority = SettledFloor | ManualOverrideFloor;
 
-/** The only mint for a settled floor: a coverage projection decides it. */
+/** The only mint for a current settled floor: a coverage projection decides it. */
 export function settledFloorOf(coverage: RequirementCoverage): SettledFloor {
-  return coverage.kind === "projected"
-    ? Object.freeze({ kind: "settled", count: settledCriticalCount(coverage) })
-    : Object.freeze({ kind: "unprojected", reason: specIndexUnavailableMessage(coverage.reason) });
+  if (coverage.kind === "unavailable") {
+    return unprojectedFloor(specIndexUnavailableMessage(coverage.reason));
+  }
+  const criticalFindings = settledCriticalFindings(coverage);
+  return Object.freeze({
+    kind: "settled",
+    count: criticalFindings.length as SettledCriticalCount,
+    criticalFindings,
+  });
 }
 
-/**
- * The stated absence of projection authority for a registered or legacy
- * capture. `reconcileSpecCheck` fails this arm closed and persists the reason;
- * only `manualOverrideFloor` can authorize settlement without a numeric floor.
- */
+/** A stated absence of projection authority; blank absence reasons are illegal. */
 export function unprojectedFloor(reason: string): SettledFloor {
+  if (reason.trim() === "") throw new Error("unprojected floor requires a non-empty reason");
   return Object.freeze({ kind: "unprojected", reason });
 }
 
 /** Mint authority for the already-approved manual helper path only. */
 export function manualOverrideFloor(reason: string): ManualOverrideFloor {
   if (reason.trim() === "") throw new Error("manual override floor requires a non-empty reason");
-  return Object.freeze({ kind: "manual-override", reason });
+  return Object.freeze({ kind: "manual-override", reason }) as ManualOverrideFloor;
 }
 
-/**
- * Parse a persisted settled floor back into its ADT. `null` for anything else.
- *
- * Keyed by variant rather than written as an if-chain: the `Record` is typed
- * over `SettledFloor["kind"]`, so adding a third variant fails to compile here
- * instead of silently parsing as `null` and unfloring every restored epoch.
- */
+const safeCount = (raw: unknown): SettledCriticalCount | null =>
+  typeof raw === "number" && Number.isSafeInteger(raw) && raw >= 0
+    ? raw as SettledCriticalCount
+    : null;
+
+const parseSettledCriticalFindings = (raw: unknown): readonly SettledCriticalFinding[] | null =>
+  Array.isArray(raw) && raw.every((finding) => typeof finding === "string" && finding.trim() !== "")
+    ? Object.freeze(raw.map((finding) => settledFinding(finding)))
+    : null;
+
+/** Parse persisted current and historical settled-floor authority. */
 const FLOOR_VARIANTS: Readonly<Record<SettledFloor["kind"], (record: Record<string, unknown>) => SettledFloor | null>> =
   Object.freeze({
-    settled: (record) => typeof record.count === "number" && Number.isInteger(record.count) && record.count >= 0
-      ? Object.freeze({ kind: "settled" as const, count: record.count as SettledCriticalCount })
-      : null,
+    settled: (record) => {
+      const count = safeCount(record.count);
+      if (count === null) return null;
+      if (record.criticalFindings === undefined) {
+        return Object.freeze({ kind: "legacy-settled" as const, count });
+      }
+      const criticalFindings = parseSettledCriticalFindings(record.criticalFindings);
+      return criticalFindings !== null && criticalFindings.length === count
+        ? Object.freeze({ kind: "settled" as const, count, criticalFindings })
+        : null;
+    },
+    "legacy-settled": (record) => {
+      const count = safeCount(record.count);
+      return count === null ? null : Object.freeze({ kind: "legacy-settled" as const, count });
+    },
     unprojected: (record) => typeof record.reason === "string" && record.reason.trim() !== ""
       ? Object.freeze({ kind: "unprojected" as const, reason: record.reason })
       : null,
@@ -533,6 +564,7 @@ function renderUnclaimed(heading: string, family: string, ids: readonly string[]
  */
 export function renderRequirementCoverage(coverage: RequirementCoverage): string {
   if (coverage.kind === "unavailable") return renderUnavailable(coverage.reason).join("\n");
+  const criticalFindings = settledCriticalFindings(coverage);
   return [
     "## Requirement Coverage Projection",
     "",
@@ -547,6 +579,15 @@ export function renderRequirementCoverage(coverage: RequirementCoverage): string
     "",
     ...renderUnclaimed("Functional Requirements", "Functional Requirement", coverage.unclaimed),
     ...renderUnclaimed("Acceptance Scenarios", "Acceptance Scenario", coverage.unclaimedScenarios),
+    "### Required settled CRITICAL footer lines",
+    "",
+    "Copy every line below verbatim into the machine-readable footer. These structural findings remain",
+    "CRITICAL even when an agent-decided row's implementation assessment passes.",
+    "",
+    ...(criticalFindings.length === 0
+      ? ["No settled CRITICAL footer lines."]
+      : criticalFindings.map((finding) => `CRITICAL: ${finding}`)),
+    "",
     "### Out of Scope (typed exclusion list)",
     "",
     ...coverage.exclusions.map(({ id, content }) => `- ${id}: ${content}`),
@@ -555,7 +596,7 @@ export function renderRequirementCoverage(coverage: RequirementCoverage): string
     "",
     ...coverage.glossary.map(({ term, definition }) => `- ${term}: ${definition}`),
     "",
-    `Settled CRITICAL findings: ${settledCriticalCount(coverage)}. Your report may not fall below this count.`,
+    `Settled CRITICAL findings: ${criticalFindings.length}. Your report may not fall below this count.`,
   ].join("\n");
 }
 

@@ -417,8 +417,9 @@ interface TaskCommonMetadataBase {
    * authored: decompose describes WHICH Requirements a Task completes, and the
    * specification's own bytes decide what those Requirements SAID at that
    * moment. Absent on graphs decomposed before this field existed and on graphs
-   * whose spec file does not project into a Spec Index — in both cases drift is
-   * reported as unverifiable, never as stable.
+   * whose spec file did not project during population. A later successful gate
+   * projection reports that absence as unverifiable drift; if projection still
+   * cannot be established, settlement refuses with `projection-unavailable`.
    */
   readonly spec_anchor_hashes?: Readonly<Record<string, string>>;
   /** Explicit independent regression/new-test policy. New graphs carry this;
@@ -624,7 +625,17 @@ interface SpecCheckBase {
   readonly run_at: string;
 }
 
-/** Captured evidence is complete: count/view lockstep is established at construction. */
+export type ManualSpecCheckEvidenceSource = Readonly<{
+  kind: "manual-override";
+  reason: string;
+}>;
+
+/**
+ * Captured evidence is complete: count/view lockstep is established at
+ * construction. Registered and historical captures need no duplicate source
+ * field because their Wave epoch is the authority; a manual bypass always
+ * carries its attributable reason in the evidence itself.
+ */
 export type CapturedSpecCheck = Readonly<SpecCheckBase & {
   verdict: Exclude<SpecCheckVerdict, "EVIDENCE_CAPTURE_FAILED">;
   critical_count: number;
@@ -636,7 +647,10 @@ export type CapturedSpecCheck = Readonly<SpecCheckBase & {
   high_findings: readonly string[];
   medium_findings: readonly string[];
   error?: never;
-}>;
+} & (
+  | Readonly<{ evidence_source?: never }>
+  | Readonly<{ evidence_source: ManualSpecCheckEvidenceSource }>
+)>;
 
 /**
  * Why a spec-check capture failed, as a closed set rather than prose.
@@ -1083,14 +1097,15 @@ export interface WaveReviewEpochAuthority {
    * recovery refuses to infer it from evidence. */
   readonly specCheckSlotAuthority?: WaveSpecCheckSlotAuthority;
   /**
-   * The settled CRITICAL floor rendered into this epoch's spec-check packet.
+   * The exact settled CRITICAL authority rendered into this epoch's spec-check
+   * packet: current epochs carry both count and Finding identities; historical
+   * epochs may carry count only.
    *
-   * Recorded at installation because it is the ONLY number the Agent was
+   * Recorded at installation because it is the ONLY authority the Agent was
    * actually shown. Re-projecting it at capture time reads `spec_anchor_hashes`
-   * and out-of-Wave `spec_anchors` that no epoch digest covers, so the enforced
-   * count could drift above the rendered one and fail an honest report. Absent
-   * on epochs installed before this field existed; `epochSettledFloor` is the
-   * only reader, and it maps that absence to a stated `unprojected` floor.
+   * and out-of-Wave `spec_anchors` that no epoch digest covers, so enforcement
+   * could drift from the packet. Absent on epochs installed before any floor
+   * existed; `epochSettledFloor` maps that absence to stated unavailability.
    */
   readonly settledSpecCheckFloor?: SettledFloor;
 }

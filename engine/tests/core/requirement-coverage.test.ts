@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import {
   parseSpec,
-  parseSpecContentHash,
   type ParsedSpec,
   type SpecContentHash,
 } from "../../src/core/parse-spec";
@@ -25,14 +24,19 @@ import {
 import { parseSpecCheckOutput, reconcileSpecCheck } from "../../src/core/spec-check";
 
 const RUN_AT = "2026-09-06T00:00:00.000Z";
-/** A spec-check footer reporting `critical` CRITICAL findings. */
-const report = (critical: number) => parseSpecCheckOutput([
-  "SPEC_CHECK_WAVE: 1",
-  ...Array.from({ length: critical }, (_, at) => `CRITICAL: finding ${at + 1}`),
-  `SPEC_CHECK_CRITICAL_COUNT: ${critical}`,
-  "SPEC_CHECK_HIGH_COUNT: 0",
-  `SPEC_CHECK_VERDICT: ${critical === 0 ? "PASSED" : "BLOCKED"}`,
-].join("\n"));
+/** A spec-check footer reporting either anonymous or exact CRITICAL findings. */
+const report = (critical: number | readonly string[]) => {
+  const findings = typeof critical === "number"
+    ? Array.from({ length: critical }, (_, at) => `finding ${at + 1}`)
+    : [...critical];
+  return parseSpecCheckOutput([
+    "SPEC_CHECK_WAVE: 1",
+    ...findings.map((finding) => `CRITICAL: ${finding}`),
+    `SPEC_CHECK_CRITICAL_COUNT: ${findings.length}`,
+    "SPEC_CHECK_HIGH_COUNT: 0",
+    `SPEC_CHECK_VERDICT: ${findings.length === 0 ? "PASSED" : "BLOCKED"}`,
+  ].join("\n"));
+};
 
 const specSource = `# Feature: Coverage
 
@@ -72,15 +76,10 @@ const indexed: SpecIndexAvailability =
 
 const readable = (hash: SpecContentHash): RecordedHash => ({ kind: "readable", hash });
 
-/** The link-time recording, round-tripped through the persistence boundary. */
-const hashesOf = (claims: readonly string[]): ReadonlyMap<string, RecordedHash> => {
-  const map = new Map<string, RecordedHash>();
-  for (const [claim, raw] of Object.entries(recordedAnchorHashes(index, claims))) {
-    const hash = parseSpecContentHash(raw);
-    if (hash !== null) map.set(claim, readable(hash));
-  }
-  return map;
-};
+/** The link-time recording, lifted directly from parser-minted hashes. */
+const hashesOf = (claims: readonly string[]): ReadonlyMap<string, RecordedHash> =>
+  new Map(Object.entries(recordedAnchorHashes(index, claims))
+    .map(([claim, hash]) => [claim, readable(hash)] as const));
 
 const task = (overrides: Partial<CoverageTask> = {}): CoverageTask => Object.freeze({
   id: "T1",
@@ -221,15 +220,33 @@ describe("settled floor", () => {
     expect(settledCriticalCount(settled())).toBe(6);
   });
 
-  it("refuses a report that falls below the floor and admits one that exceeds it", () => {
-    // Asserted through reconcileSpecCheck, the rule that actually gates. The
-    // production-dead duplicate these once used carried the only tests, so a
-    // divergence between the two copies would have stayed green.
+  it("keeps an altered Requirement hash as a required CRITICAL identity", () => {
+    const altered = rowsOf([task({
+      completionAnchors: ["FR-001", "FR-002", "AS-001", "AS-002"],
+      anchorHashes: new Map([["FR-001", { kind: "unreadable", stored: "deadbeef" }]]),
+    })]);
+    const floor = settledFloorOf(altered);
+    expect(floor.kind).toBe("settled");
+    if (floor.kind !== "settled") return;
+    expect(floor.count).toBe(1);
+    expect(floor.criticalFindings).toEqual([
+      expect.stringMatching(/Task "T1" claim "FR-001" .*have been altered/u),
+    ]);
+    expect(reconcileSpecCheck(report(0), 1, RUN_AT, floor)).toMatchObject({
+      kind: "evidence-failed",
+      specCheck: { cause: "settled-floor" },
+    });
+  });
+
+  it("requires every settled Finding and admits additional Agent findings", () => {
     const floor = settledFloorOf(settled());
-    expect(reconcileSpecCheck(report(5), 1, RUN_AT, floor).kind).toBe("evidence-failed");
-    expect(reconcileSpecCheck(report(6), 1, RUN_AT, floor).kind).toBe("captured");
-    // A floor, not an equality: the Agent is expected to add its own findings.
-    expect(reconcileSpecCheck(report(9), 1, RUN_AT, floor).kind).toBe("captured");
+    if (floor.kind !== "settled") throw new Error("projected fixture must mint a current floor");
+    expect(reconcileSpecCheck(report(floor.criticalFindings.slice(1)), 1, RUN_AT, floor).kind)
+      .toBe("evidence-failed");
+    expect(reconcileSpecCheck(report(floor.criticalFindings), 1, RUN_AT, floor).kind).toBe("captured");
+    expect(reconcileSpecCheck(
+      report([...floor.criticalFindings, "Agent found another defect"]), 1, RUN_AT, floor,
+    ).kind).toBe("captured");
   });
 
   it("fails settlement closed when no projection was possible", () => {

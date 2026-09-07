@@ -28,7 +28,7 @@ Two execution paths exist, and every step below depends on which one you are on.
 | When | `LOOM_CONTEXT_PATH` is set AND the `requirement-coverage` section does **not** say `UNAVAILABLE` | `LOOM_CONTEXT_PATH` is absent (standalone), OR the section says `UNAVAILABLE` |
 | Requirement checklist | the projection's rows | grep the spec for the claimed identifiers |
 | Requirement text | the projection's `Requirement` column | read it from the spec at `specFile` |
-| Acceptance scenarios | the projection's unclaimed-scenario list | grep the spec for `Given … When … Then` |
+| Acceptance scenarios | claimed `AS-NNN` rows plus the projection's unclaimed-scenario list | grep the spec for `Given … When … Then` |
 | Out-of-Scope list | the projection's typed `OOS-NNN` entries | grep the spec's Out of Scope section |
 | Glossary | the projection's typed terms | grep the spec's Appendix table |
 | Who settles a row | `Decided by: engine` rows are settled | nothing is settled; you assess everything |
@@ -73,25 +73,40 @@ The projection is engine-derived authority, not advice, and it states its own ru
 - **`Decided by`** — `engine` means the row is settled: copy it into your report verbatim, do not re-litigate it. `agent` means an assessment is still owed **regardless of severity**.
 - **`Severity`** — how bad the structural fact is. A `MEDIUM` (drifted) or `CRITICAL` (altered hash) row can still be `Decided by: agent`; severity never excuses you from reading the code.
 
-The projection's last line states the settled CRITICAL count. **Your report may not fall below it** — the engine enforces this exact number at capture and fails evidence capture if you do.
+The projection's required-footer section gives every settled `CRITICAL:` line and its last line states their count. **Copy every settled line verbatim and do not fall below the count**—capture enforces both Finding identity and cardinality.
 
 If it renders `UNAVAILABLE` you are on the **Unprojected** path: nothing is settled, and the projection carries no Requirement text, no scenario roster, no exclusion list and no glossary.
 
-**Standalone `/spec-check` only (`LOOM_CONTEXT_PATH` is absent): Run the live-graph fallback:**
+**Standalone `/spec-check` only (`LOOM_CONTEXT_PATH` is absent): Run the live-graph fallback ONCE:**
 
 ```bash
-SPEC=$(ls -t .claude/specs/*/spec.md | head -1) && echo "$SPEC"
+GRAPH_SNAPSHOT=$(mktemp) && trap 'rm -f "$GRAPH_SNAPSHOT"' EXIT &&
+cp .claude/state/active_task_graph.json "$GRAPH_SNAPSHOT" &&
+SPEC=$(jq -r '.spec_file | select(type == "string" and length > 0) // empty' "$GRAPH_SNAPSHOT") &&
+LEGACY_SPEC_FALLBACK=false &&
+if [ -z "$SPEC" ]; then
+  SPEC=$(ls -t .claude/specs/*/spec.md | head -1)
+  LEGACY_SPEC_FALLBACK=true
+fi &&
+jq --arg specFile "$SPEC" --argjson legacySpecFallback "$LEGACY_SPEC_FALLBACK" '
+  .current_wave as $wave |
+  {
+    specFile: $specFile,
+    legacySpecFallback: $legacySpecFallback,
+    wave: $wave,
+    tasks: [.tasks[] | select(.wave == $wave) | {
+      id,
+      description,
+      completionAnchors: (.spec_anchors // []),
+      contributions: (.spec_contributions // []),
+      declaredFiles: (.file_list // []),
+      modifiedFiles: (.files_modified // [])
+    }]
+  }
+' "$GRAPH_SNAPSHOT"
 ```
 
-```bash
-jq -r '.current_wave' .claude/state/active_task_graph.json
-```
-
-```bash
-jq -r '.current_wave as $w | .tasks[] | select(.wave == $w) | {id, description, completionAnchors:(.spec_anchors // []), contributions:(.spec_contributions // []), declaredFiles:(.file_list // []), modifiedFiles:(.files_modified // [])}' .claude/state/active_task_graph.json
-```
-
-Normalize this fallback to the same SPEC path, WAVE number, and Task scope shape. **The standalone path has no engine-derived projection** — there is no registered packet to carry one — so it performs the model-read assessment for every claim, exactly as before. Say so in the summary rather than implying structural verdicts were available.
+Save the exact `specFile`, `wave`, and `tasks` from this one output. The TaskGraph's `spec_file` is authoritative; the newest-Spec mtime heuristic is used only when legacy state records no usable path, and `legacySpecFallback: true` must be disclosed in the summary. **The standalone path has no engine-derived projection**—there is no registered packet to carry one—so it performs the model-read assessment for every claim. Say so rather than implying structural verdicts were available.
 
 ### Step 2: Take the Requirement checklist
 
@@ -143,13 +158,13 @@ You MUST NOT overturn a settled row. If you believe one is wrong, the defect is 
 - SHOULD requirements that are unimplemented = HIGH
 - MAY requirements that are unimplemented = MEDIUM
 
-**Then emit both unclaimed lists from the projection** — Functional Requirements and Acceptance Scenarios — each entry as CRITICAL: a Requirement or Scenario whose completion no Task claims at any Wave is planned by nobody. (Requirement Contributions are deliberately not counted as claims; if a listed item has contributing work planned, say so beside the finding rather than dropping it.)
+**Then emit both unclaimed lists from the projection** — Functional Requirements and Acceptance Scenarios — each entry as CRITICAL: a Requirement or Scenario whose completion has no planned owner at any Wave. Requirement Contributions are deliberately not completion ownership; if a listed item has contributing work planned, say so beside the finding rather than dropping it.
 
 ### Step 5: Acceptance scenario coverage
 
-Acceptance Scenarios are canonical `AS-NNN` entries in the Spec Index — a Task claims one exactly as it claims an `FR-NNN`, and a claimed scenario already has its row in Step 4. This step covers the scenarios in scope that **no** Task claimed.
+Acceptance Scenarios are canonical `AS-NNN` entries in the Spec Index—a Task claims one exactly as it claims an `FR-NNN`. Step 4 decides implementation satisfaction; this step independently proves test linkage for **both** claimed and unclaimed scenarios.
 
-**Projected — the scenario roster is the projection's "Acceptance Scenarios whose completion no Task claims" section.** For each identifier it lists, grep the changed test files:
+**Projected — build the scenario roster from every `AS-NNN` claim row plus the projection's "Acceptance Scenarios whose completion no Task claims" section.** Preserve which source each identifier came from, then grep the changed test files for every identifier:
 
 ```bash
 grep -rn "AS-001" --include=*.test.ts --include=*.spec.ts --include=*Test.java .
@@ -157,12 +172,13 @@ grep -rn "AS-001" --include=*.test.ts --include=*.spec.ts --include=*Test.java .
 
 The convention is `it('AS-001: …')` — an identifier in a test name is a structural link, not prose matching.
 
-1. **Emit verdict**: `AS-NNN: COVERED — <test file>` or `AS-NNN: NOT COVERED — <reason>`
+1. **Emit verdict**: `AS-NNN: COVERED — <test file>` or `AS-NNN: NOT COVERED — <reason>`.
 2. When the grep finds a name, **Read the test** to confirm it exercises the scenario rather than merely naming it.
+3. For a claimed scenario with no real test link, emit the HIGH/MEDIUM/LOW finding defined below. Claimed means implemented in Step 4; it never means tested.
 
-If that section says every scenario is claimed, this step is genuinely empty — say so; do not leave the scenario table blank.
+If the unclaimed section says every scenario is claimed, Step 5 still checks every claimed `AS-NNN` row. It is empty only when the projection contains neither claimed AS rows nor unclaimed scenarios.
 
-**This step does not re-grade what Step 4 already settled.** Every identifier in the projection's unclaimed-scenario roster ALREADY has its `CRITICAL:` line from Step 4, and the engine counts it into the settled floor. What you produce here is the *coverage* fact beside it — whether any test exercises the scenario — not a competing severity. Downgrading one of those identifiers to HIGH, MEDIUM or LOW instead of emitting its CRITICAL puts your report below the floor and fails evidence capture.
+**This step does not re-grade what Step 4 already settled.** Every identifier in the unclaimed-scenario roster already has its exact `CRITICAL:` line in the projection's required-footer section and in the settled floor. Coverage is an additional fact; never replace or downgrade that CRITICAL.
 
 **Unprojected:** grep the spec for `Given .* When .* Then` lines and assess each, as before.
 
@@ -313,7 +329,7 @@ SPEC_CHECK_VERDICT: PASSED | BLOCKED
 - Registered Wave Gate scope comes only from `LOOM_CONTEXT_PATH`; never reread mutable `active_task_graph.json`
 - The Requirement Coverage Projection is engine-derived authority: `Decided by: engine` rows are copied, never overturned or softened
 - Severity is not settlement. A `MEDIUM` or `CRITICAL` row that reads `Decided by: agent` still needs you to read the code
-- Your CRITICAL count may never fall below the projection's stated settled floor; the engine enforces that exact number at capture and fails evidence capture if it does
+- Copy every line from the projection's “Required settled CRITICAL footer lines” section verbatim; capture enforces Finding identity as well as the count floor, while still allowing additional Agent findings
 - An UNAVAILABLE projection puts you on the Unprojected path: nothing is settled, and the glossary and Out-of-Scope list must be read from the specification — say so in the summary
 - Requirement Contributions are traceability only and never enter completion scope
 - MUST use tool calls (Grep, Read, Bash) for evidence — no assessing from memory, and no re-deriving what the projection already decided

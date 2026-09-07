@@ -524,10 +524,9 @@ export function waveSpecCheckScope(tasks: readonly Task[]): readonly WaveSpecChe
 const parsedAnchorHashes = (stored: Task["spec_anchor_hashes"]): ReadonlyMap<string, RecordedHash> =>
   new Map(Object.entries(stored ?? {}).map(([claim, raw]) => {
     const hash = parseSpecContentHash(raw);
-    // The load boundary proves `spec_anchor_hashes` — `migrateParsedTask`
-    // refuses a non-record and describes every non-string value with the same
-    // `<non-string …>` vocabulary this arm used to mint — so `raw` is always a
-    // string here. The unreadable arm keeps covering strings that are not the
+    // The load boundary proves `spec_anchor_hashes`: `migrateParsedTask`
+    // rejects every non-string value before this lift runs, so `raw` is always
+    // a string here. The unreadable arm keeps covering strings that are not the
     // shape `specContentHash` mints: a truncated or tampered hash stays
     // distinguishable from one that was never recorded, and the projection
     // says so instead of grading the row down silently.
@@ -783,9 +782,9 @@ export function prepareWaveReviewBatch(
     value: Object.freeze({
       batchEpoch: batchEpoch.value,
       specCheckDocuments,
-      // Derived from `requirementCoverage` itself - the same value the packet
-      // section above renders - so the number recorded on the epoch and the
-      // number the Agent reads are one expression, not two agreeing ones.
+      // Derived from `requirementCoverage` itself—the same value the packet
+      // section above renders—so the Finding identities/count recorded on the
+      // epoch and those the Agent reads are one expression, not two agreeing ones.
       settledFloor: settledFloorOf(requirementCoverage),
       requests: Object.freeze(requests),
       packets: Object.freeze(packets),
@@ -804,9 +803,9 @@ export type WaveReviewEpochReplayDecision =
  * Parse epoch replay authority into an exhaustive decision.
  *
  * Exact replay retains captured spec-check evidence. A byte/slot-identical
- * historical epoch with no recorded floor is an explicit upgrade: installation
- * writes the packet's floor and clears prior spec-check evidence so fresh
- * capture is required. Every other mismatch is different authority.
+ * historical epoch with no floor—or with a matching count-only legacy floor—
+ * is an explicit upgrade: installation writes the packet's identity-bearing
+ * floor and clears prior evidence. Every other mismatch is different authority.
  */
 export function decideWaveReviewEpochReplay(
   existing: WaveReviewEpochAuthority | undefined,
@@ -824,14 +823,20 @@ export function decideWaveReviewEpochReplay(
   if (existing.settledSpecCheckFloor === undefined) {
     return Object.freeze({ kind: "upgrade-floor" });
   }
+  if (existing.settledSpecCheckFloor.kind === "legacy-settled") {
+    return batch.settledFloor.kind === "settled" &&
+        existing.settledSpecCheckFloor.count === batch.settledFloor.count
+      ? Object.freeze({ kind: "upgrade-floor" })
+      : Object.freeze({ kind: "different" });
+  }
   return canonicalStructuralEquals(existing.settledSpecCheckFloor, batch.settledFloor)
     ? Object.freeze({ kind: "exact" })
     : Object.freeze({ kind: "different" });
 }
 
 /**
- * The settled CRITICAL floor for one spec-check capture: the number the Agent
- * was shown, read back from the epoch that showed it.
+ * The settled CRITICAL floor for one spec-check capture: the identities and
+ * count the Agent was shown, read back from the epoch that showed them.
  *
  * Deliberately NOT a re-projection. Re-deriving at capture time reads
  * `spec_anchor_hashes` and the `spec_anchors` of Tasks outside the reviewed

@@ -68,6 +68,7 @@ describe("parseSpecCheckOutput (pure)", () => {
 
   it("fails evidence reconciliation when the required verdict marker is absent", () => {
     const parsed = parseSpecCheckOutput([
+      "SPEC_CHECK_WAVE: 1",
       "SPEC_CHECK_CRITICAL_COUNT: 0",
       "SPEC_CHECK_HIGH_COUNT: 0",
     ].join("\n"));
@@ -90,6 +91,7 @@ describe("parseSpecCheckOutput (pure)", () => {
     // lines either, so coercing the missing marker to 0 made the count agree
     // with the itemization and recorded a truncated report as a clean one.
     const parsed = parseSpecCheckOutput([
+      "SPEC_CHECK_WAVE: 1",
       "SPEC_CHECK_CRITICAL_COUNT: 0",
       "SPEC_CHECK_VERDICT: PASSED",
     ].join("\n"));
@@ -107,8 +109,9 @@ describe("parseSpecCheckOutput (pure)", () => {
     });
   });
 
-  it("captures a genuinely clean report that emits all three markers", () => {
+  it("captures a genuinely clean report that emits every required marker", () => {
     const parsed = parseSpecCheckOutput([
+      "SPEC_CHECK_WAVE: 1",
       "SPEC_CHECK_CRITICAL_COUNT: 0",
       "SPEC_CHECK_HIGH_COUNT: 0",
       "SPEC_CHECK_VERDICT: PASSED",
@@ -196,6 +199,7 @@ describe("parseSpecCheckOutput (pure)", () => {
 
   it("fails evidence reconciliation when the high count drifts from HIGH lines", () => {
     const parsed = parseSpecCheckOutput([
+      "SPEC_CHECK_WAVE: 1",
       "HIGH: uncounted risk",
       "SPEC_CHECK_CRITICAL_COUNT: 0",
       "SPEC_CHECK_HIGH_COUNT: 0",
@@ -978,8 +982,8 @@ describe("the Requirement Coverage Projection is enforced, not merely rendered",
   });
 });
 
-describe("round-4: the reported party selects no Wave", () => {
-  it("files a legacy projection refusal on the engine's wave, never the Agent's claimed wave", async () => {
+describe("round-6: the reported party selects no Wave", () => {
+  it("files a wrong-Wave transcript refusal on the engine's wave", async () => {
     // The defect this closes: the Wave chain took findings.wave — the Agent's
     // own SPEC_CHECK_WAVE marker — so on the legacy path (epoch absent) the
     // Agent chose both the roster its floor is derived from and, through
@@ -1036,7 +1040,8 @@ describe("round-4: the reported party selects no Wave", () => {
         expect(state.spec_check.wave).toBe(3);
         expect(state.spec_check).toMatchObject({
           verdict: "EVIDENCE_CAPTURE_FAILED",
-          cause: "projection-unavailable",
+          cause: "transcript",
+          error: expect.stringContaining("does not match protected Wave 3"),
         });
         // Evidence failure carries no accepted critical count, so neither Wave
         // receives a content block; the engine-selected filing Wave remains 3.

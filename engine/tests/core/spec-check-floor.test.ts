@@ -3,16 +3,18 @@ import {
   parseSpecCheckOutput,
   parseStoredSpecCheck,
   reconcileSpecCheck,
+  settleSpecCheck,
   specCheckNeedsReapplication,
 } from "../../src/core/spec-check";
 import {
   manualOverrideFloor,
   parseSettledFloor,
   unprojectedFloor,
+  type ManualOverrideFloor,
   type SettledFloor,
 } from "../../src/core/requirement-coverage";
 import { epochSettledFloor } from "../../src/core/wave-review-authority";
-import type { SpecCheck, WaveReviewEpochAuthority } from "../../src/types";
+import type { SpecCheck, TaskGraph, WaveReviewEpochAuthority } from "../../src/types";
 
 
 /**
@@ -42,6 +44,15 @@ const settled = (count: number): SettledFloor => {
   if (parsed === null) throw new Error("fixture settled floor must parse");
   return parsed;
 };
+const currentSettled = (...criticalFindings: readonly string[]): SettledFloor => {
+  const parsed = parseSettledFloor({
+    kind: "settled",
+    count: criticalFindings.length,
+    criticalFindings,
+  });
+  if (parsed === null) throw new Error("fixture current floor must parse");
+  return parsed;
+};
 const unprojected = (): SettledFloor => unprojectedFloor("test fixture: no projection");
 
 const reconcile = (critical: number, floor: SettledFloor) =>
@@ -58,10 +69,33 @@ describe("reconcileSpecCheck enforces the settled floor", () => {
     expect(result.specCheck).toMatchObject({ cause: "settled-floor" });
   });
 
-  it("admits a report that meets the floor, and one that exceeds it", () => {
+  it("admits a legacy report that meets the count floor, and one that exceeds it", () => {
     expect(reconcile(3, settled(3)).kind).toBe("captured");
-    // A floor, never an equality: the Agent adds its own findings.
+    // Historical packets carried count authority only.
     expect(reconcile(7, settled(3)).kind).toBe("captured");
+  });
+
+  it("requires every current settled Finding identity while admitting additions", () => {
+    const floor = currentSettled("required one", "required two");
+    expect(reconcileSpecCheck(parseSpecCheckOutput([
+      "SPEC_CHECK_WAVE: 5",
+      "CRITICAL: required one",
+      "CRITICAL: required two",
+      "SPEC_CHECK_CRITICAL_COUNT: 2",
+      "SPEC_CHECK_HIGH_COUNT: 0",
+      "SPEC_CHECK_VERDICT: BLOCKED",
+    ].join("\n")), 5, "now", floor).kind).toBe("captured");
+    expect(reconcileSpecCheck(parseSpecCheckOutput([
+      "SPEC_CHECK_WAVE: 5",
+      "CRITICAL: unrelated one",
+      "CRITICAL: unrelated two",
+      "SPEC_CHECK_CRITICAL_COUNT: 2",
+      "SPEC_CHECK_HIGH_COUNT: 0",
+      "SPEC_CHECK_VERDICT: BLOCKED",
+    ].join("\n")), 5, "now", floor)).toMatchObject({
+      kind: "evidence-failed",
+      specCheck: { cause: "settled-floor", error: expect.stringContaining("required one") },
+    });
   });
 
   it("fails closed when no projection was available", () => {
@@ -104,7 +138,7 @@ describe("reconcileSpecCheck enforces the settled floor", () => {
   });
 });
 
-describe("epochSettledFloor reads back the number the Agent was shown", () => {
+describe("epochSettledFloor reads back the authority the Agent was shown", () => {
   const epoch = (floor?: SettledFloor): WaveReviewEpochAuthority => ({
     runId: "run.floor" as WaveReviewEpochAuthority["runId"],
     wave: 5,
@@ -112,8 +146,16 @@ describe("epochSettledFloor reads back the number the Agent was shown", () => {
     ...(floor === undefined ? {} : { settledSpecCheckFloor: floor }),
   });
 
-  it("returns the recorded floor verbatim", () => {
-    expect(epochSettledFloor(epoch(settled(4)))).toEqual({ kind: "settled", count: 4 });
+  it("returns a historical count-only floor as an explicit legacy variant", () => {
+    expect(epochSettledFloor(epoch(settled(4)))).toEqual({ kind: "legacy-settled", count: 4 });
+  });
+
+  it("returns current identity-bearing authority verbatim", () => {
+    expect(epochSettledFloor(epoch(currentSettled("required")))).toEqual({
+      kind: "settled",
+      count: 1,
+      criticalFindings: ["required"],
+    });
   });
 
   it("states why an absent epoch carries no floor, rather than settling zero", () => {
@@ -147,6 +189,10 @@ describe("a settled-floor refusal survives the resume loop", () => {
 
   it("still re-applies a transcript failure, which is what the loop exists for", () => {
     expect(specCheckNeedsReapplication(failed("transcript"), 5)).toBe(true);
+  });
+
+  it("does not re-apply a decided projection-unavailable refusal", () => {
+    expect(specCheckNeedsReapplication(failed("projection-unavailable"), 5)).toBe(false);
   });
 
   it("re-applies when nothing is recorded, or when what is recorded is another Wave's", () => {
@@ -205,5 +251,141 @@ describe("a persisted evidence failure carries its cause across a reload", () =>
     expect(parsed.ok).toBe(false);
     if (parsed.ok) return;
     expect(parsed.errors.join(" ")).toContain("must be absent when evidence capture succeeded");
+  });
+
+  it.each([1e100, Number.MAX_SAFE_INTEGER + 1])("refuses unsafe captured count %s", (criticalCount) => {
+    const parsed = parseStoredSpecCheck({
+      wave: 5, run_at: "now", verdict: "BLOCKED",
+      critical_count: criticalCount, high_count: 0,
+      critical_findings: [], high_findings: [], medium_findings: [],
+    });
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) expect(parsed.errors.join(" ")).toContain("safe integer");
+  });
+
+  it("round-trips attributable manual override provenance", () => {
+    const resolution = reconcileSpecCheck(
+      parseSpecCheckOutput(transcript(0)),
+      5,
+      "now",
+      manualOverrideFloor("accepted false-positive waiver"),
+    );
+    expect(resolution).toMatchObject({
+      kind: "captured",
+      specCheck: { evidence_source: { kind: "manual-override", reason: "accepted false-positive waiver" } },
+    });
+    const parsed = parseStoredSpecCheck(resolution.specCheck);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) expect(parsed.value).toEqual(resolution.specCheck);
+  });
+});
+
+describe("settleSpecCheck aggregate command", () => {
+  const state = (): TaskGraph => ({
+    current_phase: "execute",
+    current_wave: 5,
+    phase_artifacts: {},
+    skipped_phases: [],
+    spec_file: null,
+    plan_file: null,
+    tasks: [],
+    wave_gates: {
+      "5": { impl_complete: false, tests_passed: null, reviews_complete: false, blocked: true },
+    },
+    spec_check: {
+      wave: 5,
+      run_at: "before",
+      verdict: "BLOCKED",
+      critical_count: 1,
+      high_count: 0,
+      critical_findings: ["old blocker"],
+      high_findings: [],
+      medium_findings: [],
+    },
+  });
+
+  it("changes captured evidence and its derived Wave block atomically", () => {
+    const settlement = settleSpecCheck(state(), {
+      kind: "registered-transcript",
+      parsed: parseSpecCheckOutput(transcript(0)),
+      wave: 5,
+      runAt: "now",
+      floor: settled(0),
+    });
+    expect(settlement.state.spec_check).toEqual(settlement.specCheck);
+    expect(settlement.specCheck).toMatchObject({ verdict: "PASSED", critical_count: 0 });
+    expect(settlement.state.wave_gates["5"]?.blocked).toBe(false);
+  });
+
+  it("applies capture failure through the same atomic transition", () => {
+    const settlement = settleSpecCheck(state(), {
+      kind: "capture-failure",
+      wave: 5,
+      runAt: "now",
+      error: "transport lost transcript",
+    });
+    expect(settlement.specCheck).toMatchObject({
+      verdict: "EVIDENCE_CAPTURE_FAILED",
+      cause: "transcript",
+      error: "transport lost transcript",
+    });
+    expect(settlement.state.wave_gates["5"]?.blocked).toBe(false);
+  });
+
+  it("preserves the aggregate when manual evidence is malformed", () => {
+    const original = state();
+    const settlement = settleSpecCheck(original, {
+      kind: "manual-transcript",
+      parsed: parseSpecCheckOutput("SPEC_CHECK_WAVE: 5"),
+      wave: 5,
+      runAt: "now",
+      authority: manualOverrideFloor("operator override"),
+    });
+    expect(settlement.kind).toBe("manual-evidence-refused");
+    expect(settlement.state).toBe(original);
+  });
+});
+
+describe("transcript authority invariants", () => {
+  it.each([
+    ["missing", "SPEC_CHECK_CRITICAL_COUNT: 0\nSPEC_CHECK_HIGH_COUNT: 0\nSPEC_CHECK_VERDICT: PASSED"],
+    ["wrong", "SPEC_CHECK_WAVE: 6\nSPEC_CHECK_CRITICAL_COUNT: 0\nSPEC_CHECK_HIGH_COUNT: 0\nSPEC_CHECK_VERDICT: PASSED"],
+  ])("rejects a %s Wave marker", (_label, raw) => {
+    expect(reconcileSpecCheck(parseSpecCheckOutput(raw), 5, "now", settled(0))).toMatchObject({
+      kind: "evidence-failed",
+      specCheck: { cause: "transcript", error: expect.stringContaining("SPEC_CHECK_WAVE") },
+    });
+  });
+
+  it.each([
+    ["PASSED", 1],
+    ["BLOCKED", 0],
+  ] as const)("rejects verdict %s with %i critical findings", (verdict, count) => {
+    const parsed = parseSpecCheckOutput([
+      "SPEC_CHECK_WAVE: 5",
+      ...(count === 0 ? [] : ["CRITICAL: finding"]),
+      `SPEC_CHECK_CRITICAL_COUNT: ${count}`,
+      "SPEC_CHECK_HIGH_COUNT: 0",
+      `SPEC_CHECK_VERDICT: ${verdict}`,
+    ].join("\n"));
+    expect(reconcileSpecCheck(parsed, 5, "now", settled(0))).toMatchObject({
+      kind: "evidence-failed",
+      specCheck: { error: expect.stringContaining("SPEC_CHECK_VERDICT must be") },
+    });
+  });
+
+  it("rejects blank authority reasons at construction", () => {
+    expect(() => unprojectedFloor("  ")).toThrow("non-empty reason");
+    expect(() => manualOverrideFloor("\n")).toThrow("non-empty reason");
+  });
+
+  it("does not let an ordinary object literal forge manual authority", () => {
+    // @ts-expect-error the private unique-symbol witness is minted only by manualOverrideFloor
+    const forged: ManualOverrideFloor = { kind: "manual-override", reason: "invented" };
+    expect(forged.kind).toBe("manual-override");
+  });
+
+  it.each([1e100, Number.MAX_SAFE_INTEGER + 1])("refuses unsafe persisted floor count %s", (count) => {
+    expect(parseSettledFloor({ kind: "settled", count })).toBeNull();
   });
 });

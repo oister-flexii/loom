@@ -90,8 +90,8 @@ const unavailable = () => {
 
 describe("commands/spec-check.md is bound to the projection it consumes", () => {
   it("reads the section label the renderer is published under", () => {
-    // If the packet section were renamed, the command's decoder would silently
-    // find nothing and the Agent would proceed with no projection at all.
+    // If the packet section were renamed, the decoder throws and loudly blocks
+    // every registered spec-check until producer and command agree again.
     expect(command).toContain('entry.label === "requirement-coverage"');
   });
 
@@ -156,10 +156,29 @@ describe("commands/spec-check.md is bound to the projection it consumes", () => 
     }
   });
 
-  it("states the settled floor and fail-closed Unprojected policy the engine enforces", () => {
+  it("binds standalone Spec, Wave, and Tasks to one live-graph snapshot", () => {
+    expect(command).toContain("GRAPH_SNAPSHOT=$(mktemp)");
+    expect(command).toContain("cp .claude/state/active_task_graph.json \"$GRAPH_SNAPSHOT\"");
+    expect(command).toContain(".spec_file");
+    expect(command).toContain("newest-Spec mtime heuristic is used only when legacy state records no usable path");
+  });
+
+  it("checks claimed Acceptance Scenarios as well as unclaimed scenarios", () => {
+    const step = command.slice(
+      command.indexOf("### Step 5"),
+      command.indexOf("### Step 6"),
+    );
+    expect(step).toContain("every `AS-NNN` claim row");
+    expect(step).toContain("Step 5 still checks every claimed `AS-NNN` row");
+    expect(step).toContain("claimed scenario with no real test link");
+  });
+
+  it("states the identity-bearing floor and fail-closed Unprojected policy the engine enforces", () => {
     const rendered = renderRequirementCoverage(everyVerdict());
+    expect(rendered).toContain("### Required settled CRITICAL footer lines");
     expect(rendered).toContain("Your report may not fall below this count");
-    expect(command).toContain("may never fall below the projection's stated settled floor");
+    expect(command).toContain("Copy every line from the projection's “Required settled CRITICAL footer lines” section verbatim");
+    expect(command).toContain("Finding identity as well as the count floor");
     expect(command).toContain("unprojected run is an absence of structural evidence, never a pass");
   });
 });

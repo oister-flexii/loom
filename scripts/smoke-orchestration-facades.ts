@@ -8,6 +8,12 @@ import { evaluateTaskProof } from "../engine/src/core/proof-obligations";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const CLI = join(ROOT, "engine", "src", "cli.ts");
+const PASSING_SPEC_CHECK_FOOTER = [
+  "SPEC_CHECK_WAVE: 1",
+  "SPEC_CHECK_CRITICAL_COUNT: 0",
+  "SPEC_CHECK_HIGH_COUNT: 0",
+  "SPEC_CHECK_VERDICT: PASSED",
+].join("\n");
 const temporaryRoots: string[] = [];
 
 process.on("exit", () => {
@@ -474,7 +480,7 @@ function waveGateCriticalRefutationSmoke(): void {
   let next: unknown = initial;
   for (const request of initial.requests) {
     const output = request.authority.role === "spec-check-invoker"
-      ? ["SPEC_CHECK_WAVE: 1", "SPEC_CHECK_CRITICAL_COUNT: 0", "SPEC_CHECK_HIGH_COUNT: 0", "SPEC_CHECK_VERDICT: PASSED"].join("\n")
+      ? PASSING_SPEC_CHECK_FOOTER
       : reviewerOutput("critical", "src/x.ts", reviewBinding);
     next = submit(cwd, runsRoot, runDir, request, output);
   }
@@ -512,7 +518,7 @@ function waveGateSmoke(): void {
   let next: unknown = initial;
   for (const request of initial.requests) {
     const output = request.authority.role === "spec-check-invoker"
-      ? ["SPEC_CHECK_WAVE: 1", "SPEC_CHECK_CRITICAL_COUNT: 0", "SPEC_CHECK_HIGH_COUNT: 0", "SPEC_CHECK_VERDICT: PASSED"].join("\n")
+      ? PASSING_SPEC_CHECK_FOOTER
       : reviewerOutput("advisory", "src/x.ts", reviewBinding);
     next = submit(cwd, runsRoot, runDir, request, output);
   }

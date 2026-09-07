@@ -223,24 +223,15 @@ describe("Requirement Coverage Projection properties", () => {
     ));
   });
 
-  it("the floor never counts a row the Agent is the one to decide", () => {
-    // Stated as a property of the two axes rather than by transcribing the
-    // function's body — the previous version reimplemented settledCriticalCount
-    // and could only prove it equalled its own copy.
+  it("the floor counts every structural CRITICAL regardless of who assesses implementation", () => {
     fc.assert(fc.property(tasksArb, (tasks) => {
       const coverage = projectRequirementCoverage(indexed, tasks);
       if (coverage.kind !== "projected") return;
-      const engineCriticals = coverage.rows.filter(({ verdict }) =>
-        claimDecider(verdict) === "engine" && claimSeverity(verdict) === "CRITICAL").length;
+      const structuralCriticals = coverage.rows.filter(({ verdict }) =>
+        claimSeverity(verdict) === "CRITICAL").length;
       const unclaimed = coverage.unclaimed.length + coverage.unclaimedScenarios.length;
-      // An agent-decided CRITICAL (an altered recorded hash) has no instructed
-      // route to a CRITICAL marker line, so counting it made the floor
-      // unmeetable. The floor is blind to those rows: it is exactly the
-      // engine-decided criticals, the unclaimed identifiers, and at most the
-      // one synthetic no-traceability row.
-      const synthetic = settledCriticalCount(coverage) - engineCriticals - unclaimed;
-      expect(synthetic === 0 || synthetic === 1).toBe(true);
-      expect(coverage.rows.length === 0 || synthetic === 0).toBe(true);
+      const synthetic = coverage.rows.length === 0 && !coverage.tracesByContribution ? 1 : 0;
+      expect(settledCriticalCount(coverage)).toBe(structuralCriticals + unclaimed + synthetic);
     }));
   });
 
@@ -252,20 +243,22 @@ describe("Requirement Coverage Projection properties", () => {
       const coverage = projectRequirementCoverage(indexed, tasks);
       if (coverage.kind !== "projected") return;
       const floor = settledFloorOf(coverage);
-      const report = (critical: number) => reconcileSpecCheck(
+      if (floor.kind !== "settled") throw new Error("projected coverage must mint a current floor");
+      const report = (findings: readonly string[]) => reconcileSpecCheck(
         parseSpecCheckOutput([
           "SPEC_CHECK_WAVE: 1",
-          ...Array.from({ length: critical }, (_, at) => `CRITICAL: f${at}`),
-          `SPEC_CHECK_CRITICAL_COUNT: ${critical}`,
+          ...findings.map((finding) => `CRITICAL: ${finding}`),
+          `SPEC_CHECK_CRITICAL_COUNT: ${findings.length}`,
           "SPEC_CHECK_HIGH_COUNT: 0",
-          `SPEC_CHECK_VERDICT: ${critical === 0 ? "PASSED" : "BLOCKED"}`,
+          `SPEC_CHECK_VERDICT: ${findings.length === 0 ? "PASSED" : "BLOCKED"}`,
         ].join("\n")),
         1, "2026-09-06T00:00:00.000Z", floor,
       );
-      const exact = settledCriticalCount(coverage);
-      expect(report(exact).kind).toBe("captured");
-      expect(report(exact + 1).kind).toBe("captured");
-      if (exact > 0) expect(report(exact - 1).kind).toBe("evidence-failed");
+      expect(report(floor.criticalFindings).kind).toBe("captured");
+      expect(report([...floor.criticalFindings, "Agent finding"]).kind).toBe("captured");
+      if (floor.criticalFindings.length > 0) {
+        expect(report(floor.criticalFindings.slice(1)).kind).toBe("evidence-failed");
+      }
     }));
   });
   it("renders one body row per projected row, whatever the claim text contains", () => {

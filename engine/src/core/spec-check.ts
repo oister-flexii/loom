@@ -1,5 +1,10 @@
-import type { SpecCheckFloorAuthority } from "./requirement-coverage";
+import type {
+  ManualOverrideFloor,
+  SettledFloor,
+  SpecCheckFloorAuthority,
+} from "./requirement-coverage";
 import { isNoFindingSentinel } from "../utils/no-finding-sentinel";
+import { reconcileWaveBlock } from "./wave-gate-model";
 import type { AgentRequestAuthority } from "./orchestration-contract";
 import {
   parseSpecCheckVerdict,
@@ -269,6 +274,17 @@ export function reconcileSpecCheck(
       "transcript",
     );
   }
+  if (parsed.wave === null) {
+    return evidenceFailure(wave, runAt, "SPEC_CHECK_WAVE marker not found - re-run /wave-gate", "transcript");
+  }
+  if (!Number.isSafeInteger(parsed.wave) || parsed.wave !== wave) {
+    return evidenceFailure(
+      wave,
+      runAt,
+      `SPEC_CHECK_WAVE (${parsed.wave}) does not match protected Wave ${wave} - re-run /wave-gate`,
+      "transcript",
+    );
+  }
   if (parsed.criticalCount === null) {
     return evidenceFailure(wave, runAt, "SPEC_CHECK_CRITICAL_COUNT marker not found - re-run /wave-gate", "transcript");
   }
@@ -295,6 +311,15 @@ export function reconcileSpecCheck(
       "transcript",
     );
   }
+  const expectedVerdict = parsed.criticalCount === 0 ? "PASSED" : "BLOCKED";
+  if (parsed.verdict !== expectedVerdict) {
+    return evidenceFailure(
+      wave,
+      runAt,
+      `SPEC_CHECK_VERDICT must be ${expectedVerdict} when SPEC_CHECK_CRITICAL_COUNT is ${parsed.criticalCount} - re-run /wave-gate`,
+      "transcript",
+    );
+  }
   // Last, so malformed evidence reports its concrete transcript defect first.
   // An unavailable projection is an absence of evidence, never a pass. Manual
   // operator authority is a separate arm and deliberately skips this refusal.
@@ -309,7 +334,8 @@ export function reconcileSpecCheck(
   }
   // A floor, never an equality: the Agent is expected to ADD findings its own
   // reading turns up; it may never subtract the engine's.
-  if (floorAuthority.kind === "settled" && parsed.criticalCount < floorAuthority.count) {
+  if ((floorAuthority.kind === "settled" || floorAuthority.kind === "legacy-settled") &&
+      parsed.criticalCount < floorAuthority.count) {
     return evidenceFailure(
       wave,
       runAt,
@@ -318,7 +344,18 @@ export function reconcileSpecCheck(
       "settled-floor",
     );
   }
-  const verdict = parsed.verdict === "EVIDENCE_CAPTURE_FAILED" ? "UNKNOWN" : parsed.verdict;
+  if (floorAuthority.kind === "settled") {
+    const reported = new Set(parsed.critical);
+    const omitted = floorAuthority.criticalFindings.filter((finding) => !reported.has(finding));
+    if (omitted.length > 0) {
+      return evidenceFailure(
+        wave,
+        runAt,
+        `spec-check omitted ${omitted.length} engine-settled CRITICAL finding(s): ${omitted.join("; ")} - re-run /wave-gate`,
+        "settled-floor",
+      );
+    }
+  }
   return {
     kind: "captured",
     specCheck: {
@@ -329,15 +366,84 @@ export function reconcileSpecCheck(
       critical_findings: [...parsed.critical],
       high_findings: [...parsed.high],
       medium_findings: [...parsed.medium],
-      verdict,
+      verdict: parsed.verdict,
+      ...(floorAuthority.kind === "manual-override"
+        ? { evidence_source: { kind: "manual-override" as const, reason: floorAuthority.reason } }
+        : {}),
     },
   };
+}
+
+export type SpecCheckSettlementCommand =
+  | Readonly<{
+      kind: "registered-transcript";
+      parsed: ParsedSpecCheckOutput;
+      wave: number;
+      runAt: string;
+      floor: SettledFloor;
+    }>
+  | Readonly<{
+      kind: "manual-transcript";
+      parsed: ParsedSpecCheckOutput;
+      wave: number;
+      runAt: string;
+      authority: ManualOverrideFloor;
+    }>
+  | Readonly<{
+      kind: "capture-failure";
+      wave: number;
+      runAt: string;
+      error: string;
+    }>;
+
+export type SpecCheckSettlement =
+  | Readonly<{ kind: "applied"; state: TaskGraph; specCheck: SpecCheck }>
+  | Readonly<{ kind: "manual-evidence-refused"; state: TaskGraph; specCheck: EvidenceFailedSpecCheck }>;
+
+/**
+ * Pure aggregate command for every spec-check transport. It owns both evidence
+ * construction and Wave-block reconciliation so a shell cannot persist one
+ * without the other. Manual malformed evidence is the sole non-applying arm.
+ */
+export function settleSpecCheck(
+  state: TaskGraph,
+  command: Exclude<SpecCheckSettlementCommand, { kind: "manual-transcript" }>,
+): Extract<SpecCheckSettlement, { kind: "applied" }>;
+export function settleSpecCheck(
+  state: TaskGraph,
+  command: Extract<SpecCheckSettlementCommand, { kind: "manual-transcript" }>,
+): SpecCheckSettlement;
+export function settleSpecCheck(
+  state: TaskGraph,
+  command: SpecCheckSettlementCommand,
+): SpecCheckSettlement {
+  const resolution = command.kind === "capture-failure"
+    ? evidenceFailure(command.wave, command.runAt, command.error, "transcript")
+    : reconcileSpecCheck(
+        command.parsed,
+        command.wave,
+        command.runAt,
+        command.kind === "manual-transcript" ? command.authority : command.floor,
+      );
+  if (command.kind === "manual-transcript" && resolution.kind === "evidence-failed") {
+    return Object.freeze({ kind: "manual-evidence-refused", state, specCheck: resolution.specCheck });
+  }
+  const specCheck = resolution.specCheck;
+  return Object.freeze({
+    kind: "applied",
+    state: Object.freeze({
+      ...state,
+      spec_check: specCheck,
+      wave_gates: reconcileWaveBlock(state.wave_gates, state.tasks, specCheck, command.wave),
+    }),
+    specCheck,
+  });
 }
 
 const stringArray = (value: unknown): value is readonly string[] =>
   Array.isArray(value) && value.every((entry) => typeof entry === "string");
 const count = (value: unknown): value is number =>
-  typeof value === "number" && Number.isInteger(value) && value >= 0;
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 
 /** Parse persisted spec-check state into its captured/evidence-failed ADT. */
 export function parseStoredSpecCheck(raw: unknown): SpecCheckParseResult {
@@ -347,8 +453,8 @@ export function parseStoredSpecCheck(raw: unknown): SpecCheckParseResult {
   const spec = raw as Record<string, unknown>;
   const verdict = typeof spec.verdict === "string" ? parseSpecCheckVerdict(spec.verdict) : null;
   const errors: string[] = [];
-  if (!Number.isInteger(spec.wave) || (spec.wave as number) < 1) {
-    errors.push(`spec_check.wave must be an integer >= 1, got ${JSON.stringify(spec.wave)}`);
+  if (!Number.isSafeInteger(spec.wave) || (spec.wave as number) < 1) {
+    errors.push(`spec_check.wave must be a safe integer >= 1, got ${JSON.stringify(spec.wave)}`);
   }
   if (typeof spec.run_at !== "string") {
     errors.push(`spec_check.run_at must be a string, got ${JSON.stringify(spec.run_at)}`);
@@ -376,7 +482,9 @@ function parseFailedSpecCheck(
       spec.cause !== "settled-floor" && spec.cause !== "projection-unavailable") {
     errors.push(`spec_check.cause ${JSON.stringify(spec.cause)} is not recognized`);
   }
-  for (const field of ["critical_count", "high_count", "critical_findings", "high_findings", "medium_findings"] as const) {
+  for (const field of [
+    "critical_count", "high_count", "critical_findings", "high_findings", "medium_findings", "evidence_source",
+  ] as const) {
     if (spec[field] !== undefined) errors.push(`spec_check.${field} must be absent when evidence capture failed`);
   }
   return errors.length > 0 ? { ok: false, errors } : { ok: true, value: freshEvidenceFailed(spec, verdict) };
@@ -390,12 +498,16 @@ function parseCapturedSpecCheck(
   const errors: string[] = [];
   if (spec.error !== undefined) errors.push("spec_check.error must be absent when evidence capture succeeded");
   if (spec.cause !== undefined) errors.push("spec_check.cause must be absent when evidence capture succeeded");
-  if (!count(spec.critical_count)) errors.push("spec_check.critical_count must be a non-negative integer");
-  if (!count(spec.high_count)) errors.push("spec_check.high_count must be a non-negative integer");
+  const evidenceSource = parseManualEvidenceSource(spec.evidence_source);
+  if (evidenceSource === null) {
+    errors.push("spec_check.evidence_source must be absent or a manual-override with a non-empty reason");
+  }
+  if (!count(spec.critical_count)) errors.push("spec_check.critical_count must be a non-negative safe integer");
+  if (!count(spec.high_count)) errors.push("spec_check.high_count must be a non-negative safe integer");
   if (!stringArray(spec.critical_findings)) errors.push("spec_check.critical_findings must be an array of strings");
   if (!stringArray(spec.high_findings)) errors.push("spec_check.high_findings must be an array of strings");
   if (!stringArray(spec.medium_findings)) errors.push("spec_check.medium_findings must be an array of strings");
-  if (errors.length > 0) return { ok: false, errors };
+  if (errors.length > 0 || evidenceSource === null) return { ok: false, errors };
 
   const criticalFindings = spec.critical_findings as readonly string[];
   const highFindings = spec.high_findings as readonly string[];
@@ -407,7 +519,15 @@ function parseCapturedSpecCheck(
   if (spec.high_count !== highFindings.length) {
     errors.push(`spec_check.high_count (${spec.high_count}) must equal high_findings.length (${highFindings.length})`);
   }
-  return errors.length > 0 ? { ok: false, errors } : { ok: true, value: freshCaptured(spec, verdict) };
+  if (verdict === "PASSED" && spec.critical_count !== 0) {
+    errors.push("spec_check.verdict PASSED requires critical_count 0");
+  }
+  if (verdict === "BLOCKED" && spec.critical_count === 0) {
+    errors.push("spec_check.verdict BLOCKED requires critical_count greater than 0");
+  }
+  return errors.length > 0
+    ? { ok: false, errors }
+    : { ok: true, value: freshCaptured(spec, verdict, evidenceSource) };
 }
 
 /**
@@ -420,9 +540,20 @@ function parseCapturedSpecCheck(
  * `CapturedSpecCheck`'s `readonly` findings. Freezing a freshly built record
  * makes the proof survive its own return, as every sibling parser here does.
  */
+function parseManualEvidenceSource(raw: unknown): CapturedSpecCheck["evidence_source"] | null {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  const record = raw as Record<string, unknown>;
+  return Object.keys(record).length === 2 && record.kind === "manual-override" &&
+      typeof record.reason === "string" && record.reason.trim() !== ""
+    ? Object.freeze({ kind: "manual-override", reason: record.reason })
+    : null;
+}
+
 function freshCaptured(
   spec: Record<string, unknown>,
   verdict: Exclude<SpecCheckVerdict, "EVIDENCE_CAPTURE_FAILED">,
+  evidenceSource: CapturedSpecCheck["evidence_source"],
 ): CapturedSpecCheck {
   return Object.freeze({
     wave: spec.wave as number,
@@ -433,6 +564,7 @@ function freshCaptured(
     critical_findings: Object.freeze([...(spec.critical_findings as readonly string[])]),
     high_findings: Object.freeze([...(spec.high_findings as readonly string[])]),
     medium_findings: Object.freeze([...(spec.medium_findings as readonly string[])]),
+    ...(evidenceSource === undefined ? {} : { evidence_source: evidenceSource }),
   });
 }
 

@@ -110,6 +110,7 @@ describe("store-spec-check helper", () => {
   it("fails closed when CRITICAL_COUNT disagrees with the CRITICAL: lines (forged-zero shape)", () => {
     const { exitCode, stderr } = runHelper(
       [
+        "SPEC_CHECK_WAVE: 1",
         "CRITICAL: requirement REQ-1 not implemented",
         "SPEC_CHECK_CRITICAL_COUNT: 0",
         "SPEC_CHECK_HIGH_COUNT: 0",
@@ -124,6 +125,7 @@ describe("store-spec-check helper", () => {
   it("fails closed when HIGH_COUNT disagrees with the HIGH: lines", () => {
     const { exitCode, stderr } = runHelper(
       [
+        "SPEC_CHECK_WAVE: 1",
         "HIGH: partial coverage of REQ-2",
         "SPEC_CHECK_CRITICAL_COUNT: 0",
         "SPEC_CHECK_HIGH_COUNT: 3",
@@ -163,7 +165,13 @@ describe("store-spec-check helper", () => {
 
     expect(exitCode).toBe(0);
     expect(stderr).toContain("manual operator override: FRs 12-14 are covered in wave 3");
-    expect(readState().spec_check?.verdict).toBe("PASSED");
+    expect(readState().spec_check).toMatchObject({
+      verdict: "PASSED",
+      evidence_source: {
+        kind: "manual-override",
+        reason: "FRs 12-14 are covered in wave 3",
+      },
+    });
   });
 
   it("pins the floor argument: the operator override imposes no floor even when a projection would settle rows", () => {
