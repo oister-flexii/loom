@@ -88,6 +88,36 @@ function modelFreePlan(root: string): string {
   return path;
 }
 
+function canonicalSpec(root: string): string {
+  const path = join(root, "spec.md");
+  writeFileSync(path, [
+    "# Feature: Orchestration fixture",
+    "",
+    "## User Scenarios",
+    "",
+    "### US1: [P1] Complete a Wave review",
+    "",
+    "**Acceptance Scenarios:**",
+    "- AS-001: Given accepted evidence, When the gate resumes, Then the Wave progresses",
+    "",
+    "## Functional Requirements",
+    "",
+    "- FR-001: System MUST process the exact current Wave evidence",
+    "",
+    "## Out of Scope",
+    "",
+    "- OOS-001: Unrelated feature work",
+    "",
+    "## Appendix: Glossary",
+    "",
+    "| Term | Definition |",
+    "|------|------------|",
+    "| Wave evidence | Evidence bound to the current Wave authority |",
+    "",
+  ].join("\n"));
+  return path;
+}
+
 function specCheckDocuments(specFile: string | null, planFile: string | null) {
   const document = (path: string | null) => path === null
     ? { path: null, contentDigest: null }
@@ -1359,11 +1389,13 @@ describe("orchestration CLI", () => {
       file: "src/x.ts", line: 1, claim: "current packet must finish before this finding is adjudicated",
     };
     const graph = {
+      spec_trace_version: 2,
       current_phase: "execute", current_wave: 1, phase_artifacts: {}, skipped_phases: [],
-      spec_file: null, plan_file: null, wave_gates: {},
+      spec_file: canonicalSpec(root), plan_file: null, wave_gates: {},
       tasks: [{
         id: "T10", description: "review target", agent: "code-implementer-agent", wave: 1,
         status: "implemented", proof, depends_on: [], file_list: ["src/x.ts"], files_modified: ["src/x.ts"],
+        spec_anchors: ["FR-001", "AS-001"], spec_contributions: [],
         test_result: { verdict: "trusted-pass" }, test_evidence: "passed", new_tests_written: true,
         new_test_evidence: "present", review_status: "blocked", review_generation: 0,
         findings: [finding], critical_findings: [finding.claim], advisory_findings: [],
@@ -1380,7 +1412,7 @@ describe("orchestration CLI", () => {
     ], JSON.stringify({ wave: 1 }), root);
     expect(started.status, started.stderr).toBe(0);
     const initial = JSON.parse(started.stdout) as { kind: string; requests: readonly { authority: AgentRequestAuthority }[] };
-    expect(initial.kind).toBe("spawn-batch");
+    expect(initial.kind, started.stdout).toBe("spawn-batch");
     const opened = openRunDirectory(runsRoot, runDir);
     if (!opened.ok) throw new Error(opened.error.message);
     for (const { authority } of initial.requests) {
@@ -1557,10 +1589,12 @@ describe("orchestration CLI", () => {
     };
     const statePath = join(root, ".claude", "state", "active_task_graph.json");
     writeFileSync(statePath, JSON.stringify({
+      spec_trace_version: 2,
       current_phase: "execute", current_wave: 1, phase_artifacts: {}, skipped_phases: [],
-      spec_file: null, plan_file: modelFreePlan(root), wave_gates: {}, tasks: [{
+      spec_file: canonicalSpec(root), plan_file: modelFreePlan(root), wave_gates: {}, tasks: [{
         id: "T1", description: "review target", agent: "code-implementer-agent", wave: 1,
         status: "implemented", proof, depends_on: [], file_list: ["src/x.ts"], files_modified: ["src/x.ts"],
+        spec_anchors: ["FR-001", "AS-001"], spec_contributions: [],
         test_result: { verdict: "trusted-pass" }, test_evidence: "passed", new_tests_written: true,
         new_test_evidence: "present", review_status: "pending", review_generation: 0,
         findings: [finding], critical_findings: [finding.claim], advisory_findings: [],
@@ -1573,7 +1607,7 @@ describe("orchestration CLI", () => {
     const started = runCli(["start", "wave-gate", "--runs-root", runsRoot, "--run", runDir], JSON.stringify({ wave: 1 }), root);
     expect(started.status, started.stderr).toBe(0);
     const initial = JSON.parse(started.stdout) as { kind: string; requests: readonly { authority: AgentRequestAuthority }[] };
-    expect(initial.kind).toBe("spawn-batch");
+    expect(initial.kind, started.stdout).toBe("spawn-batch");
     expect(initial.requests.some(({ authority }) => authority.role === "spec-check-invoker" && authority.attempt === 1)).toBe(true);
     const opened = openRunDirectory(runsRoot, runDir);
     if (!opened.ok) throw new Error(opened.error.message);

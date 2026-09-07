@@ -17,10 +17,10 @@ export type SpecEntryId<F extends SpecFamily = SpecFamily> = string & { readonly
 export type SpecContentHash = string & { readonly [SPEC_CONTENT_HASH]: true };
 
 /**
- * Phantom witness that the carrier's `contentHash` was derived from the
- * carrier's own content. It has no runtime representation; its only job is to
- * make the smart constructors below the sole origin of an entry, so an entry
- * whose hash disagrees with its content is unrepresentable outside this module.
+ * Phantom constructor-origin witness. It has no runtime representation and is
+ * not forgery-proof: structural spreading can preserve the static brand while
+ * replacing content. Parser-minted entries still derive their hash in one smart
+ * constructor, and runtime property tests enforce that construction contract.
  */
 type HashedByConstruction = Readonly<{ [HASHED_BY_CONSTRUCTION]: true }>;
 

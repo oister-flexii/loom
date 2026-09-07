@@ -18,7 +18,7 @@ import {
   reconcileSpecCheck,
   type SpecCheckManualOverride,
 } from "../../core/spec-check";
-import { unprojectedFloor } from "../../core/requirement-coverage";
+import { manualOverrideFloor } from "../../core/requirement-coverage";
 import { reconcileWaveBlock } from "../../core/wave-gate-model";
 import { StateManager } from "../../state-manager";
 
@@ -65,15 +65,12 @@ export async function runStoreSpecCheck(
     }
 
     const wave = parsed.wave ?? state.current_wave ?? 1;
-    // The documented operator override, and the fourth settlement path a
-    // hand-maintained list of three did not name. It writes spec_check and the
-    // wave block exactly as the three floored paths do, so it must state its
-    // floor rather than inherit one by omission. It is deliberately
-    // `unprojected`: the operator supplies the transcript on stdin, there is no
-    // packet and no Agent that was shown a projection, and the override exists
-    // precisely to correct a structural verdict a human judged wrong.
-    const resolution = reconcileSpecCheck(parsed, wave, runAt,
-      unprojectedFloor("manual store-spec-check override: no packet, and the operator is overriding structural verdicts"));
+    // Manual authority is distinct from an unprojected registered capture.
+    // The latter fails closed because absence of projection evidence cannot
+    // pass; this arm exists only after `decideSpecCheckManualOverride` proved
+    // the separately authorized operator path.
+    const reason = override.reason ?? "legacy manual store-spec-check override";
+    const resolution = reconcileSpecCheck(parsed, wave, runAt, manualOverrideFloor(reason));
     if (resolution.kind === "evidence-failed") {
       return {
         state,

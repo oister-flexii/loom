@@ -1,6 +1,7 @@
 /**
  * Requirement Coverage Projection — the pure join of one Spec Index against the
- * frozen current-Wave Task roster.
+ * whole protected Task roster: rows describe the current Wave, while unclaimed
+ * completion lists consider every Wave.
  *
  * Every verdict here is decided by structure alone: an identifier is in the
  * Spec Index or it is not, a Task declared artifacts or it did not, a recorded
@@ -97,15 +98,19 @@ export type CoverageRow = Readonly<{
 export type SpecIndexUnavailable =
   | Readonly<{ kind: "no-spec-file" }>
   | Readonly<{ kind: "unreadable"; path: string; reason: string }>
-  | Readonly<{ kind: "unparsed"; path: string; errors: NonEmpty<SpecParseError> }>;
+  | Readonly<{
+      kind: "unparsed";
+      path: string;
+      /** Digest of the exact bytes whose parse produced `errors`. */
+      contentDigest: string;
+      errors: NonEmpty<SpecParseError>;
+    }>;
 
 /**
- * A Spec Index observation: the projection of the exact observed bytes, and the
- * digest of those same bytes.
- *
- * The digest rides inside the variant so the "one read" claim is checkable
- * rather than asserted: a caller can prove the index came from the document
- * whose digest it is publishing, instead of proving only that the paths agree.
+ * A Spec Index observation. Every bytes-backed outcome carries the digest of
+ * the exact bytes parsed; digest-less variants mean no bytes were observed.
+ * The path is caller-supplied document identity and is proved against protected
+ * authority by the Wave observation consumer.
  */
 export type SpecIndexAvailability =
   | Readonly<{ kind: "indexed"; path: string; contentDigest: string; index: ParsedSpec }>
@@ -253,7 +258,8 @@ export function projectRequirementCoverage(
   return Object.freeze({
     kind: "projected",
     rows: Object.freeze(rows),
-    tracesByContribution: tasks.some((task) => task.inCurrentWave && task.contributions.length > 0),
+    tracesByContribution: tasks.some((task) => task.inCurrentWave && task.contributions.some((claim) =>
+      byId.get(claim)?.family === "completable")),
     unclaimed: unclaimedOf(specIndex.index.frs),
     unclaimedScenarios: unclaimedOf(specIndex.index.scenarios),
     exclusions: specIndex.index.oos,
@@ -314,6 +320,9 @@ export function claimSeverity(verdict: ClaimVerdict): ClaimSeverity {
     .exhaustive();
 }
 
+declare const SETTLED_CRITICAL_COUNT: unique symbol;
+export type SettledCriticalCount = number & { readonly [SETTLED_CRITICAL_COUNT]: true };
+
 /**
  * The exact number of CRITICAL findings the projection settles, and therefore
  * the floor the spec-check Agent's own report may not go under.
@@ -322,8 +331,8 @@ export function claimSeverity(verdict: ClaimVerdict): ClaimSeverity {
  * every Requirement and Acceptance Scenario nobody claims. Derived here so the
  * engine and the Agent are counting the same thing.
  */
-export function settledCriticalCount(coverage: RequirementCoverage): number {
-  if (coverage.kind === "unavailable") return 0;
+export function settledCriticalCount(coverage: RequirementCoverage): SettledCriticalCount {
+  if (coverage.kind === "unavailable") return 0 as SettledCriticalCount;
   // By DECIDER, not by severity. Severity says how bad a structural fact is;
   // the decider says who owes the verdict. Counting by severity swept in
   // `agent`-decided rows — an altered recorded hash grades CRITICAL, yet the
@@ -338,7 +347,8 @@ export function settledCriticalCount(coverage: RequirementCoverage): number {
   // is a legitimate shape in this domain — it renders as such and must NOT be
   // floored, or the Agent would have to substantiate a finding that is false.
   const syntheticCritical = coverage.rows.length === 0 && !coverage.tracesByContribution ? 1 : 0;
-  return engineCriticals + syntheticCritical + coverage.unclaimed.length + coverage.unclaimedScenarios.length;
+  return (engineCriticals + syntheticCritical + coverage.unclaimed.length +
+    coverage.unclaimedScenarios.length) as SettledCriticalCount;
 }
 
 /**
@@ -356,8 +366,16 @@ export function settledCriticalCount(coverage: RequirementCoverage): number {
  * WHY, so the absence is stated rather than inferred from a missing argument.
  */
 export type SettledFloor =
-  | Readonly<{ kind: "settled"; count: number }>
+  | Readonly<{ kind: "settled"; count: SettledCriticalCount }>
   | Readonly<{ kind: "unprojected"; reason: string }>;
+
+/**
+ * Settlement authority accepted only from the separately authorized manual
+ * helper. It is deliberately not a `SettledFloor`, so it cannot be persisted on
+ * a Wave epoch and then used to bypass registered projection enforcement.
+ */
+export type ManualOverrideFloor = Readonly<{ kind: "manual-override"; reason: string }>;
+export type SpecCheckFloorAuthority = SettledFloor | ManualOverrideFloor;
 
 /** The only mint for a settled floor: a coverage projection decides it. */
 export function settledFloorOf(coverage: RequirementCoverage): SettledFloor {
@@ -367,15 +385,18 @@ export function settledFloorOf(coverage: RequirementCoverage): SettledFloor {
 }
 
 /**
- * The floor for a capture that was never packet-correlated.
- *
- * A legacy or unregistered capture ran with no `LOOM_CONTEXT_PATH`, so the
- * Agent was on the Unprojected path and saw no settled count. Flooring it
- * against a number derived from the live graph failed honest reports against
- * evidence they were never shown.
+ * The stated absence of projection authority for a registered or legacy
+ * capture. `reconcileSpecCheck` fails this arm closed and persists the reason;
+ * only `manualOverrideFloor` can authorize settlement without a numeric floor.
  */
 export function unprojectedFloor(reason: string): SettledFloor {
   return Object.freeze({ kind: "unprojected", reason });
+}
+
+/** Mint authority for the already-approved manual helper path only. */
+export function manualOverrideFloor(reason: string): ManualOverrideFloor {
+  if (reason.trim() === "") throw new Error("manual override floor requires a non-empty reason");
+  return Object.freeze({ kind: "manual-override", reason });
 }
 
 /**
@@ -388,7 +409,7 @@ export function unprojectedFloor(reason: string): SettledFloor {
 const FLOOR_VARIANTS: Readonly<Record<SettledFloor["kind"], (record: Record<string, unknown>) => SettledFloor | null>> =
   Object.freeze({
     settled: (record) => typeof record.count === "number" && Number.isInteger(record.count) && record.count >= 0
-      ? Object.freeze({ kind: "settled" as const, count: record.count })
+      ? Object.freeze({ kind: "settled" as const, count: record.count as SettledCriticalCount })
       : null,
     unprojected: (record) => typeof record.reason === "string" && record.reason.trim() !== ""
       ? Object.freeze({ kind: "unprojected" as const, reason: record.reason })
@@ -584,7 +605,8 @@ export function specIndexPath(availability: SpecIndexAvailability): string | nul
     .exhaustive();
 }
 
-/** The digest of the bytes an available index was parsed from; `null` otherwise. */
+/** The digest of every bytes-backed parse outcome; `null` when no bytes were observed. */
 export function specIndexDigest(availability: SpecIndexAvailability): string | null {
-  return availability.kind === "indexed" ? availability.contentDigest : null;
+  if (availability.kind === "indexed") return availability.contentDigest;
+  return availability.reason.kind === "unparsed" ? availability.reason.contentDigest : null;
 }

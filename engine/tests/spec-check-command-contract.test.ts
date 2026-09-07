@@ -80,7 +80,10 @@ const unavailable = () => {
   const parsed = parseSpec("# not a specification");
   if (parsed.ok) throw new Error("fixture must fail to parse");
   return projectRequirementCoverage(
-    { kind: "unavailable", reason: { kind: "unparsed", path: "spec.md", errors: parsed.errors } },
+    {
+      kind: "unavailable",
+      reason: { kind: "unparsed", path: "spec.md", contentDigest: "b".repeat(64), errors: parsed.errors },
+    },
     [task()],
   );
 };
@@ -153,9 +156,10 @@ describe("commands/spec-check.md is bound to the projection it consumes", () => 
     }
   });
 
-  it("states the settled floor the engine actually enforces", () => {
+  it("states the settled floor and fail-closed Unprojected policy the engine enforces", () => {
     const rendered = renderRequirementCoverage(everyVerdict());
     expect(rendered).toContain("Your report may not fall below this count");
     expect(command).toContain("may never fall below the projection's stated settled floor");
+    expect(command).toContain("unprojected run is an absence of structural evidence, never a pass");
   });
 });

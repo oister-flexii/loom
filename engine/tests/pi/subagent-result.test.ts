@@ -1,4 +1,8 @@
-import type { SettledFloor } from "../../src/core/requirement-coverage";
+import {
+  parseSettledFloor,
+  unprojectedFloor,
+  type SettledFloor,
+} from "../../src/core/requirement-coverage";
 import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -61,6 +65,12 @@ const WAVE_RUN_ID = parsedWaveRunId.value;
 const WAVE_AUTHORITY_DIGEST = parsedWaveAuthorityDigest.value;
 const WAVE_BATCH_EPOCH = parsedWaveBatchEpoch.value;
 
+function settledFloor(count: number): SettledFloor {
+  const parsed = parseSettledFloor({ kind: "settled", count });
+  if (parsed === null) throw new Error("fixture settled floor must parse");
+  return parsed;
+}
+
 function graph(overrides: Partial<TaskGraph> = {}): TaskGraph {
   return {
     current_phase: "execute",
@@ -95,7 +105,7 @@ function parsedGraph(graph: TaskGraph): ParsedTaskGraph {
 
 function graphWithSpecCheckAuthority(
   wave = 1,
-  settledSpecCheckFloor: SettledFloor | null = null,
+  settledSpecCheckFloor: SettledFloor | null = settledFloor(0),
 ) {
   const state = parsedGraph(graph({
     current_wave: wave,
@@ -1087,6 +1097,23 @@ describe("applySpecCheckPiResult", () => {
     expect(store.current().wave_gates["1"]?.blocked ?? false).toBe(false);
   });
 
+  it("fails closed when the epoch records an unavailable projection", async () => {
+    const fixture = graphWithSpecCheckAuthority(1, unprojectedFloor("specification did not parse"));
+    const store = fakeStore(fixture.state);
+    await applySpecCheckPiResult({
+      store,
+      result: result({ agent: "spec-check-invoker", messages: assistantText(specCheckText(0)) }),
+      reservedSlot: fixture.reservedSlot,
+      now: NOW,
+    });
+
+    expect(store.current().spec_check).toMatchObject({
+      verdict: "EVIDENCE_CAPTURE_FAILED",
+      cause: "projection-unavailable",
+      error: expect.stringContaining("specification did not parse"),
+    });
+  });
+
   it.each([
     ["malformed messages", [{ role: 42 }]],
     ["count-mismatched evidence", assistantText([
@@ -1217,7 +1244,7 @@ describe("applySpecCheckPiResult", () => {
     // The gap this closes: every Pi fixture used an epoch with no recorded
     // floor, so the transport's enforcement was never once exercised - the
     // suite would have stayed green with the floor argument removed entirely.
-    const fixture = graphWithSpecCheckAuthority(1, { kind: "settled", count: 2 });
+    const fixture = graphWithSpecCheckAuthority(1, settledFloor(2));
     const store = fakeStore(fixture.state);
     await applySpecCheckPiResult({
       store,
@@ -1235,7 +1262,7 @@ describe("applySpecCheckPiResult", () => {
   });
 
   it("accepts a Pi report that meets the floor its epoch recorded", async () => {
-    const fixture = graphWithSpecCheckAuthority(1, { kind: "settled", count: 1 });
+    const fixture = graphWithSpecCheckAuthority(1, settledFloor(1));
     const store = fakeStore(fixture.state);
     await applySpecCheckPiResult({
       store,

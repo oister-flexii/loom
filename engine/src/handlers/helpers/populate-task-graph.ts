@@ -473,53 +473,51 @@ const handler: HookHandler = async (stdin, args) => {
     );
   }
 
-  const populate = async (): Promise<void> => mgr.update((existing) => {
-    // Re-check the guard INSIDE the locked transform. The check above ran on a
-    // snapshot loaded before the lock, and this callback receives a freshly
-    // reloaded graph — so a task that left "pending" in between (an agent
-    // starting, a wave completing) had its real status silently overwritten by
-    // the unconditional `tasks:` assignment below. The pre-lock check stays: it
-    // gives the operator the clean CLI error in the common case; this one makes
-    // the overwrite impossible in the racing case.
-    if (!force && existing.tasks.some((t) => t.status !== "pending")) {
-      throw new Error(
-        "Cannot overwrite task graph with non-pending tasks: a task left \"pending\" while this " +
-        "population was being prepared. Use --force to override.",
-      );
-    }
-    // The prepared Spec Index was read from the spec file this same precedence
-    // named before the lock. If the locked graph now names a different one, the
-    // prepared hashes describe another document — refuse rather than stamp
-    // Requirement text that was never at these identifiers.
-    const lockedSpecFile = resolvedSpecFile(existing.spec_file, decompose.spec_file);
-    if (lockedSpecFile !== observedSpecFile) {
-      throw new Error(
-        `spec_file changed from ${observedSpecFile ?? "none"} to ${lockedSpecFile ?? "none"} while this ` +
-        "population was being prepared; re-run populate-task-graph.",
-      );
-    }
-    const { active_wave_completion_suite: staleCompletionSuite, ...existingWithoutCompletionSuite } = existing;
-    void staleCompletionSuite;
-    const merged: TaskGraph = {
-      ...existingWithoutCompletionSuite,
-      spec_trace_version: 2,
-      plan_title: decompose.plan_title,
-      plan_file: validatedPlanFile,
-      spec_file: lockedSpecFile,
-      tasks: decompose.tasks.map((task) => sanitizeDecomposedTask(task, specIndex)),
-      current_wave: 1,
-      executing_tasks: [],
-      wave_gates: buildWaveGates(waves),
-      verification_manifest: preparedManifest.value,
-      ...(issue === undefined ? {} : { github_issue: issue }),
-      ...(repo === undefined ? {} : { github_repo: repo }),
-    };
-
-    return merged;
-  });
-
   try {
-    await populate();
+    await mgr.update((existing) => {
+      // Re-check the guard INSIDE the locked transform. The check above ran on a
+      // snapshot loaded before the lock, and this callback receives a freshly
+      // reloaded graph — so a task that left "pending" in between (an agent
+      // starting, a wave completing) had its real status silently overwritten by
+      // the unconditional `tasks:` assignment below. The pre-lock check stays: it
+      // gives the operator the clean CLI error in the common case; this one makes
+      // the overwrite impossible in the racing case.
+      if (!force && existing.tasks.some((t) => t.status !== "pending")) {
+        throw new Error(
+          "Cannot overwrite task graph with non-pending tasks: a task left \"pending\" while this " +
+          "population was being prepared. Use --force to override.",
+        );
+      }
+      // The prepared Spec Index was read from the spec file this same precedence
+      // named before the lock. If the locked graph now names a different one, the
+      // prepared hashes describe another document — refuse rather than stamp
+      // Requirement text that was never at these identifiers.
+      const lockedSpecFile = resolvedSpecFile(existing.spec_file, decompose.spec_file);
+      if (lockedSpecFile !== observedSpecFile) {
+        throw new Error(
+          `spec_file changed from ${observedSpecFile ?? "none"} to ${lockedSpecFile ?? "none"} while this ` +
+          "population was being prepared; re-run populate-task-graph.",
+        );
+      }
+      const { active_wave_completion_suite: staleCompletionSuite, ...existingWithoutCompletionSuite } = existing;
+      void staleCompletionSuite;
+      const merged: TaskGraph = {
+        ...existingWithoutCompletionSuite,
+        spec_trace_version: 2,
+        plan_title: decompose.plan_title,
+        plan_file: validatedPlanFile,
+        spec_file: lockedSpecFile,
+        tasks: decompose.tasks.map((task) => sanitizeDecomposedTask(task, specIndex)),
+        current_wave: 1,
+        executing_tasks: [],
+        wave_gates: buildWaveGates(waves),
+        verification_manifest: preparedManifest.value,
+        ...(issue === undefined ? {} : { github_issue: issue }),
+        ...(repo === undefined ? {} : { github_repo: repo }),
+      };
+
+      return merged;
+    });
   } catch (error) {
     // The locked re-check refuses by throwing (the only way out of a transform);
     // surface it as the same clean CLI error the pre-lock check produces rather

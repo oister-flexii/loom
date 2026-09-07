@@ -35,7 +35,7 @@ import {
   readWaveReviewContext,
   waveSpecCheckDocumentsMatch,
   waveSpecCheckScope,
-  isExactEpochReplay,
+  decideWaveReviewEpochReplay,
   epochSettledFloor,
   type WaveRequestBatch,
   type WaveReviewContextAuthority,
@@ -736,18 +736,18 @@ export async function installWaveReviewRuns(
       throw new Error("Wave review packet context changed before the batch could be installed");
     }
     const existingEpoch = locked.wave_review_epoch;
-    const exactEpochReplay = isExactEpochReplay(
+    const replay = decideWaveReviewEpochReplay(
       existingEpoch, batch, specCheckAuthority.runId, wave, specCheckAuthority.slotId);
-    if (existingEpoch !== undefined && !exactEpochReplay && locked.tasks.some((task) =>
+    if (existingEpoch !== undefined && replay.kind === "different" && locked.tasks.some((task) =>
       registration.taskIds.includes(task.id) && task.review_run !== undefined)) {
       throw new Error("Wave review batch differs from the exact installed Wave review epoch");
     }
     return {
       ...locked,
-      // A first installation invalidates older Wave evidence. An exact replay
-      // is idempotent and must retain spec-check evidence captured meanwhile.
-      spec_check: exactEpochReplay ? locked.spec_check : undefined,
-      wave_review_epoch: exactEpochReplay ? existingEpoch : {
+      // Exact replay retains captured spec-check evidence. A historical
+      // floorless epoch is upgraded under this lock and requires fresh capture.
+      spec_check: replay.kind === "exact" ? locked.spec_check : undefined,
+      wave_review_epoch: replay.kind === "exact" ? existingEpoch : {
         runId: specCheckAuthority.runId,
         wave,
         batchEpoch: batch.batchEpoch,
@@ -1425,12 +1425,9 @@ export async function applyWaveFacadeSubmission(
           const expected = `${locked.current_wave}/${locked.active_wave_gate?.runId ?? "none"}/${locked.active_wave_gate?.authorityDigest ?? "none"}/${epoch?.runId ?? "none"}/${epoch?.wave ?? "none"}/${(epoch?.batchEpoch ?? "none").slice(0, 12)}`;
           throw new Error(`Wave spec-check request ${authority.requestId} does not belong to the exact current review epoch (expected current_wave/runId/digest/epoch-runId/epoch-wave/epoch-batch: ${expected}; request wave ${wave}, digest ${context.authorityDigest}, runId ${authority.runId}, batch ${batchEpoch.slice(0, 12)})`);
         }
-        // Floored inside the lock against the locked graph, through the same
-        // `reconcileSpecCheck` every other harness calls. Resolving before the
-        // lock left this path unfloored, and the resume loop re-applies a
-        // capture exactly when spec_check.verdict is EVIDENCE_CAPTURE_FAILED —
-        // which is what a floor violation writes — so an unfloored facade
-        // silently overwrote the refusal the hook had just recorded.
+        // Reconciled under the lock through the same function every transport
+        // calls, using the floor recorded on the epoch from the exact packet.
+        // Nothing re-projects mutable graph inputs at capture time.
         const resolution = reconcileSpecCheck(parsed, wave, new Date().toISOString(),
           epochSettledFloor(locked.wave_review_epoch));
         return {

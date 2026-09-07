@@ -285,6 +285,34 @@ describe("taskFindingsError slot_authority validation", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Requirement Content Hash authority
+// ---------------------------------------------------------------------------
+
+describe("parseTaskGraph spec_anchor_hashes load boundary", () => {
+  it("round-trips a record of strings", () => {
+    const parsed = parseTaskGraph(graph({
+      tasks: [{ ...validTask, spec_anchor_hashes: { "FR-001": DIGEST("a") } }],
+    }));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.tasks[0]?.spec_anchor_hashes).toEqual({ "FR-001": DIGEST("a") });
+    expect(Object.isFrozen(parsed.value.tasks[0]?.spec_anchor_hashes)).toBe(true);
+  });
+
+  it.each([42, null, true, {}, []])("refuses non-string hash value %j", (value) => {
+    expect(errorOf(graph({
+      tasks: [{ ...validTask, spec_anchor_hashes: { "FR-001": value } }],
+    }))).toContain('tasks[0].spec_anchor_hashes["FR-001"] must be a string');
+  });
+
+  it.each([null, [], "hash"])("refuses non-record spec_anchor_hashes %j", (value) => {
+    expect(errorOf(graph({
+      tasks: [{ ...validTask, spec_anchor_hashes: value }],
+    }))).toContain("spec_anchor_hashes must be a record of strings");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Wave review epoch authority
 // ---------------------------------------------------------------------------
 
@@ -501,6 +529,9 @@ describe("parseTaskGraph wave_review_epoch authority", () => {
     // unfloor a live epoch, which is the exact failure recording it prevents.
     ["forged settled floor", waveReviewEpoch({ settledSpecCheckFloor: "forged" })],
     ["unknown floor variant", waveReviewEpoch({ settledSpecCheckFloor: { kind: "waived" } })],
+    ["manual override floor", waveReviewEpoch({
+      settledSpecCheckFloor: { kind: "manual-override", reason: "operator" },
+    })],
     ["settled floor with no count", waveReviewEpoch({ settledSpecCheckFloor: { kind: "settled" } })],
     ["negative settled floor", waveReviewEpoch({ settledSpecCheckFloor: { kind: "settled", count: -1 } })],
     ["non-integer settled floor", waveReviewEpoch({ settledSpecCheckFloor: { kind: "settled", count: 1.5 } })],

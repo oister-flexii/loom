@@ -103,7 +103,7 @@ const rowsOf = (tasks: readonly CoverageTask[], availability: SpecIndexAvailabil
 const unparsedReason = () => {
   const unparsed = parseSpec("# not a specification");
   if (unparsed.ok) throw new Error("fixture must fail to parse");
-  return { kind: "unparsed", path: "spec.md", errors: unparsed.errors } as const;
+  return { kind: "unparsed", path: "spec.md", contentDigest: DIGEST, errors: unparsed.errors } as const;
 };
 
 describe("projectRequirementCoverage", () => {
@@ -232,14 +232,15 @@ describe("settled floor", () => {
     expect(reconcileSpecCheck(report(9), 1, RUN_AT, floor).kind).toBe("captured");
   });
 
-  it("imposes no floor when no projection was possible", () => {
+  it("fails settlement closed when no projection was possible", () => {
     const unavailable = projectRequirementCoverage(
       { kind: "unavailable", reason: unparsedReason() },
       [task()],
     );
     expect(settledCriticalCount(unavailable)).toBe(0);
     expect(settledFloorOf(unavailable).kind).toBe("unprojected");
-    expect(reconcileSpecCheck(report(0), 1, RUN_AT, settledFloorOf(unavailable)).kind).toBe("captured");
+    expect(reconcileSpecCheck(report(0), 1, RUN_AT, settledFloorOf(unavailable)))
+      .toMatchObject({ kind: "evidence-failed", specCheck: { cause: "projection-unavailable" } });
   });
 });
 
@@ -370,7 +371,9 @@ describe("Spec Index observation accessors", () => {
     // The wave-gate guard compares this against the protected spec_file, so a
     // failed parse or read must still name the document it failed on — a `null`
     // here would let a mismatched observation pass the guard.
-    expect(specIndexPath({ kind: "unavailable", reason: unparsedReason() })).toBe("spec.md");
+    const unparsed = { kind: "unavailable" as const, reason: unparsedReason() };
+    expect(specIndexPath(unparsed)).toBe("spec.md");
+    expect(specIndexDigest(unparsed)).toBe(DIGEST);
     expect(specIndexPath({
       kind: "unavailable",
       reason: { kind: "unreadable", path: "s.md", reason: "ENOENT" },
@@ -466,11 +469,7 @@ describe("round-2 regressions", () => {
     expect(String((failed.specCheck as { error?: string }).error)).toContain("settled 1");
   });
 
-  it("does not floor a Wave that traces only through Requirement Contributions", () => {
-    // CONTEXT.md defines a Contribution as work that advances a Requirement
-    // without asserting its completion, so a Wave carrying only Contributions
-    // is a legitimate foundation Wave. Counting the synthetic row for it forced
-    // the Agent to emit a CRITICAL it could not substantiate and could not fix.
+  it("does not floor a Wave that traces through a completable Requirement Contribution", () => {
     const coverage = projectRequirementCoverage(indexed, [
       task({ id: "W1", inCurrentWave: false, completionAnchors: ["FR-001", "FR-002", "AS-001", "AS-002"] }),
       task({ id: "W2", inCurrentWave: true, completionAnchors: [], contributions: ["FR-001"] }),
@@ -481,7 +480,19 @@ describe("round-2 regressions", () => {
     expect(rendered).toContain("legitimate foundation Wave");
     expect(rendered).not.toContain("| engine | CRITICAL |");
     expect(rendered).toContain("Settled CRITICAL findings: 0.");
-    // And an honest zero-CRITICAL report is accepted, which is the whole point.
     expect(reconcileSpecCheck(report(0), 1, RUN_AT, settledFloorOf(coverage)).kind).toBe("captured");
   });
+
+  it.each(["FR-404", "OOS-001"])(
+    "does not let non-completable Contribution %s suppress the no-trace CRITICAL",
+    (contribution) => {
+      const coverage = projectRequirementCoverage(indexed, [
+        task({ id: "W1", inCurrentWave: false, completionAnchors: ["FR-001", "FR-002", "AS-001", "AS-002"] }),
+        task({ id: "W2", inCurrentWave: true, completionAnchors: [], contributions: [contribution] }),
+      ]);
+      expect(coverage.kind === "projected" && coverage.tracesByContribution).toBe(false);
+      expect(settledCriticalCount(coverage)).toBe(1);
+      expect(renderRequirementCoverage(coverage)).toContain("no work in this Wave traces to a Requirement");
+    },
+  );
 });

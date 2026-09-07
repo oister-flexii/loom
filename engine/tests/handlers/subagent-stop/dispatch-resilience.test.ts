@@ -216,6 +216,7 @@ describe("request-bound capture gates legacy dispatch", () => {
         plan: { path: state.plan_file, contentDigest: null },
       },
       specCheckSlotAuthority: { slot_id: request.slotId, attempted: request.attempt },
+      settledSpecCheckFloor: { kind: "settled", count: 0 },
     };
     writeFileSync(statePath, JSON.stringify(state));
 

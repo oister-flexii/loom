@@ -7,10 +7,17 @@ import type { WaveSpecCheckDocumentAuthority } from "../types";
 
 export type { WaveSpecCheckObservation } from "../core/wave-review-authority";
 
-type ObservedDocument = Readonly<{
-  authority: WaveSpecCheckDocumentAuthority;
-  bytes: Buffer | null;
-}>;
+type ObservedDocument =
+  | Readonly<{
+      kind: "absent";
+      authority: Readonly<{ path: null; contentDigest: null }>;
+      bytes: null;
+    }>
+  | Readonly<{
+      kind: "observed";
+      authority: Extract<WaveSpecCheckDocumentAuthority, Readonly<{ path: string }>>;
+      bytes: Buffer;
+    }>;
 
 /**
  * Gate-time read policy: a recorded document that cannot be read is a refusal,
@@ -18,7 +25,13 @@ type ObservedDocument = Readonly<{
  * `unreadable` outcome on this path — the observation throws instead.
  */
 function observeDocument(path: string | null): ObservedDocument {
-  if (path === null) return Object.freeze({ authority: Object.freeze({ path: null, contentDigest: null }), bytes: null });
+  if (path === null) {
+    return Object.freeze({
+      kind: "absent",
+      authority: Object.freeze({ path: null, contentDigest: null }),
+      bytes: null,
+    });
+  }
   let bytes: Buffer;
   try {
     bytes = readFileSync(path);
@@ -30,12 +43,16 @@ function observeDocument(path: string | null): ObservedDocument {
   }
   const digest = parseArtifactDigest(createHash("sha256").update(bytes).digest("hex"));
   if (!digest.ok) throw new Error(digest.error.message);
-  return Object.freeze({ authority: Object.freeze({ path, contentDigest: digest.value }), bytes });
+  return Object.freeze({
+    kind: "observed",
+    authority: Object.freeze({ path, contentDigest: digest.value }),
+    bytes,
+  });
 }
 
 /** Project the observed spec bytes, never a second read of the same path. */
 function indexOf(spec: ObservedDocument): SpecIndexAvailability {
-  return spec.authority.path === null || spec.bytes === null
+  return spec.kind === "absent"
     ? Object.freeze({ kind: "unavailable", reason: Object.freeze({ kind: "no-spec-file" }) })
     : projectSpecBytes(spec.authority.path, spec.bytes);
 }

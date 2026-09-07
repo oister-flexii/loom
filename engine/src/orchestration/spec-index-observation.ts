@@ -20,9 +20,9 @@ import { parseSpec } from "../core/parse-spec";
 /**
  * The one bytes-to-availability projection, shared by both observers.
  *
- * The digest is taken from the very bytes that were parsed, so an `indexed`
- * result cannot name a document it was not derived from — the property both
- * observers' callers rely on and neither should re-establish for itself.
+ * The digest and parse outcome come from the exact supplied bytes. `path` is
+ * caller-provided document identity; the Wave observer couples it to its
+ * authority and the consumer proves that pair against protected state.
  */
 export function projectSpecBytes(path: string, bytes: Buffer): SpecIndexAvailability {
   const parsed = parseSpec(bytes.toString("utf8"));
@@ -31,7 +31,7 @@ export function projectSpecBytes(path: string, bytes: Buffer): SpecIndexAvailabi
     ? Object.freeze({ kind: "indexed", path, contentDigest, index: parsed.value })
     : Object.freeze({
         kind: "unavailable",
-        reason: Object.freeze({ kind: "unparsed", path, errors: parsed.errors }),
+        reason: Object.freeze({ kind: "unparsed", path, contentDigest, errors: parsed.errors }),
       });
 }
 

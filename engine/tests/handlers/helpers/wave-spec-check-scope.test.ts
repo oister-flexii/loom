@@ -16,8 +16,12 @@ import { parseTaskGraph, StateManager } from "../../../src/state-manager";
 import type { AgentRequestAuthority } from "../../../src/core/orchestration-contract";
 import { taskFixture } from "../../fixtures/task-lifecycle";
 import { WAVE_REVIEW_AGENTS } from "../../../src/core/model-profiles";
-import { isExactEpochReplay, prepareWaveReviewBatch, type WaveRequestBatch } from "../../../src/core/wave-review-authority";
-import type { SettledFloor } from "../../../src/core/requirement-coverage";
+import {
+  decideWaveReviewEpochReplay,
+  prepareWaveReviewBatch,
+  type WaveRequestBatch,
+} from "../../../src/core/wave-review-authority";
+import { parseSettledFloor, type SettledFloor } from "../../../src/core/requirement-coverage";
 import type { WaveReviewEpochAuthority } from "../../../src/types";
 import { observeWaveSpecCheckDocuments } from "../../../src/orchestration/wave-spec-check-documents";
 import { projectSpecBytes } from "../../../src/orchestration/spec-index-observation";
@@ -291,6 +295,18 @@ describe("registered Wave spec-check scope", () => {
     expect(manager.load().spec_check).toEqual(acceptedSpecCheck);
     expect(manager.load().wave_review_epoch?.specCheckSlotAuthority?.attempted).toBe(2);
 
+    await manager.update((locked) => {
+      const { settledSpecCheckFloor: historicalFloor, ...floorlessEpoch } = locked.wave_review_epoch!;
+      void historicalFloor;
+      return { ...locked, spec_check: acceptedSpecCheck, wave_review_epoch: floorlessEpoch };
+    });
+    await installWaveReviewRuns(manager, registration, batch);
+    const upgraded = manager.load();
+    expect(upgraded.spec_check).toBeUndefined();
+    expect(upgraded.wave_review_epoch?.settledSpecCheckFloor).toEqual(batch.settledFloor);
+    expect(upgraded.wave_review_epoch?.specCheckSlotAuthority?.attempted).toBe(1);
+    expect(upgraded.tasks[0]?.review_run?.packet_id).toBe(batch.taskRuns[0]?.packetId);
+
     const conflictingGraph = parseTaskGraph({
       ...parsed.value,
       tasks: parsed.value.tasks.map((task) => ({ ...task, review_generation: (task.review_generation ?? 0) + 1 })),
@@ -300,7 +316,7 @@ describe("registered Wave spec-check scope", () => {
     expect(conflictingBatch.batchEpoch).not.toBe(batch.batchEpoch);
     await expect(installWaveReviewRuns(manager, registration, conflictingBatch))
       .rejects.toThrow("packet context changed");
-    expect(manager.load().spec_check).toEqual(acceptedSpecCheck);
+    expect(manager.load().spec_check).toBeUndefined();
     expect(manager.load().wave_review_epoch?.batchEpoch).toBe(batch.batchEpoch);
   });
 
@@ -724,6 +740,20 @@ describe("Wave spec-check authority guards", () => {
     if (!prepared.ok) expect(prepared.error.message).toContain("parsed from bytes other than");
   });
 
+  it("refuses an unparsed result derived from different bytes at the same path", () => {
+    const specFile = specFileIn(spec);
+    const honest = observeWaveSpecCheckDocuments(specFile, null);
+    const mismatched = Object.freeze({
+      authority: honest.authority,
+      specIndex: projectSpecBytes(specFile, Buffer.from("# not a canonical specification", "utf8")),
+    });
+    const prepared = prepareWaveReviewBatch(
+      runId(), registration, graphWith(specFile), 1, workspace, mismatched,
+    );
+    expect(prepared.ok).toBe(false);
+    if (!prepared.ok) expect(prepared.error.message).toContain("parsed from bytes other than");
+  });
+
   it("accepts the honest single-read observation the shell produces", () => {
     const specFile = specFileIn(spec);
     const prepared = prepareWaveReviewBatch(
@@ -799,67 +829,21 @@ describe("wave-review-authority spec-check scope decoding", () => {
   });
 });
 
-describe("a non-string recorded hash is described, not crashed on", () => {
-  it("renders a stated verdict instead of throwing out of prepareWaveReviewBatch", () => {
-    // `spec_anchor_hashes` is typed Record<string, string> but nothing on the
-    // load path parses it, so a hand-edited graph can put a number there. The
-    // renderer then did `stored.slice(0, 16)` and threw a TypeError out of a
-    // function whose contract is a stated refusal, aborting the Wave Gate.
-    const spec = `# Feature: Altered
-
-## User Scenarios
-
-### US1: [P1] Describe an altered hash
-
-**Acceptance Scenarios:**
-- AS-001: Given a non-string hash, When the gate runs, Then it is described
-
-## Functional Requirements
-
-- FR-001: System MUST describe an unreadable recorded hash
-
-## Out of Scope
-
-- OOS-001: Symbol-level source indexing
-
-## Appendix: Glossary
-
-| Term | Definition |
-|------|------------|
-| Spec Index | A deterministic projection of specification entries |
-`;
-    const root = mkdtempSync(join(tmpdir(), "loom-nonstring-hash-"));
-    cleanup.push(root);
-    const specPath = join(root, "spec.md");
-    writeFileSync(specPath, spec, "utf8");
+describe("a non-string recorded hash is rejected at the load boundary", () => {
+  it.each([42, null, {}, []])("refuses corrupt persisted value %j", (value) => {
     const parsed = parseTaskGraph({
       spec_trace_version: 2, current_phase: "execute", current_wave: 1, phase_artifacts: {},
-      skipped_phases: [], spec_file: specPath, plan_file: null, wave_gates: {},
+      skipped_phases: [], spec_file: null, plan_file: null, wave_gates: {},
       tasks: [taskFixture({
         id: "T1", description: "claims FR-001", agent: "code-implementer-agent", wave: 1,
         status: "pending", depends_on: [], spec_anchors: ["FR-001"], spec_contributions: [],
         file_list: ["src/a.ts"], files_modified: ["src/a.ts"],
-        spec_anchor_hashes: { "FR-001": 42 } as unknown as Readonly<Record<string, string>>,
+        spec_anchor_hashes: { "FR-001": value } as unknown as Readonly<Record<string, string>>,
       })],
     });
-    if (!parsed.ok) throw new Error("graph fixture must parse");
-    const runsRoot = mkdtempSync(join(tmpdir(), "loom-nonstring-run-"));
-    cleanup.push(runsRoot);
-    const created = createRunDirectory(runsRoot, "run.nonstring");
-    if (!created.ok) throw new Error(created.error.message);
-    const batch = waveRequests(created.value, {
-      schemaVersion: 1, kind: "wave-gate", input: { wave: 1 }, taskIds: ["T1"],
-      authorityDigest: "a".repeat(64),
-    }, parsed.value, 1);
-    const specRequest = batch.requests.find(({ authority }) =>
-      (authority as AgentRequestAuthority).role === "spec-check-invoker");
-    const digest = (specRequest!.authority as AgentRequestAuthority).contextDigest;
-    const packet = batch.packets.find((candidate) => candidate.digest === digest);
-    const section = packet?.fixedContext.find(({ label }) => label === "requirement-coverage");
-    if (section === undefined) throw new Error("spec-check packet must carry a requirement-coverage section");
-    const rendered = new TextDecoder("utf8", { fatal: true }).decode(Uint8Array.from(section.bytes));
-    expect(rendered).toContain("have been altered");
-    expect(rendered).toContain("non-string number");
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) return;
+    expect(parsed.error).toContain('spec_anchor_hashes["FR-001"] must be a string');
   });
 });
 
@@ -899,47 +883,53 @@ describe("an installed epoch is replayed only when it is the same epoch", () => 
     specCheckSlotAuthority: Object.freeze({ slot_id: "wave-slot:spec-check", attempted: 1 as const }),
     ...(floor === undefined ? {} : { settledSpecCheckFloor: floor }),
   });
-  const settled = (count: number): SettledFloor => Object.freeze({ kind: "settled", count });
+  const settled = (count: number): SettledFloor => {
+    const parsed = parseSettledFloor({ kind: "settled", count });
+    if (parsed === null) throw new Error("fixture settled floor must parse");
+    return parsed;
+  };
   const replay = (existing: WaveReviewEpochAuthority | undefined, floor: SettledFloor) =>
-    isExactEpochReplay(existing, batch(floor), RUN_ID, 1, "wave-slot:spec-check");
+    decideWaveReviewEpochReplay(existing, batch(floor), RUN_ID, 1, "wave-slot:spec-check");
 
-  it("replays an epoch whose recorded floor matches", () => {
-    expect(replay(epoch(settled(3)), settled(3))).toBe(true);
+  it("classifies an epoch whose recorded floor matches as exact", () => {
+    expect(replay(epoch(settled(3)), settled(3))).toEqual({ kind: "exact" });
   });
 
-  it("refuses to replay an epoch whose recorded floor differs", () => {
+  it("classifies an epoch whose recorded floor differs as different", () => {
     // `batchEpoch` covers neither `spec_anchor_hashes` nor out-of-Wave
     // `spec_anchors`, so two batches can agree on the digest and still disagree
     // on the number the Agent would be shown. Retaining the stale one would
     // reopen the divergence recording the floor was meant to close.
-    expect(replay(epoch(settled(3)), settled(4))).toBe(false);
-    expect(replay(epoch(settled(3)), { kind: "unprojected", reason: "no spec_file" })).toBe(false);
+    expect(replay(epoch(settled(3)), settled(4))).toEqual({ kind: "different" });
+    expect(replay(epoch(settled(3)), { kind: "unprojected", reason: "no spec_file" }))
+      .toEqual({ kind: "different" });
   });
 
-  it("replays an epoch installed before the floor was recorded", () => {
-    // Absent is not a disagreement: it is an engine upgrade mid-Wave, and
-    // refusing it would turn that into a hard failure for no added safety.
-    expect(replay(epoch(), settled(3))).toBe(true);
+  it("classifies an epoch installed before floor recording as an explicit upgrade", () => {
+    expect(replay(epoch(), settled(3))).toEqual({ kind: "upgrade-floor" });
   });
 
-  it("never replays when there is no installed epoch at all", () => {
-    expect(replay(undefined, settled(3))).toBe(false);
+  it("classifies an absent installed epoch as different", () => {
+    expect(replay(undefined, settled(3))).toEqual({ kind: "different" });
   });
 
   it("refuses a different run, Wave, batch digest, documents, or spec-check slot", () => {
     const same = batch(settled(3));
-    expect(isExactEpochReplay(epoch(settled(3)), same, OTHER_RUN_ID, 1, "wave-slot:spec-check")).toBe(false);
-    expect(isExactEpochReplay(epoch(settled(3)), same, RUN_ID, 2, "wave-slot:spec-check")).toBe(false);
-    expect(isExactEpochReplay(epoch(settled(3)), same, RUN_ID, 1, "wave-slot:other")).toBe(false);
-    expect(isExactEpochReplay(
+    expect(decideWaveReviewEpochReplay(epoch(settled(3)), same, OTHER_RUN_ID, 1, "wave-slot:spec-check"))
+      .toEqual({ kind: "different" });
+    expect(decideWaveReviewEpochReplay(epoch(settled(3)), same, RUN_ID, 2, "wave-slot:spec-check"))
+      .toEqual({ kind: "different" });
+    expect(decideWaveReviewEpochReplay(epoch(settled(3)), same, RUN_ID, 1, "wave-slot:other"))
+      .toEqual({ kind: "different" });
+    expect(decideWaveReviewEpochReplay(
       { ...epoch(settled(3)), batchEpoch: DIGEST("c") },
       same, RUN_ID, 1, "wave-slot:spec-check",
-    )).toBe(false);
-    expect(isExactEpochReplay(
+    )).toEqual({ kind: "different" });
+    expect(decideWaveReviewEpochReplay(
       { ...epoch(settled(3)), specCheckDocuments: {
         spec: { path: "spec.md", contentDigest: DIGEST("f") }, plan: { path: null, contentDigest: null },
       } },
       same, RUN_ID, 1, "wave-slot:spec-check",
-    )).toBe(false);
+    )).toEqual({ kind: "different" });
   });
 });

@@ -1749,10 +1749,8 @@ function reducePiSpecCheckResult(
     );
   }
 
-  // Floored through the same `reconcileSpecCheck` the Claude hook and the Wave
-  // Gate facade call. Committing the Agent's own count here left the settled
-  // floor unenforced on this transport entirely, while the command told the
-  // Agent the engine re-derives it at capture.
+  // Every transport enforces the epoch-recorded floor through the same
+  // `reconcileSpecCheck`; none re-projects mutable graph inputs at capture.
   const resolution = reconcileSpecCheck(observation.findings, wave, now,
     epochSettledFloor(state.wave_review_epoch));
   if (resolution.kind === "evidence-failed") {

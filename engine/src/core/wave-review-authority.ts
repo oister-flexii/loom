@@ -51,13 +51,10 @@ import { parseSpecContentHash } from "./parse-spec";
  * the Spec Index projected from the very bytes its digest names.
  *
  * The shell produces both from a single read. `prepareWaveReviewBatch` proves
- * the pairing for the `indexed` arm — the index carries the digest of the bytes
- * it was parsed from, and that digest is compared with the document authority.
- * It does NOT prove it for the `unavailable` arm, which carries no digest and
- * is checked on path equality alone; that arm is also the one that yields an
- * unprojected floor, so the gap is stated here rather than overclaimed.
- * Declared where the consumer lives, and re-exported by the shell producer so
- * the contract has exactly one owner.
+ * byte pairing for both successful and failed parses: every bytes-backed Spec
+ * Index outcome carries the digest compared with document authority. Only
+ * no-byte outcomes remain digest-less. Declared where the consumer lives and
+ * re-exported by the shell producer so the contract has exactly one owner.
  */
 export type WaveSpecCheckObservation = Readonly<{
   authority: WaveSpecCheckDocumentsAuthority;
@@ -797,35 +794,39 @@ export function prepareWaveReviewBatch(
   });
 }
 
+/** How an installed epoch relates to the freshly prepared batch. */
+export type WaveReviewEpochReplayDecision =
+  | Readonly<{ kind: "exact" }>
+  | Readonly<{ kind: "upgrade-floor" }>
+  | Readonly<{ kind: "different" }>;
+
 /**
- * Whether an already-installed epoch is the SAME epoch this batch describes.
+ * Parse epoch replay authority into an exhaustive decision.
  *
- * An exact replay is idempotent and must retain the spec-check evidence
- * captured against it; anything else invalidates that evidence. The floor
- * participates because `batchEpoch` does not cover every input that decides it
- * (`spec_anchor_hashes`, and the `spec_anchors` of Tasks outside the reviewed
- * Wave), so two batches can agree on the digest and disagree on the number the
- * Agent would be shown.
- *
- * An epoch with NO recorded floor is not a disagreement - it is an epoch
- * installed before the field existed, and refusing it would turn an engine
- * upgrade mid-Wave into a hard failure for no added safety.
+ * Exact replay retains captured spec-check evidence. A byte/slot-identical
+ * historical epoch with no recorded floor is an explicit upgrade: installation
+ * writes the packet's floor and clears prior spec-check evidence so fresh
+ * capture is required. Every other mismatch is different authority.
  */
-export function isExactEpochReplay(
+export function decideWaveReviewEpochReplay(
   existing: WaveReviewEpochAuthority | undefined,
   batch: WaveRequestBatch,
   runId: OrchestrationRunId,
   wave: number,
   specCheckSlotId: string,
-): boolean {
-  if (existing === undefined) return false;
-  return existing.runId === runId &&
-    existing.wave === wave &&
-    existing.batchEpoch === batch.batchEpoch &&
-    waveSpecCheckDocumentsMatch(existing.specCheckDocuments, batch.specCheckDocuments) &&
-    (existing.settledSpecCheckFloor === undefined ||
-      canonicalStructuralEquals(existing.settledSpecCheckFloor, batch.settledFloor)) &&
-    existing.specCheckSlotAuthority?.slot_id === specCheckSlotId;
+): WaveReviewEpochReplayDecision {
+  if (existing === undefined || existing.runId !== runId || existing.wave !== wave ||
+      existing.batchEpoch !== batch.batchEpoch ||
+      !waveSpecCheckDocumentsMatch(existing.specCheckDocuments, batch.specCheckDocuments) ||
+      existing.specCheckSlotAuthority?.slot_id !== specCheckSlotId) {
+    return Object.freeze({ kind: "different" });
+  }
+  if (existing.settledSpecCheckFloor === undefined) {
+    return Object.freeze({ kind: "upgrade-floor" });
+  }
+  return canonicalStructuralEquals(existing.settledSpecCheckFloor, batch.settledFloor)
+    ? Object.freeze({ kind: "exact" })
+    : Object.freeze({ kind: "different" });
 }
 
 /**

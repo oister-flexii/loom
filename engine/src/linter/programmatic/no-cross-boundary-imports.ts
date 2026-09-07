@@ -332,10 +332,9 @@ export function underPrefix(path: string, prefix: string): boolean {
  * Enforcement model:
  *   1. Find the boundary rule matching this file's path
  *   2. Check DENY list first — explicit denials always block
- *   3. Check the per-file capability allowlist (perFileAllow) — a file named
- *      there may import exactly its listed prefixes, whether or not the
- *      directory allow would admit them
- *   4. Check ALLOW list — import must match at least one allow entry
+ *   3. Check the additive per-file capability allowlist (perFileAllow) — a
+ *      named file may additionally import its listed prefixes
+ *   4. Check the directory ALLOW list — import may match any allow entry
  *   5. If none admits the import — violation (fail-closed allowlist)
  */
 export function checkBoundaryViolation(
@@ -359,10 +358,9 @@ export function checkBoundaryViolation(
     }
   }
 
-  // Per-file capability allowlist, before the blanket allow: a file named here
-  // may import exactly its listed prefixes, whether or not the directory-level
-  // allow would admit them. This is how `node:` hardware is granted to named
-  // core modules instead of to the whole directory.
+  // Additive per-file capability allowlist, checked before the directory allow.
+  // This is how `node:` hardware is granted to named core modules without
+  // removing their ordinary directory-level imports.
   const perFile = boundary.perFileAllow?.[normalizedFile];
   if (perFile !== undefined) {
     if (perFile.some((allowed) => underPrefix(resolvedImport, allowed))) {

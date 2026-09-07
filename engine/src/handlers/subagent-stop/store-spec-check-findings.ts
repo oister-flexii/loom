@@ -94,15 +94,10 @@ export const runStoreSpecCheckFindings = async (
         },
       };
     }
-    // The Wave here NEVER takes findings.wave: that is the Agent's own
-    // SPEC_CHECK_WAVE marker, and letting the reported party select it would
-    // let the Agent choose both the roster its floor is derived from (a Wave
-    // with no CRITICAL rows) AND the veto's target — reconcileWaveBlock
-    // attributes the spec-check cause to the record's own wave and marks that
-    // wave's gate, so one Wave variable feeds both the stored record and the
-    // block. The epoch is the engine's own record of which wave the capture is
-    // about; on the legacy path (epoch absent) the state's current wave is the
-    // engine's belief. The reported party selects nothing.
+    // The Wave never comes from the Agent's SPEC_CHECK_WAVE marker. Protected
+    // epoch authority chooses evidence filing and the Wave block target; on the
+    // legacy path the protected current Wave is the engine's belief. The
+    // reported party selects neither destination.
     const epochWave = state.wave_review_epoch?.wave ?? null;
     const wave = epochWave ?? state.current_wave ?? 1;
     // Read back from the epoch, never re-projected: only a packet-correlated

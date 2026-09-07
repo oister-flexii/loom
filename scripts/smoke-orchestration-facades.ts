@@ -371,18 +371,49 @@ function modelFreePlan(cwd: string): string {
   return planFile;
 }
 
-function waveState(planFile: string): Record<string, unknown> {
+function canonicalSpec(cwd: string): string {
+  const specFile = join(cwd, "spec.md");
+  writeFileSync(specFile, [
+    "# Feature: Façade smoke",
+    "",
+    "## User Scenarios",
+    "",
+    "### US1: [P1] Drive the Wave Gate",
+    "",
+    "**Acceptance Scenarios:**",
+    "- AS-001: Given accepted evidence, When the gate resumes, Then the Wave progresses",
+    "",
+    "## Functional Requirements",
+    "",
+    "- FR-001: System MUST drive exact Wave evidence through the façade",
+    "",
+    "## Out of Scope",
+    "",
+    "- OOS-001: Unrelated feature work",
+    "",
+    "## Appendix: Glossary",
+    "",
+    "| Term | Definition |",
+    "|------|------------|",
+    "| Wave evidence | Evidence bound to current Wave authority |",
+    "",
+  ].join("\n"));
+  return specFile;
+}
+
+function waveState(planFile: string, specFile: string): Record<string, unknown> {
   const proof = evaluateTaskProof(
     { newTestsRequired: true, declaredArtifacts: ["src/x.ts"] },
     { taskCompleted: true, testResult: { verdict: "trusted-pass" }, filesModified: ["src/x.ts"], newTestsWritten: true },
   );
   check(proof.state === "satisfied", "Wave fixture proof is not satisfied");
   return {
+    spec_trace_version: 2,
     current_phase: "execute",
     current_wave: 1,
     phase_artifacts: {},
     skipped_phases: [],
-    spec_file: null,
+    spec_file: specFile,
     plan_file: planFile,
     tasks: [{
       id: "T1",
@@ -392,6 +423,8 @@ function waveState(planFile: string): Record<string, unknown> {
       status: "implemented",
       proof,
       depends_on: [],
+      spec_anchors: ["FR-001", "AS-001"],
+      spec_contributions: [],
       file_list: ["src/x.ts"],
       files_modified: ["src/x.ts"],
       test_result: { verdict: "trusted-pass" },
@@ -415,7 +448,7 @@ function registeredWaveRepository(label: string): Readonly<{ cwd: string; stateP
   git(cwd, ["commit", "-qm", "baseline"]);
   const statePath = join(cwd, ".claude", "state", "active_task_graph.json");
   mkdirSync(dirname(statePath), { recursive: true });
-  writeFileSync(statePath, JSON.stringify(waveState(modelFreePlan(cwd))));
+  writeFileSync(statePath, JSON.stringify(waveState(modelFreePlan(cwd), canonicalSpec(cwd))));
   return { cwd, statePath };
 }
 

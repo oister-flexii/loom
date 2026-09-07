@@ -1,4 +1,4 @@
-import type { SettledFloor } from "./requirement-coverage";
+import type { SpecCheckFloorAuthority } from "./requirement-coverage";
 import { isNoFindingSentinel } from "../utils/no-finding-sentinel";
 import type { AgentRequestAuthority } from "./orchestration-contract";
 import {
@@ -214,12 +214,10 @@ export function decideSpecCheckManualOverride(
  *
  * The Wave Gate resume loop writes transcript bytes to disk before applying
  * them, so it must re-apply anything whose durable capture is not reflected in
- * protected state. A `settled-floor` failure is the one case where re-applying
- * is not recovery but erasure: the transcript parsed, the floor is recorded on
- * the epoch and cannot move, and re-running the same bytes against the same
- * floor can only reach the same refusal - so a re-application can do nothing
- * but overwrite a decided answer, which is how a refusal could disappear and
- * the resume end as `PASSED`.
+ * protected state. Only a `transcript` failure is re-applyable: settled-floor
+ * and projection-unavailable failures are deterministic decisions under the
+ * epoch authority, so the same bytes cannot repair them. Preserving those
+ * answers stops the resume loop from replacing a decided refusal.
  */
 export function specCheckNeedsReapplication(specCheck: SpecCheck | undefined, wave: number): boolean {
   if (specCheck === undefined || specCheck.wave !== wave) return true;
@@ -252,17 +250,16 @@ const evidenceFailure = (
  * `EVIDENCE_CAPTURE_FAILED`, erasing the refusal it had just recorded.
  *
  * The parameter is REQUIRED and is an ADT, not a nullable number, so an
- * unfloored settlement cannot be reached by omission — which is exactly how a
- * fourth settlement path shipped unenforced while a hand-maintained list of
- * three claimed totality. `unprojected` states WHY no floor applies (no spec
- * file, a specification that no longer parses, or a capture the Agent received
- * no packet for) instead of leaving an absent argument to mean it.
+ * unfloored settlement cannot be reached by omission. `unprojected` states WHY
+ * registered evidence lacks projection authority and fails closed; the distinct
+ * `manual-override` arm is minted only after the operator-override authority
+ * check and therefore cannot be persisted on a Wave epoch.
  */
 export function reconcileSpecCheck(
   parsed: ParsedSpecCheckOutput,
   wave: number,
   runAt: string,
-  settledFloor: SettledFloor,
+  floorAuthority: SpecCheckFloorAuthority,
 ): SpecCheckResolution {
   if (parsed.duplicateMarkers.length > 0) {
     return evidenceFailure(
@@ -298,14 +295,25 @@ export function reconcileSpecCheck(
       "transcript",
     );
   }
-  // Last, so a malformed footer is reported as malformed rather than as a
-  // floor violation. A floor, never an equality: the Agent is expected to ADD
-  // findings its own reading turns up; it may never subtract the engine's.
-  if (settledFloor.kind === "settled" && parsed.criticalCount < settledFloor.count) {
+  // Last, so malformed evidence reports its concrete transcript defect first.
+  // An unavailable projection is an absence of evidence, never a pass. Manual
+  // operator authority is a separate arm and deliberately skips this refusal.
+  if (floorAuthority.kind === "unprojected") {
     return evidenceFailure(
       wave,
       runAt,
-      `spec-check reported ${parsed.criticalCount} CRITICAL but the Requirement Coverage Projection settled ${settledFloor.count}` +
+      `Requirement Coverage Projection unavailable: ${floorAuthority.reason}; ` +
+      "absence of projection evidence cannot pass a Wave Gate - restore projection authority and re-run /wave-gate",
+      "projection-unavailable",
+    );
+  }
+  // A floor, never an equality: the Agent is expected to ADD findings its own
+  // reading turns up; it may never subtract the engine's.
+  if (floorAuthority.kind === "settled" && parsed.criticalCount < floorAuthority.count) {
+    return evidenceFailure(
+      wave,
+      runAt,
+      `spec-check reported ${parsed.criticalCount} CRITICAL but the Requirement Coverage Projection settled ${floorAuthority.count}` +
       `; settled rows are decided by structure and are not the Agent's to drop - re-run /wave-gate`,
       "settled-floor",
     );
@@ -364,7 +372,8 @@ function parseFailedSpecCheck(
   if (typeof spec.error !== "string" || spec.error.trim() === "") {
     errors.push("spec_check.error must be a non-empty string when evidence capture failed");
   }
-  if (spec.cause !== undefined && spec.cause !== "transcript" && spec.cause !== "settled-floor") {
+  if (spec.cause !== undefined && spec.cause !== "transcript" &&
+      spec.cause !== "settled-floor" && spec.cause !== "projection-unavailable") {
     errors.push(`spec_check.cause ${JSON.stringify(spec.cause)} is not recognized`);
   }
   for (const field of ["critical_count", "high_count", "critical_findings", "high_findings", "medium_findings"] as const) {
@@ -439,6 +448,8 @@ function freshEvidenceFailed(
     // Absent is not unknown: every failure written before the floor existed was
     // a transcript failure, so the historical shape has exactly one meaning and
     // the parse boundary is where it becomes total.
-    cause: spec.cause === "settled-floor" ? "settled-floor" : "transcript",
+    cause: spec.cause === "settled-floor" || spec.cause === "projection-unavailable"
+      ? spec.cause
+      : "transcript",
   });
 }

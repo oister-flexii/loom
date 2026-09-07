@@ -5,7 +5,12 @@ import {
   reconcileSpecCheck,
   specCheckNeedsReapplication,
 } from "../../src/core/spec-check";
-import { unprojectedFloor, type SettledFloor } from "../../src/core/requirement-coverage";
+import {
+  manualOverrideFloor,
+  parseSettledFloor,
+  unprojectedFloor,
+  type SettledFloor,
+} from "../../src/core/requirement-coverage";
 import { epochSettledFloor } from "../../src/core/wave-review-authority";
 import type { SpecCheck, WaveReviewEpochAuthority } from "../../src/types";
 
@@ -32,7 +37,11 @@ const transcript = (critical: number): string => [
   `SPEC_CHECK_VERDICT: ${critical === 0 ? "PASSED" : "BLOCKED"}`,
 ].join("\n");
 
-const settled = (count: number): SettledFloor => Object.freeze({ kind: "settled", count });
+const settled = (count: number): SettledFloor => {
+  const parsed = parseSettledFloor({ kind: "settled", count });
+  if (parsed === null) throw new Error("fixture settled floor must parse");
+  return parsed;
+};
 const unprojected = (): SettledFloor => unprojectedFloor("test fixture: no projection");
 
 const reconcile = (critical: number, floor: SettledFloor) =>
@@ -55,12 +64,20 @@ describe("reconcileSpecCheck enforces the settled floor", () => {
     expect(reconcile(7, settled(3)).kind).toBe("captured");
   });
 
-  it("imposes no floor when no projection was available", () => {
-    // Unprojected is a real state, and it does impose no floor - the honest
-    // statement, not a claim that it is somehow still a check. What keeps it
-    // from reading as a pass is the command, which requires the Agent to say
-    // in its summary that it worked without a projection.
-    expect(reconcile(0, unprojected()).kind).toBe("captured");
+  it("fails closed when no projection was available", () => {
+    const result = reconcile(0, unprojected());
+    expect(result.kind).toBe("evidence-failed");
+    expect(result.specCheck).toMatchObject({ cause: "projection-unavailable" });
+    expect(String((result.specCheck as { error?: string }).error)).toContain("test fixture: no projection");
+  });
+
+  it("admits only separately authorized manual override settlement without a floor", () => {
+    expect(reconcileSpecCheck(
+      parseSpecCheckOutput(transcript(0)),
+      5,
+      "2026-09-05T00:00:00.000Z",
+      manualOverrideFloor("operator supplied an attributable override"),
+    ).kind).toBe("captured");
   });
 
 
@@ -117,7 +134,7 @@ describe("epochSettledFloor reads back the number the Agent was shown", () => {
 });
 
 describe("a settled-floor refusal survives the resume loop", () => {
-  const failed = (cause: "transcript" | "settled-floor"): SpecCheck =>
+  const failed = (cause: "transcript" | "settled-floor" | "projection-unavailable"): SpecCheck =>
     ({ wave: 5, run_at: "now", verdict: "EVIDENCE_CAPTURE_FAILED", error: "refused", cause });
 
   it("does not re-apply a decided floor refusal", () => {
@@ -151,7 +168,7 @@ describe("a persisted evidence failure carries its cause across a reload", () =>
     wave: 5, run_at: "now", verdict: "EVIDENCE_CAPTURE_FAILED", error: "refused", ...overrides,
   });
 
-  it.each(["transcript", "settled-floor"] as const)("round-trips the %s cause", (cause) => {
+  it.each(["transcript", "settled-floor", "projection-unavailable"] as const)("round-trips the %s cause", (cause) => {
     const parsed = stored({ cause });
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;

@@ -8,10 +8,11 @@ import { parseSpecCheckOutput } from "../../src/handlers/subagent-stop/store-spe
 import handler, { runStoreSpecCheckFindings } from "../../src/handlers/subagent-stop/store-spec-check-findings";
 import { projectSlug } from "../../src/utils/agent-transcript-path";
 import { reconcileSpecCheck } from "../../src/core/spec-check";
-import { unprojectedFloor } from "../../src/core/requirement-coverage";
+import { parseSettledFloor } from "../../src/core/requirement-coverage";
 
-/** These cases exercise footer parsing, not the floor, so they settle unfloored. */
-const NO_FLOOR = unprojectedFloor("test fixture: no projection");
+/** These cases exercise footer parsing under a valid zero settled floor. */
+const ZERO_FLOOR = parseSettledFloor({ kind: "settled", count: 0 });
+if (ZERO_FLOOR === null) throw new Error("zero-floor fixture must parse");
 import { parseOrchestrationRunId, parseSlotId } from "../../src/core/orchestration-contract";
 
 describe("parseSpecCheckOutput (pure)", () => {
@@ -71,7 +72,7 @@ describe("parseSpecCheckOutput (pure)", () => {
       "SPEC_CHECK_HIGH_COUNT: 0",
     ].join("\n"));
 
-    const resolution = reconcileSpecCheck(parsed, 1, "now", NO_FLOOR);
+    const resolution = reconcileSpecCheck(parsed, 1, "now", ZERO_FLOOR);
     expect(resolution).toEqual({
       kind: "evidence-failed",
       specCheck: {
@@ -93,7 +94,7 @@ describe("parseSpecCheckOutput (pure)", () => {
       "SPEC_CHECK_VERDICT: PASSED",
     ].join("\n"));
 
-    const resolution = reconcileSpecCheck(parsed, 1, "now", NO_FLOOR);
+    const resolution = reconcileSpecCheck(parsed, 1, "now", ZERO_FLOOR);
     expect(resolution).toEqual({
       kind: "evidence-failed",
       specCheck: {
@@ -113,7 +114,7 @@ describe("parseSpecCheckOutput (pure)", () => {
       "SPEC_CHECK_VERDICT: PASSED",
     ].join("\n"));
 
-    const resolution = reconcileSpecCheck(parsed, 1, "now", NO_FLOOR);
+    const resolution = reconcileSpecCheck(parsed, 1, "now", ZERO_FLOOR);
     expect(resolution.kind).toBe("captured");
     if (resolution.kind !== "captured") return;
     expect(resolution.specCheck.high_count).toBe(0);
@@ -130,7 +131,7 @@ describe("parseSpecCheckOutput (pure)", () => {
     ].join("\n"));
 
     expect(parsed.duplicateMarkers).toEqual(["SPEC_CHECK_CRITICAL_COUNT"]);
-    expect(reconcileSpecCheck(parsed, 1, "now", NO_FLOOR)).toMatchObject({
+    expect(reconcileSpecCheck(parsed, 1, "now", ZERO_FLOOR)).toMatchObject({
       kind: "evidence-failed",
       specCheck: {
         verdict: "EVIDENCE_CAPTURE_FAILED",
@@ -149,7 +150,7 @@ describe("parseSpecCheckOutput (pure)", () => {
     ].join("\n"));
 
     expect(parsed.duplicateMarkers).toEqual(["SPEC_CHECK_VERDICT"]);
-    expect(reconcileSpecCheck(parsed, 1, "now", NO_FLOOR)).toMatchObject({
+    expect(reconcileSpecCheck(parsed, 1, "now", ZERO_FLOOR)).toMatchObject({
       kind: "evidence-failed",
       specCheck: {
         verdict: "EVIDENCE_CAPTURE_FAILED",
@@ -182,7 +183,7 @@ describe("parseSpecCheckOutput (pure)", () => {
           `${marker}: ${value(second)}`,
           "SPEC_CHECK_VERDICT: PASSED",
         ].join("\n"));
-        const resolution = reconcileSpecCheck(parsed, 1, "now", NO_FLOOR);
+        const resolution = reconcileSpecCheck(parsed, 1, "now", ZERO_FLOOR);
 
         expect(parsed.duplicateMarkers).toContain(marker);
         expect(resolution.kind).toBe("evidence-failed");
@@ -201,7 +202,7 @@ describe("parseSpecCheckOutput (pure)", () => {
       "SPEC_CHECK_VERDICT: PASSED",
     ].join("\n"));
 
-    const resolution = reconcileSpecCheck(parsed, 1, "now", NO_FLOOR);
+    const resolution = reconcileSpecCheck(parsed, 1, "now", ZERO_FLOOR);
     expect(resolution.kind).toBe("evidence-failed");
     if (resolution.kind === "evidence-failed") {
       expect(resolution.specCheck.error).toContain("SPEC_CHECK_HIGH_COUNT");
@@ -726,8 +727,8 @@ describe("handler fail-closed paths (round-10 Fix 2 + gap 20)", () => {
       const state = JSON.parse(readFileSync(statePath, "utf-8"));
       expect(state.spec_check).toMatchObject({
         wave: 2,
-        verdict: "PASSED",
-        critical_count: 0,
+        verdict: "EVIDENCE_CAPTURE_FAILED",
+        cause: "projection-unavailable",
       });
     } finally {
       if (previousConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR;
@@ -957,12 +958,14 @@ describe("the Requirement Coverage Projection is enforced, not merely rendered",
     expect(stored.verdict).not.toBe("EVIDENCE_CAPTURE_FAILED");
   });
 
-  it("imposes no floor on an epoch installed before the floor was recorded", async () => {
-    // A historical epoch genuinely showed the Agent no settled count. Failing
-    // its honest report against a number invented after the fact would be the
-    // same defect in the opposite direction.
+  it("fails closed on an epoch installed before floor authority was recorded", async () => {
     const stored = await storedSpecCheck(0, null);
-    expect(stored).toMatchObject({ wave: 5, critical_count: 0, verdict: "PASSED" });
+    expect(stored).toMatchObject({
+      wave: 5,
+      verdict: "EVIDENCE_CAPTURE_FAILED",
+      cause: "projection-unavailable",
+    });
+    expect(String(stored.error)).toContain("predates recorded Requirement Coverage floor authority");
   });
 
   it("accepts a report that meets the floor", async () => {
@@ -976,7 +979,7 @@ describe("the Requirement Coverage Projection is enforced, not merely rendered",
 });
 
 describe("round-4: the reported party selects no Wave", () => {
-  it("files the record and the block on the engine's wave, never the Agent's claimed wave, on the legacy path", async () => {
+  it("files a legacy projection refusal on the engine's wave, never the Agent's claimed wave", async () => {
     // The defect this closes: the Wave chain took findings.wave — the Agent's
     // own SPEC_CHECK_WAVE marker — so on the legacy path (epoch absent) the
     // Agent chose both the roster its floor is derived from and, through
@@ -1031,9 +1034,13 @@ describe("round-4: the reported party selects no Wave", () => {
         // The record files under the engine's wave (state.current_wave), not
         // the Agent's claimed wave 5.
         expect(state.spec_check.wave).toBe(3);
-        // The block lands on the engine's wave: the cause attributes to the
-        // record's own wave, so the same honest value files and blocks.
-        expect(state.wave_gates["3"].blocked).toBe(true);
+        expect(state.spec_check).toMatchObject({
+          verdict: "EVIDENCE_CAPTURE_FAILED",
+          cause: "projection-unavailable",
+        });
+        // Evidence failure carries no accepted critical count, so neither Wave
+        // receives a content block; the engine-selected filing Wave remains 3.
+        expect(state.wave_gates["3"].blocked).toBe(false);
         expect(state.wave_gates["5"].blocked).toBe(false);
       });
     } finally {

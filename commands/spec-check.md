@@ -33,7 +33,7 @@ Two execution paths exist, and every step below depends on which one you are on.
 | Glossary | the projection's typed terms | grep the spec's Appendix table |
 | Who settles a row | `Decided by: engine` rows are settled | nothing is settled; you assess everything |
 
-**On the Unprojected path you MUST say so in the summary**, and state why (no registered packet, or the projection's stated `UNAVAILABLE` reason). An unprojected run is a weaker run; reporting it as if structural verdicts were available is the one failure this whole step exists to prevent.
+**On the Unprojected path you MUST say so in the summary**, and state why (no registered packet, or the projection's stated `UNAVAILABLE` reason). An unprojected run is an absence of structural evidence, never a pass: registered settlement fails closed until projection authority is restored. A separately authorized manual `store-spec-check` override remains available and must carry its explicit override reason.
 
 ### Step 1: Load artifacts and freeze scope authority
 
@@ -286,7 +286,7 @@ SPEC_CHECK_VERDICT: PASSED | BLOCKED
 **Rules for machine-readable lines:**
 - Each `CRITICAL:` / `HIGH:` / `MEDIUM:` line MUST start at column 0 (no leading spaces)
 - One finding per line, no line breaks within a finding
-- Counts MUST match the number of CRITICAL/HIGH/MEDIUM lines above them
+- `SPEC_CHECK_CRITICAL_COUNT` and `SPEC_CHECK_HIGH_COUNT` MUST match their respective CRITICAL/HIGH lines; MEDIUM lines have no count marker
 - Even if counts are zero, emit the SPEC_CHECK_CRITICAL_COUNT, SPEC_CHECK_HIGH_COUNT, and SPEC_CHECK_VERDICT lines — all three are required, and a missing marker fails evidence capture rather than reading as zero
 - These lines appear AFTER the human-readable report, as the very last output
 

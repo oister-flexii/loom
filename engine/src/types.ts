@@ -642,15 +642,16 @@ export type CapturedSpecCheck = Readonly<SpecCheckBase & {
  * Why a spec-check capture failed, as a closed set rather than prose.
  *
  * `transcript` is a capture the harness could not read or whose footer does not
- * parse: re-applying the same bytes is exactly what the Wave Gate resume loop
- * exists to do. `settled-floor` is a DECIDED refusal - the transcript parsed
- * perfectly and reported fewer CRITICAL findings than the Requirement Coverage
- * Projection had already settled. Re-applying it cannot change that answer, and
- * the resume loop overwriting the refusal with a fresh `PASSED` is the defect
- * this distinction closes. The `error` string is for operators; this is the
- * field control flow is allowed to branch on.
+ * parse, and is the only re-applyable arm. `settled-floor` means a parsed report
+ * omitted engine-settled findings. `projection-unavailable` means no structural
+ * projection could be proved, which is an absence of evidence and therefore a
+ * decided refusal. The `error` string is for operators; control flow branches
+ * only on this closed cause.
  */
-export type SpecCheckEvidenceFailureCause = "transcript" | "settled-floor";
+export type SpecCheckEvidenceFailureCause =
+  | "transcript"
+  | "settled-floor"
+  | "projection-unavailable";
 
 /** A failed capture carries a cause and cannot masquerade as usable counts. */
 export type EvidenceFailedSpecCheck = Readonly<SpecCheckBase & {
