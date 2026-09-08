@@ -13,7 +13,8 @@ describe("Linux CI verification contract", () => {
     expect(workflow).not.toMatch(/npm run (test|typecheck)|bun test|bunx|npx|continue-on-error|@latest|publish/);
   });
 
-  it("pins the measured runtimes and installs both existing frozen dependency graphs", () => {
+  it("pins full Git history, the measured runtimes, and both existing frozen dependency graphs", () => {
+    expect(workflow).toMatch(/uses: actions\/checkout@v4\n\s+with:\n\s+fetch-depth: 0/);
     expect(workflow).toContain('node-version: "22.23.2"');
     expect(workflow).toContain('bun-version: "1.3.13"');
     expect(workflow.match(/bun install --frozen-lockfile/g)).toHaveLength(2);
