@@ -79,17 +79,16 @@ export const DEFAULT_BOUNDARIES: readonly BoundaryRule[] = [
       // filesystem. Listed individually rather than opening `machine/`, which
       // would also admit the ledger and report-discovery shells.
       "engine/src/machine/extract-evidence",
-      // Dependency-free string helpers. Each imports NOTHING (verified: zero
-      // import statements), so naming them individually cannot open a path
-      // back into the shell. `engine/src/utils/` as a whole stays denied by
-      // omission because utils also holds modules that import core, and a
-      // blanket entry would legitimise a core→utils→core cycle.
+      // Narrow pure helpers: extract-task-id uses core/task-id for canonical
+      // Task identity; the other two have no imports. These explicit entries
+      // admit no shell/I/O dependency. The rest of utils stays denied rather
+      // than granting access to its filesystem and locking helpers.
       "engine/src/utils/extract-task-id",
       "engine/src/utils/no-finding-sentinel",
       "engine/src/utils/strip-namespace",
       // find-file imports only `node:fs` and `node:path`. The core boundary's
       // formerly blanket `node:` allowance is now per-module, and this
-      // dependency-free wrapper over the same calls is enumerated below — the
+      // narrow wrapper over the same calls is enumerated below — the
       // capability policed is protected-state WRITING: `engine/src/state-manager`
       // stays unlisted, and `validate-phase-order` takes its state read as an
       // injected dependency instead.
@@ -109,22 +108,20 @@ export const DEFAULT_BOUNDARIES: readonly BoundaryRule[] = [
     // `identity.ts` sat here for `node:crypto`/`node:path` after it had lost
     // every import statement; it is now off the list.
     perFileAllow: {
-      // block-direct-edits, guard-state-file, validate-template-substitution,
-      // and validate-phase-order no longer appear here: the first two dropped
-      // `node:fs` when their bare `existsSync` probes became the injectable,
-      // fail-closed `pathExistsFailClosed` default from `engine/src/config`,
-      // and validate-phase-order dropped it (along with `utils/find-file`) when
-      // its phase-artifact reads became the injected `ArtifactProbe` port.
-      // block-direct-edits dropped `node:fs` AND its `machine/ledger` import
-      // together when the `.active` roster read became the injected
-      // `ActiveRosterProbe` port, whose adapter lives in the handler.
-      // Re-adding an fs import in any of them must be re-reviewed.
       "engine/src/core/harness-capture.ts": ["node:crypto"],
       "engine/src/core/harness-resources.ts": ["node:crypto", "node:path"],
       "engine/src/core/legacy-archive.ts": ["node:crypto"],
       "engine/src/core/orchestration-contract/bytes.ts": ["node:crypto"],
       "engine/src/core/orchestration-contract/effects.ts": ["node:path"],
       "engine/src/core/orchestration-contract/publication.ts": ["node:crypto"],
+      // The Spec Index: a total pure grammar whose only node use is a content
+      // digest. It lives in core/ rather than parsers/ because the Requirement
+      // Coverage Projection joins against it, and core may not import parsers.
+      // The rule that move established: a DOMAIN grammar whose output is a
+      // value object carrying invariants belongs in core/; a harness or tool
+      // OUTPUT scraper (transcripts, bash output, changed-file lists) belongs
+      // in parsers/.
+      "engine/src/core/parse-spec.ts": ["node:crypto"],
       "engine/src/core/panel-kernel.ts": ["node:path"],
       "engine/src/core/phase-artifact-paths.ts": ["node:path"],
       "engine/src/core/panel-program.ts": ["node:crypto"],
@@ -214,9 +211,10 @@ export const DEFAULT_BOUNDARIES: readonly BoundaryRule[] = [
  *
  * The regex is line-based, so prose describing an import still matches — a
  * diagnostic like `` `must not import from "${denied}"` `` captured
- * `${denied}` and reported the message string as a cross-boundary import. A
- * real specifier never contains a template interpolation, whitespace, or a
- * newline, so those are the tells.
+ * `${denied}` and reported the message string as a cross-boundary import.
+ * This line-regex extractor deliberately rejects whitespace and template
+ * interpolation as conservative tells; that is not a claim about every string
+ * JavaScript grammar permits as a module specifier.
  */
 function isPlausibleSpecifier(specifier: string | undefined): specifier is string {
   return specifier !== undefined &&
@@ -255,7 +253,6 @@ export function extractImports(
     const line = lines[i];
     const trimmed = line.trim();
 
-    // Track block comments
     if (inBlockComment) {
       if (trimmed.includes("*/")) inBlockComment = false;
       continue;
@@ -266,14 +263,12 @@ export function extractImports(
     }
     if (trimmed.startsWith("//")) continue;
 
-    // Try TS/JS import first
     const tsMatch = tsImportRe.exec(line);
     if (tsMatch && isPlausibleSpecifier(tsMatch[1])) {
       imports.push({ line: i + 1, specifier: tsMatch[1], text: line });
       continue;
     }
 
-    // Try Java import
     const javaMatch = javaImportRe.exec(line);
     if (javaMatch) {
       imports.push({ line: i + 1, specifier: javaMatch[1], text: line });
@@ -324,10 +319,9 @@ export function underPrefix(path: string, prefix: string): boolean {
  * Enforcement model:
  *   1. Find the boundary rule matching this file's path
  *   2. Check DENY list first — explicit denials always block
- *   3. Check the per-file capability allowlist (perFileAllow) — a file named
- *      there may import exactly its listed prefixes, whether or not the
- *      directory allow would admit them
- *   4. Check ALLOW list — import must match at least one allow entry
+ *   3. Check the additive per-file capability allowlist (perFileAllow) — a
+ *      named file may additionally import its listed prefixes
+ *   4. Check the directory ALLOW list — import may match any allow entry
  *   5. If none admits the import — violation (fail-closed allowlist)
  */
 export function checkBoundaryViolation(
@@ -335,26 +329,21 @@ export function checkBoundaryViolation(
   resolvedImport: string,
   boundaries: readonly BoundaryRule[]
 ): string | null {
-  // Normalize file path to forward slashes
   const normalizedFile = filePath.split(sep).join("/");
-
-  // Find applicable boundary rule for this file
   const boundary = boundaries.find((b) => underPrefix(normalizedFile, b.module));
   if (!boundary) {
     return null; // No boundary rule applies — allow
   }
 
-  // Check deny list first (takes priority over allow)
   for (const denied of boundary.deny) {
     if (underPrefix(resolvedImport, denied)) {
       return `Module "${boundary.module}" must not import from "${denied}" — violates bounded context boundary`;
     }
   }
 
-  // Per-file capability allowlist, before the blanket allow: a file named here
-  // may import exactly its listed prefixes, whether or not the directory-level
-  // allow would admit them. This is how `node:` hardware is granted to named
-  // core modules instead of to the whole directory.
+  // Additive per-file capability allowlist, checked before the directory allow.
+  // This is how `node:` hardware is granted to named core modules without
+  // removing their ordinary directory-level imports.
   const perFile = boundary.perFileAllow?.[normalizedFile];
   if (perFile !== undefined) {
     if (perFile.some((allowed) => underPrefix(resolvedImport, allowed))) {
@@ -369,7 +358,6 @@ export function checkBoundaryViolation(
     }
   }
 
-  // Check allow list — import must match at least one entry
   const isAllowed = boundary.allow.some((allowed) => underPrefix(resolvedImport, allowed));
   if (!isAllowed) {
     return `Module "${boundary.module}" may only import from [${boundary.allow.join(", ")}] — "${resolvedImport}" is not allowed`;

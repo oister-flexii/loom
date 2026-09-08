@@ -1,3 +1,4 @@
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 /**
  * `waveGateDecisionMismatch` is the guard that stops a Wave advisory decision
@@ -16,12 +17,17 @@ import { canonicalTempDir } from "../../../fixtures/canonical-temp-dir";
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import {
   applyCurrentSpecCheckCaptureRejection,
+  applyWaveFacadeSubmission,
   handleWaveReviewContext,
+  installWaveReviewRuns,
   publishWaveAdvisoryDecisionRequest,
+  reportUncaughtWaveGateFailure,
   specCheckSlotBelongsToWaveEpoch,
   waveAdvisoryDecisionRequestId,
+  waveGateAuthorityDigest,
   waveGateDecisionMismatch,
   waveRefutationCommitProblem,
+  waveRequests,
 } from "../../../../src/handlers/helpers/programs/wave-gate";
 import {
   deriveLoomStatusFromParsedGraph,
@@ -34,14 +40,16 @@ import { derivePendingTaskProof } from "../../../../src/core/proof-obligations";
 import { buildFindingBrief } from "../../../../src/core/review-panel";
 import {
   parseRequestId,
+  type AgentRequestAuthority,
   type ArtifactDigest,
   type OrchestrationRunId,
 } from "../../../../src/core/orchestration-contract";
 import type { WaveReviewRegistrationAuthority } from "../../../../src/core/wave-review-authority";
 import { buildContextPacket, encodeByteSection } from "../../../../src/orchestration/context-packets";
-import { openRunDirectory } from "../../../../src/orchestration/run-directory-handle";
+import { openRunDirectory, type RunDirHandle } from "../../../../src/orchestration/run-directory-handle";
 import type { RegisteredWaveGateProgram } from "../../../../src/handlers/helpers/programs/helpers";
-import { parseTaskGraph } from "../../../../src/state-manager";
+import { parseTaskGraph, StateManager } from "../../../../src/state-manager";
+import { capturedSpecCheck } from "../../../../src/core/spec-check";
 import type { TaskGraph } from "../../../../src/types";
 
 const RUN_ID = "run.wave-decision";
@@ -107,6 +115,128 @@ const registration = (
 
 const pendingDecisionId = (): string => waveAdvisoryDecisionRequestId(RUN_ID, TASKS);
 
+describe("Wave Gate start effect ordering", () => {
+  it("leaves protected bytes unchanged when Run Directory program publication is refused", async () => {
+    const root = canonicalTempDir("loom-wave-publication-refusal-");
+    const runsRoot = join(root, "runs");
+    const runDirectory = join(runsRoot, "run.publication-refusal");
+    const stateDirectory = join(root, ".claude", "state");
+    const statePath = join(stateDirectory, "active_task_graph.json");
+    mkdirSync(runDirectory, { recursive: true });
+    mkdirSync(stateDirectory, { recursive: true });
+    const initial = graph({ active_wave_gate: undefined });
+    writeFileSync(statePath, JSON.stringify(initial));
+    try {
+      const opened = openRunDirectory(runsRoot, runDirectory);
+      expect(opened.ok).toBe(true);
+      if (!opened.ok) return;
+      expect((await opened.value.registerProgram({
+        ...registration({ input: { wave: 2 } }),
+        taskIds: ["T9"],
+      })).ok).toBe(true);
+      const before = readFileSync(statePath);
+      const childEnv: NodeJS.ProcessEnv = { ...process.env, LOOM_STATE_PATH: statePath };
+      delete childEnv.PI_CODING_AGENT;
+      delete childEnv.LOOM_PI_EXTENSION_RUNTIME_REVISION;
+      delete childEnv.LOOM_PI_EXTENSION_RUNTIME_ROOT;
+      const started = spawnSync("bun", [
+        new URL("../../../../src/cli.ts", import.meta.url).pathname,
+        "helper", "orchestration", "start", "wave-gate",
+        "--runs-root", runsRoot, "--run", runDirectory,
+      ], { cwd: root, env: childEnv, input: JSON.stringify({ wave: 1 }), encoding: "utf8" });
+
+      expect(started.status).not.toBe(0);
+      expect(started.stderr).toContain("different program authority");
+      expect(readFileSync(statePath)).toEqual(before);
+      expect(new StateManager(statePath).load().active_wave_gate).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects same-Wave TaskGraph drift after publication without installing stale authority", async () => {
+    const root = canonicalTempDir("loom-wave-start-race-");
+    const statePath = join(root, "active_task_graph.json");
+    const initial = graph({ active_wave_gate: undefined, tasks: [TASKS[0]!] });
+    const taskIds = ["T1"];
+    const authorityDigest = waveGateAuthorityDigest(1, taskIds, initial);
+    const active = {
+      schemaVersion: 1,
+      kind: "active-wave-gate",
+      runId: RUN_ID,
+      wave: 1,
+      authorityDigest,
+      revision: 0,
+      terminalOutcome: null,
+    };
+    writeFileSync(statePath, JSON.stringify({ ...initial, tasks: TASKS }));
+    const before = readFileSync(statePath);
+    try {
+      await expect(new StateManager(statePath).registerActiveWaveGate(active, taskIds))
+        .rejects.toThrow("changed after Run Directory publication");
+      expect(readFileSync(statePath)).toEqual(before);
+      expect(new StateManager(statePath).load().active_wave_gate).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Wave Gate internal-failure boundary", () => {
+  it("returns expected submission refusals without classifying them as internal", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const handle = {
+      readContext: () => ({ ok: false, error: { message: "expected context refusal" } }),
+    } as unknown as RunDirHandle;
+    try {
+      const result = await applyWaveFacadeSubmission(
+        handle,
+        { runId: RUN_ID, contextDigest: DIGEST } as AgentRequestAuthority,
+        "",
+      );
+      expect(result).toEqual({ ok: false, message: "expected context refusal" });
+      expect(stderr).not.toHaveBeenCalled();
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
+  it("routes unexpected submission exceptions through stack-preserving diagnostics", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const handle = {
+      readContext: () => { throw new Error("injected context adapter crash"); },
+    } as unknown as RunDirHandle;
+    try {
+      const result = await applyWaveFacadeSubmission(
+        handle,
+        { runId: RUN_ID, contextDigest: DIGEST } as AgentRequestAuthority,
+        "",
+      );
+      expect(result).toEqual({ ok: false, message: "internal Wave Gate failure: injected context adapter crash" });
+      const diagnostic = stderr.mock.calls.map(([text]) => String(text)).join("");
+      expect(diagnostic).toContain("Error: injected context adapter crash");
+      expect(diagnostic).toContain("wave-gate-decision-authority.test.ts");
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
+  it("retains stack context and classifies the blocked diagnostic as internal", () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const error = new Error("injected reducer defect");
+    try {
+      expect(reportUncaughtWaveGateFailure(RUN_ID, error))
+        .toBe("internal Wave Gate failure: injected reducer defect");
+      const diagnostic = stderr.mock.calls.map(([text]) => String(text)).join("");
+      expect(diagnostic).toContain(`uncaught internal Wave Gate failure in ${RUN_ID}`);
+      expect(diagnostic).toContain("Error: injected reducer defect");
+      expect(diagnostic).toContain("wave-gate-decision-authority.test.ts");
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+});
+
 describe("Wave review registration authority", () => {
   it("requires an exact concrete Wave", () => {
     expectTypeOf<WaveReviewRegistrationAuthority["input"]["wave"]>().toEqualTypeOf<number>();
@@ -166,6 +296,7 @@ describe("wave review context authority", () => {
         completionAnchors: ["FR-1"],
         contributions: [],
         declaredFiles: ["engine/src/a.ts"],
+        modifiedFiles: ["engine/src/a.ts"],
       }],
       packetId: null,
       specFile: null,
@@ -203,6 +334,7 @@ describe("wave review context authority", () => {
       task: null,
       specCheckScope: [{
         id: "T1", description: "review T1", completionAnchors: ["FR-1"], contributions: [], declaredFiles: [],
+        modifiedFiles: [],
       }],
       packetId: null,
       specFile: null,
@@ -237,16 +369,11 @@ describe("wave review context authority", () => {
   it("does not let a paused attempt-1 rejection overwrite accepted attempt-2 evidence", () => {
     const batchEpoch = "b".repeat(64);
     const slotId = "wave-slot:spec-check";
-    const acceptedAttemptTwo = {
+    const acceptedAttemptTwo = capturedSpecCheck({
       wave: 1,
-      run_at: "2026-08-28T00:00:02.000Z",
-      verdict: "PASSED" as const,
-      critical_count: 0,
-      high_count: 0,
-      critical_findings: [],
-      high_findings: [],
-      medium_findings: [],
-    };
+      runAt: "2026-08-28T00:00:02.000Z",
+      criticalFindings: [],
+    });
     const lockedAfterAttemptTwo = graph({
       spec_check: acceptedAttemptTwo,
       wave_review_epoch: {
@@ -257,13 +384,6 @@ describe("wave review context authority", () => {
         specCheckSlotAuthority: { slot_id: slotId, attempted: 2 },
       } as TaskGraph["wave_review_epoch"],
     });
-    const attemptOneFailure = {
-      wave: 1,
-      run_at: "2026-08-28T00:00:01.000Z",
-      verdict: "EVIDENCE_CAPTURE_FAILED" as const,
-      error: "attempt 1 capture rejected",
-    };
-
     const transition = applyCurrentSpecCheckCaptureRejection(
       lockedAfterAttemptTwo,
       { runId: RUN_ID, slotId, attempt: 1 },
@@ -273,7 +393,8 @@ describe("wave review context authority", () => {
         authorityDigest: DIGEST as ArtifactDigest,
         specCheckDocuments: DOCUMENTS,
       },
-      attemptOneFailure,
+      "attempt 1 capture rejected",
+      "2026-08-28T00:00:01.000Z",
     );
 
     expect(transition.applied).toBe(false);
@@ -285,16 +406,11 @@ describe("wave review context authority", () => {
     const batchEpoch = "b".repeat(64);
     const slotId = "wave-slot:spec-check";
     const lockedAttemptOne = graph({
-      spec_check: {
+      spec_check: capturedSpecCheck({
         wave: 1,
-        run_at: "2026-08-28T00:00:00.000Z",
-        verdict: "BLOCKED",
-        critical_count: 1,
-        high_count: 0,
-        critical_findings: ["earlier blocker"],
-        high_findings: [],
-        medium_findings: [],
-      },
+        runAt: "2026-08-28T00:00:00.000Z",
+        criticalFindings: ["earlier blocker"],
+      }),
       wave_gates: {
         "1": { impl_complete: false, tests_passed: null, reviews_complete: false, blocked: true },
       },
@@ -311,6 +427,7 @@ describe("wave review context authority", () => {
       run_at: "2026-08-28T00:00:01.000Z",
       verdict: "EVIDENCE_CAPTURE_FAILED" as const,
       error: "attempt 1 capture rejected",
+      cause: "transcript" as const,
     };
 
     const transition = applyCurrentSpecCheckCaptureRejection(
@@ -322,7 +439,8 @@ describe("wave review context authority", () => {
         authorityDigest: DIGEST as ArtifactDigest,
         specCheckDocuments: DOCUMENTS,
       },
-      failure,
+      failure.error,
+      failure.run_at,
     );
 
     expect(transition.applied).toBe(true);
@@ -353,6 +471,29 @@ describe("wave review context authority", () => {
         task: { id: "T1", reviewGeneration: 0, declaredFiles: ["engine/src/a.ts"] },
         packetId,
       },
+    });
+  });
+
+  it("rejects matching unsafe Task Run and Task review generations", () => {
+    const packetId = "c".repeat(64);
+    const unsafeGeneration = Number.MAX_SAFE_INTEGER + 1;
+    const packet = packetFor({
+      runId: RUN_ID,
+      wave: 1,
+      authorityDigest: DIGEST,
+      batchEpoch: "b".repeat(64),
+      subject: { role: "code-reviewer", taskId: "T1" },
+      taskRun: { taskId: "T1", generation: unsafeGeneration, packetId, headSha: "d".repeat(64) },
+      task: taskAuthority({ reviewGeneration: unsafeGeneration }),
+      specCheckScope: null,
+      packetId,
+      specFile: null,
+      planFile: null,
+    });
+
+    expect(handleWaveReviewContext([packet], packet.digest)).toMatchObject({
+      kind: "corrupt",
+      message: expect.stringContaining("taskRun fields are invalid"),
     });
   });
 
@@ -439,6 +580,108 @@ describe("wave review context authority", () => {
       planFile: null,
     });
     expect(handleWaveReviewContext([packet], packet.digest).kind).toBe("corrupt");
+  });
+});
+
+describe("Wave review epoch installation", () => {
+  it("upgrades a historical floor under lock and clears stale spec-check evidence", async () => {
+    const root = canonicalTempDir("loom-wave-floor-upgrade-");
+    const previousCwd = process.cwd();
+    const runsRoot = join(root, "runs");
+    const runDirectory = join(runsRoot, "run.floor-upgrade");
+    const statePath = join(root, "active_task_graph.json");
+    mkdirSync(join(root, "src"), { recursive: true });
+    mkdirSync(runDirectory, { recursive: true });
+    writeFileSync(join(root, "src", "x.ts"), "export const x = 1;\n");
+    execFileSync("git", ["init", "--quiet"], { cwd: root });
+    execFileSync("git", ["add", "src/x.ts"], { cwd: root });
+    execFileSync("git", [
+      "-c", "user.name=Loom Tests", "-c", "user.email=loom@example.test",
+      "commit", "--quiet", "-m", "fixture",
+    ], { cwd: root });
+    process.chdir(root);
+    try {
+      const pendingTask = {
+        id: "T1",
+        description: "review floor upgrade",
+        agent: "code-implementer-agent",
+        wave: 1,
+        status: "pending" as const,
+        proof: derivePendingTaskProof({ newTestsRequired: false, declaredArtifacts: ["src/x.ts"] }),
+        new_tests_required: false,
+        depends_on: [],
+        file_list: ["src/x.ts"],
+        files_modified: ["src/x.ts"],
+        review_status: "pending" as const,
+        review_generation: 0,
+        findings: [],
+        critical_findings: [],
+        advisory_findings: [],
+      };
+      const beforeActive: TaskGraph = {
+        current_phase: "execute",
+        current_wave: 1,
+        phase_artifacts: {},
+        skipped_phases: [],
+        spec_file: null,
+        plan_file: null,
+        executing_tasks: [],
+        tasks: [pendingTask],
+        wave_gates: {},
+      };
+      const authorityDigest = waveGateAuthorityDigest(1, ["T1"], beforeActive);
+      const registration: RegisteredWaveGateProgram = {
+        schemaVersion: 1,
+        kind: "wave-gate",
+        input: { wave: 1 },
+        taskIds: ["T1"],
+        authorityDigest,
+      };
+      writeFileSync(statePath, JSON.stringify({
+        ...beforeActive,
+        active_wave_gate: {
+          schemaVersion: 1,
+          kind: "active-wave-gate",
+          runId: "run.floor-upgrade",
+          wave: 1,
+          authorityDigest,
+          revision: 0,
+          runsRoot,
+          terminalOutcome: null,
+        },
+      }));
+      const opened = openRunDirectory(runsRoot, runDirectory);
+      expect(opened.ok).toBe(true);
+      if (!opened.ok) return;
+      expect((await opened.value.registerProgram(registration)).ok).toBe(true);
+      const manager = new StateManager(statePath);
+      const batch = waveRequests(opened.value, registration, manager.load(), 1);
+      const specCheckAuthority = batch.requests
+        .map(({ authority }) => authority as AgentRequestAuthority)
+        .find(({ role }) => role === "spec-check-invoker");
+      if (specCheckAuthority === undefined) throw new Error("fixture lacks spec-check authority");
+      await manager.update((locked) => ({
+        ...locked,
+        spec_check: capturedSpecCheck({ wave: 1, runAt: "historical", criticalFindings: [] }),
+        wave_review_epoch: {
+          runId: specCheckAuthority.runId,
+          wave: 1,
+          batchEpoch: batch.batchEpoch,
+          specCheckDocuments: batch.specCheckDocuments,
+          specCheckSlotAuthority: { slot_id: specCheckAuthority.slotId, attempted: 1 },
+        },
+      }));
+
+      await installWaveReviewRuns(manager, registration, batch);
+
+      const upgraded = manager.load();
+      expect(upgraded.spec_check).toBeUndefined();
+      expect(upgraded.wave_review_epoch?.settledSpecCheckFloor).toEqual(batch.settledFloor);
+      expect(upgraded.tasks[0]?.review_run).toBeDefined();
+    } finally {
+      process.chdir(previousCwd);
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

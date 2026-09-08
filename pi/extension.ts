@@ -21,7 +21,7 @@ import { shouldBlockDirectEdit } from "../engine/src/core/block-direct-edits";
 import { activeRosterProbe } from "../engine/src/handlers/pre-tool-use/block-direct-edits";
 import { guardStateFileDecision } from "../engine/src/core/guard-state-file";
 import { validatePhaseOrder } from "../engine/src/core/validate-phase-order";
-import { reconcileWaveBlock } from "../engine/src/core/wave-gate-model";
+import { settleSpecCheck } from "../engine/src/core/spec-check";
 // Both harnesses share ONE protected-state read seam, so a Pi gate and a
 // Claude gate cannot disagree about what "no active plan" means.
 import { realPhaseOrderDeps } from "../engine/src/handlers/pre-tool-use/validate-phase-order";
@@ -181,11 +181,12 @@ const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 // write a schema this in-memory runtime may not parse.
 const LOADED_RUNTIME_IDENTITY = captureLoomRuntimeIdentity(PACKAGE_ROOT);
 // Also frozen at load. Correct under Pi, which sets the environment before it
-// loads any extension — but it makes the FIRST import of this module in a
-// process binding, which matters under `bun test`, where all files share one
-// process: a test file that imports this module before `pi-extension-review-
-// events.test.ts` sets `PI_CODING_AGENT_DIR` pins the real `~/.pi` for the
-// whole run and every agent-definition check there resolves the wrong catalog.
+// loads any extension — but under `bun test` it pins the FIRST import of this
+// module to whichever environment is current in that process, and all files
+// share one process: a test file that imports this module before `pi-
+// extension-review-events.test.ts` sets `PI_CODING_AGENT_DIR` pins the real
+// `~/.pi` for the whole run and every agent-definition check there resolves
+// the wrong catalog.
 // Keep unit tests of this file's pure helpers importing `pi/subagent-result`,
 // which reads no environment, rather than pulling this module in early.
 const PI_AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
@@ -729,6 +730,79 @@ export interface PiCleanupAction {
   readonly run: () => void | Promise<void>;
 }
 
+export type PiStartupSweep = Readonly<{ name: string; run: () => void }>;
+export type PiStartupSweepSource = () => readonly PiStartupSweep[];
+export type PiStartupSweepPorts = Readonly<{
+  /** Return false only when the channel is unavailable and wrote nothing. */
+  writeDiagnostic: (diagnostic: string) => boolean;
+  /** Return false when this session has no UI. */
+  notifyWarning: (message: string) => boolean;
+  /** Process-level fallback, kept explicit so its failure is observable. */
+  writeStderr: (diagnostic: string) => boolean;
+}>;
+
+type UnreportedStartupSweepFailure = Readonly<{
+  error: Error;
+  message: string;
+  reportingFailures: readonly string[];
+}>;
+
+const startupError = (error: unknown): Error =>
+  error instanceof Error ? error : new Error(String(error));
+
+/** Run every startup hygiene sweep and reporting route before surfacing wholly unreported failures. */
+export function runPiStartupSweeps(
+  sweeps: readonly PiStartupSweep[],
+  ports: PiStartupSweepPorts,
+): void {
+  const unreported: UnreportedStartupSweepFailure[] = [];
+  for (const sweep of sweeps) {
+    try {
+      sweep.run();
+    } catch (error) {
+      const sweepError = startupError(error);
+      const message = `session_start sweep failed: ${sweep.name}: ${sweepError.message}; ` +
+        "startup continues because authority is checked at consumption";
+      const diagnostic = sweepError.stack ?? sweepError.message;
+      const reportingFailures: string[] = [];
+      let reported = false;
+      const attemptReport = (label: string, report: () => boolean): void => {
+        try {
+          if (report()) reported = true;
+          else reportingFailures.push(`${label} unavailable`);
+        } catch (reportError) {
+          reportingFailures.push(
+            `${label} failed: ${reportError instanceof Error ? reportError.message : String(reportError)}`,
+          );
+        }
+      };
+
+      attemptReport("diagnostic writer", () =>
+        ports.writeDiagnostic(`loom(pi): ${message}\n${diagnostic}\n`));
+      attemptReport("warning notifier", () =>
+        ports.notifyWarning(`Loom ${message}${cleanupFailureSuffix(reportingFailures)}`));
+      attemptReport("stderr fallback", () =>
+        ports.writeStderr(`loom(pi): ${message}${cleanupFailureSuffix(reportingFailures)}\n`));
+
+      if (!reported) {
+        unreported.push(Object.freeze({
+          error: sweepError,
+          message,
+          reportingFailures: Object.freeze([...reportingFailures]),
+        }));
+      }
+    }
+  }
+  if (unreported.length > 0) {
+    const details = unreported.map(({ message, reportingFailures }) =>
+      `${message}${cleanupFailureSuffix(reportingFailures)}`).join(" | ");
+    throw new AggregateError(
+      unreported.map(({ error }) => error),
+      `Loom session_start sweep failure(s) reached no reporting channel: ${details}`,
+    );
+  }
+}
+
 /** Run every cleanup action even when an earlier capability/roster operation fails. */
 export async function runPiCleanupActions(
   actions: readonly PiCleanupAction[],
@@ -743,6 +817,14 @@ export async function runPiCleanupActions(
   }
   return errors;
 }
+
+const productionPiStartupSweeps: PiStartupSweepSource = () => Object.freeze([
+  Object.freeze({
+    name: "sweepStaleSessions",
+    run: (): void => { sweepStaleSessions(subagentDir(), Date.now() - STALE_SUBAGENT_TTL_MS); },
+  }),
+  Object.freeze({ name: "sweepExpiredPiWriteGrants", run: (): void => sweepExpiredPiWriteGrants() }),
+]);
 
 const cleanupFailureSuffix = (errors: readonly string[]): string =>
   errors.length === 0 ? "" : ` Cleanup failures: ${errors.join("; ")}`;
@@ -1080,7 +1162,10 @@ async function verifyTrustedStandaloneReview(input: Readonly<{ cwd: string; sess
   return outcome.receipt;
 }
 
-export default function (pi: ExtensionAPI) {
+export default function (
+  pi: ExtensionAPI,
+  startupSweepSource: PiStartupSweepSource = productionPiStartupSweeps,
+) {
   assertAnchoredFilesystemPlatformSupported();
   registerInteractiveSubagentTool(pi, PACKAGE_ROOT, PI_AGENT_DIR);
   (globalThis as unknown as Record<PropertyKey, unknown>)[LOOM_REVIEW_AUTHORITY_SYMBOL] = Object.freeze({
@@ -1631,7 +1716,7 @@ export default function (pi: ExtensionAPI) {
 
   // ─── Session Lifecycle ────────────────────────────────────────────────
 
-  pi.on("session_start", async (_event, _ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
     // Cleanup stale subagent tracking files — the ENGINE's sweep, not a
     // per-file twin: staleness is judged per session GROUP (max mtime across
     // the session's files), and the TTL is the shared STALE_SUBAGENT_TTL_MS,
@@ -1639,26 +1724,19 @@ export default function (pi: ExtensionAPI) {
     // fresh `.machine` anchor.
     //
     // Each sweep is guarded on its own: a crash in one must not prevent the
-    // other, and neither must escape the `session_start` handler as an
-    // unhandled rejection. Hygiene, not authority — expired or invalid
-    // grants are independently refused by `consumePiWriteGrant` at the
-    // actual authority boundary, so a missed sweep costs one session's
-    // cleanup, never a write.
-    for (const sweep of [
-      {
-        name: "sweepStaleSessions",
-        run: (): void => { sweepStaleSessions(subagentDir(), Date.now() - STALE_SUBAGENT_TTL_MS); },
+    // other. Hygiene is not authority — expired or invalid grants are still
+    // refused at consumption — but a failure that reaches no diagnostic, UI,
+    // or stderr route escapes as one post-batch aggregate so the harness can
+    // surface it instead of silently losing the only operator signal.
+    runPiStartupSweeps(startupSweepSource(), {
+      writeDiagnostic: (diagnostic) => { process.stderr.write(diagnostic); return true; },
+      notifyWarning: (message) => {
+        if (!ctx.hasUI) return false;
+        ctx.ui.notify(message, "warning");
+        return true;
       },
-      { name: "sweepExpiredPiWriteGrants", run: (): void => sweepExpiredPiWriteGrants() },
-    ]) {
-      try {
-        sweep.run();
-      } catch (error) {
-        process.stderr.write(
-          `loom(pi): session_start sweep failed: ${sweep.name}: ${error instanceof Error ? error.message : String(error)}\n`,
-        );
-      }
-    }
+      writeStderr: (diagnostic) => { process.stderr.write(diagnostic); return true; },
+    });
   });
 
   // Each Pi subagent is a separate `pi --no-session` process. Parent-session
@@ -2318,8 +2396,9 @@ export default function (pi: ExtensionAPI) {
                   return next;
                 }, task);
               });
+              const reviewedState: TaskGraph = { ...state, tasks };
               const specAuthorityProblems: string[] = [];
-              let specCheckPatch: Pick<TaskGraph, "spec_check"> | undefined;
+              let settledState = reviewedState;
               if (missingSpecChecks.length > 1) {
                 specAuthorityProblems.push("multiple reserved spec-check slots were missing; no unique authority exists");
               } else if (missingSpecChecks.length === 1) {
@@ -2329,26 +2408,16 @@ export default function (pi: ExtensionAPI) {
                 if (problem !== null || authority === null) {
                   specAuthorityProblems.push(problem ?? "reserved spec-check authority is absent");
                 } else {
-                  specCheckPatch = {
-                    spec_check: {
-                      wave: authority.wave,
-                      run_at: runAt,
-                      verdict: "EVIDENCE_CAPTURE_FAILED" as const,
-                      error: `reserved spec-check result ${missing.index + 1} for spec-check-invoker was missing or mismatched`,
-                    },
-                  };
+                  settledState = settleSpecCheck(reviewedState, {
+                    kind: "capture-failure",
+                    wave: authority.wave,
+                    runAt,
+                    error: `reserved spec-check result ${missing.index + 1} for spec-check-invoker was missing or mismatched`,
+                  }).state;
                 }
               }
-              const specCheck = specCheckPatch?.spec_check;
               return {
-                state: {
-                  ...state,
-                  tasks,
-                  ...(specCheckPatch ?? {}),
-                  ...(specCheck === undefined
-                    ? {}
-                    : { wave_gates: reconcileWaveBlock(state.wave_gates, tasks, specCheck, specCheck.wave) }),
-                },
+                state: settledState,
                 value: Object.freeze({
                   appliedReviewIndexes: Object.freeze(appliedReviewIndexes),
                   specAuthorityProblems: Object.freeze(specAuthorityProblems),

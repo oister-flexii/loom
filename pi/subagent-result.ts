@@ -31,12 +31,14 @@ import {
 } from "../engine/src/core/review-output";
 import {
   parseSpecCheckOutput,
-  reconcileSpecCheck,
+  settleSpecCheck,
   type ParsedSpecCheckOutput,
 } from "../engine/src/core/spec-check";
-import { waveSpecCheckDocumentsMatch } from "../engine/src/core/wave-review-authority";
+import {
+  epochSettledFloor,
+  waveSpecCheckDocumentsMatch,
+} from "../engine/src/core/wave-review-authority";
 import { observeWaveSpecCheckDocuments } from "../engine/src/orchestration/wave-spec-check-documents";
-import { reconcileWaveBlock } from "../engine/src/core/wave-gate-model";
 import {
   parseSpecArtifactDirectory,
   phaseArtifactUpdates,
@@ -284,14 +286,37 @@ export type PiSpecCheckAttemptAuthority = Readonly<{
   attempt: WaveSpecCheckSlotAuthority["attempted"];
 }>;
 
-export type PiReviewAttemptAuthority = Readonly<{
+type PiReviewAttemptAuthorityBase = Readonly<{
   taskId: string;
   agentType: string;
-  generation: number;
-  packetId: string | null;
-  slotId: string | null;
-  attempted: 1 | 2 | null;
 }>;
+
+export type PiReviewAttemptAuthority =
+  | Readonly<PiReviewAttemptAuthorityBase & {
+      kind: "legacy";
+      generation: 0;
+      packetId?: never;
+      slotId?: never;
+      attempted?: never;
+    }>
+  | Readonly<PiReviewAttemptAuthorityBase & {
+      kind: "slot-bound";
+      generation: number;
+      packetId: string;
+      slotId: string;
+      attempted: 1 | 2;
+    }>;
+
+/**
+ * Whether a Task is explicitly legacy: no Review Run, review generation,
+ * retained accepted-review authority, or issued Review Packet. Authority
+ * minting and validation must share this one predicate.
+ */
+const isExplicitlyLegacyTask = (task: LoomTask): boolean =>
+  task.review_run === undefined &&
+  task.review_generation === undefined &&
+  task.accepted_review_authority === undefined &&
+  (task.issued_review_packets?.length ?? 0) === 0;
 
 function reviewAuthorityForTask(
   task: LoomTask,
@@ -299,23 +324,19 @@ function reviewAuthorityForTask(
 ): PiReviewAttemptAuthority | null {
   const run = task.review_run;
   if (run === undefined) {
-    const explicitlyLegacy = task.review_generation === undefined &&
-      task.accepted_review_authority === undefined &&
-      (task.issued_review_packets?.length ?? 0) === 0;
-    return explicitlyLegacy
+    return isExplicitlyLegacyTask(task)
       ? Object.freeze({
+          kind: "legacy" as const,
           taskId: task.id,
           agentType,
-          generation: 0,
-          packetId: null,
-          slotId: null,
-          attempted: null,
+          generation: 0 as const,
         })
       : null;
   }
   const slot = run.slot_authority?.find((candidate) => candidate.agent === agentType);
   if (slot === undefined) return null;
   return Object.freeze({
+    kind: "slot-bound" as const,
     taskId: task.id,
     agentType,
     generation: run.generation,
@@ -343,21 +364,22 @@ export function piReviewAuthorityProblem(
 ): string | null {
   const currentAuthority = reviewAuthorityForTask(task, agentType);
   if (reservedAuthority == null) {
-    const explicitlyLegacy = task.review_run === undefined &&
-      task.review_generation === undefined &&
-      task.accepted_review_authority === undefined &&
-      (task.issued_review_packets?.length ?? 0) === 0;
-    return explicitlyLegacy
+    return isExplicitlyLegacyTask(task)
       ? null
       : "reviewer has no exact current or retained review-generation authority";
   }
-  return currentAuthority !== null &&
-      currentAuthority.taskId === reservedAuthority.taskId &&
-      currentAuthority.agentType === reservedAuthority.agentType &&
-      currentAuthority.generation === reservedAuthority.generation &&
-      currentAuthority.packetId === reservedAuthority.packetId &&
-      currentAuthority.slotId === reservedAuthority.slotId &&
-      currentAuthority.attempted === reservedAuthority.attempted
+  const sameBase = currentAuthority !== null &&
+    currentAuthority.kind === reservedAuthority.kind &&
+    currentAuthority.taskId === reservedAuthority.taskId &&
+    currentAuthority.agentType === reservedAuthority.agentType &&
+    currentAuthority.generation === reservedAuthority.generation;
+  const matches = sameBase && currentAuthority !== null &&
+    (currentAuthority.kind === "legacy" ||
+      (reservedAuthority.kind === "slot-bound" &&
+       currentAuthority.packetId === reservedAuthority.packetId &&
+       currentAuthority.slotId === reservedAuthority.slotId &&
+       currentAuthority.attempted === reservedAuthority.attempted));
+  return matches
     ? null
     : "failed reviewer reservation does not match exact current Task/Review Run slot authority";
 }
@@ -606,9 +628,9 @@ async function applyFailedSpecCheckResult(
     const diagnostic = `spec-check TaskGraph load failed: ${cause instanceof Error ? cause.message : String(cause)}`;
     return outcome([`loom(pi): ${diagnostic}`], [diagnostic]);
   }
-  let documents: WaveSpecCheckDocumentsAuthority;
+  let specObservation;
   try {
-    documents = observeWaveSpecCheckDocuments(observedState.spec_file, observedState.plan_file);
+    specObservation = observeWaveSpecCheckDocuments(observedState.spec_file, observedState.plan_file);
   } catch (cause) {
     const diagnostic = `spec-check document observation failed: ${cause instanceof Error ? cause.message : String(cause)}`;
     return outcome([`loom(pi): ${diagnostic}`], [diagnostic]);
@@ -619,7 +641,7 @@ async function applyFailedSpecCheckResult(
         state,
         args.reservedSlot?.specCheckAuthority,
         { kind: "capture-failed", error: failure },
-        documents,
+        specObservation.authority,
         args.now,
       ));
   } catch (cause) {
@@ -1527,34 +1549,30 @@ async function applyLockedReviewEvidence(args: Readonly<{
   reviewAuthority: PiReviewAttemptAuthority | null | undefined;
   resolutionFor(task: LoomTask): ReviewResolution;
 }>): Promise<PiResultOutcome> {
-  const result: { application: LockedReviewEvidenceApplication } = {
-    application: { kind: "missing" },
-  };
-  await args.store.update((state) => {
+  const application = await args.store.updateAndReturn<LockedReviewEvidenceApplication>((state) => {
     const task = state.tasks.find((candidate) => candidate.id === args.taskId);
-    if (task === undefined) return state;
+    if (task === undefined) return { state, value: { kind: "missing" } };
     const authorityProblem = piReviewAuthorityProblem(task, args.agentType, args.reviewAuthority);
     if (authorityProblem !== null) {
-      result.application = { kind: "authority-rejected", problem: authorityProblem };
-      return state;
+      return { state, value: { kind: "authority-rejected", problem: authorityProblem } };
     }
     const resolution = args.resolutionFor(task);
     const appliedTask = applyReviewResolution(task, resolution);
-    result.application = {
-      kind: "applied",
-      resolution,
-      task: appliedTask,
-      changed: appliedTask !== task,
+    return {
+      state: appliedTask === task
+        ? state
+        : {
+            ...state,
+            tasks: state.tasks.map((candidate) => candidate.id === args.taskId ? appliedTask : candidate),
+          },
+      value: {
+        kind: "applied",
+        resolution,
+        task: appliedTask,
+        changed: appliedTask !== task,
+      },
     };
-    return appliedTask === task
-      ? state
-      : {
-          ...state,
-          tasks: state.tasks.map((candidate) => candidate.id === args.taskId ? appliedTask : candidate),
-        };
   });
-
-  const application = result.application;
   if (application.kind === "missing") {
     const message = `WARNING: ${args.agentType} review task ${args.taskId} disappeared before evidence application — findings NOT stored`;
     return processingFailure(message);
@@ -1691,22 +1709,7 @@ export function piSpecCheckAuthorityProblem(
   return decision.kind === "accepted" ? null : decision.problem;
 }
 
-function commitPiSpecCheck(
-  state: TaskGraph,
-  specCheck: NonNullable<TaskGraph["spec_check"]>,
-  value: PiResultOutcome,
-): Readonly<{ state: TaskGraph; value: PiResultOutcome }> {
-  return {
-    state: {
-      ...state,
-      spec_check: specCheck,
-      wave_gates: reconcileWaveBlock(state.wave_gates, state.tasks, specCheck, specCheck.wave),
-    },
-    value,
-  };
-}
-
-/** Pure spec-check command under exact locked Wave slot authority. */
+/** Pure spec-check authority adapter around the shared aggregate command. */
 function reducePiSpecCheckResult(
   state: TaskGraph,
   authority: PiSpecCheckAttemptAuthority | null | undefined,
@@ -1720,29 +1723,19 @@ function reducePiSpecCheckResult(
     return { state, value: outcome([`loom(pi): ${diagnostic}`], [diagnostic]) };
   }
   const wave = authorityDecision.authority.wave;
-  if (observation.kind === "capture-failed") {
-    const specCheck = {
-      wave,
-      run_at: now,
-      verdict: "EVIDENCE_CAPTURE_FAILED" as const,
-      error: observation.error,
-    };
-    return commitPiSpecCheck(
-      state,
-      specCheck,
-      outcome([`loom(pi): ${observation.error} — marking spec-check evidence_capture_failed`]),
-    );
-  }
-
-  const resolution = reconcileSpecCheck(observation.findings, wave, now);
-  if (resolution.kind === "evidence-failed") {
-    return commitPiSpecCheck(
-      state,
-      resolution.specCheck,
-      outcome([`loom(pi): ${resolution.specCheck.error} — marking spec-check evidence_capture_failed`]),
-    );
-  }
-  return commitPiSpecCheck(state, resolution.specCheck, outcome());
+  const settlement = observation.kind === "capture-failed"
+    ? settleSpecCheck(state, { kind: "capture-failure", wave, runAt: now, error: observation.error })
+    : settleSpecCheck(state, {
+        kind: "registered-transcript",
+        parsed: observation.findings,
+        wave,
+        runAt: now,
+        floor: epochSettledFloor(state.wave_review_epoch),
+      });
+  const value = settlement.specCheck.verdict === "EVIDENCE_CAPTURE_FAILED"
+    ? outcome([`loom(pi): ${settlement.specCheck.error} — marking spec-check evidence_capture_failed`])
+    : outcome();
+  return { state: settlement.state, value };
 }
 
 /**
@@ -1767,9 +1760,10 @@ export async function applySpecCheckPiResult(args: Readonly<{
       };
   try {
     const observedState = args.store.load();
-    const documents = observeWaveSpecCheckDocuments(observedState.spec_file, observedState.plan_file);
+    const specObservation = observeWaveSpecCheckDocuments(observedState.spec_file, observedState.plan_file);
     return await args.store.updateAndReturn((state) =>
-      reducePiSpecCheckResult(state, args.reservedSlot?.specCheckAuthority, observation, documents, args.now));
+      reducePiSpecCheckResult(state, args.reservedSlot?.specCheckAuthority, observation,
+        specObservation.authority, args.now));
   } catch (error) {
     const diagnostic = `spec-check state commit failed: ${error instanceof Error ? error.message : String(error)}`;
     return outcome([`loom(pi): ${diagnostic}`], [diagnostic]);

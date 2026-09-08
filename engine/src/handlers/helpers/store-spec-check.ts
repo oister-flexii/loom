@@ -15,10 +15,10 @@ import { TASK_GRAPH_PATH } from "../../config";
 import {
   decideSpecCheckManualOverride,
   parseSpecCheckOutput,
-  reconcileSpecCheck,
+  settleSpecCheck,
   type SpecCheckManualOverride,
 } from "../../core/spec-check";
-import { reconcileWaveBlock } from "../../core/wave-gate-model";
+import { manualOverrideFloor } from "../../core/requirement-coverage";
 import { StateManager } from "../../state-manager";
 
 type SpecCheckStore = Pick<StateManager, "updateAndReturn">;
@@ -64,24 +64,37 @@ export async function runStoreSpecCheck(
     }
 
     const wave = parsed.wave ?? state.current_wave ?? 1;
-    const resolution = reconcileSpecCheck(parsed, wave, runAt);
-    if (resolution.kind === "evidence-failed") {
+    // Manual authority is distinct from an unprojected registered capture.
+    // The latter fails closed because absence of projection evidence cannot
+    // pass; this arm exists only after `decideSpecCheckManualOverride` proved
+    // the separately authorized operator path.
+    const reason = override.reason ?? "legacy manual store-spec-check override";
+    const settlement = settleSpecCheck(state, {
+      kind: "manual-transcript",
+      parsed,
+      wave,
+      runAt,
+      authority: manualOverrideFloor(reason),
+    });
+    if (settlement.kind === "manual-evidence-refused") {
       return {
         state,
-        value: Object.freeze({ kind: "invalid-evidence", message: resolution.specCheck.error }),
+        value: Object.freeze({ kind: "invalid-evidence", message: settlement.specCheck.error }),
+      };
+    }
+    if (settlement.specCheck.verdict === "EVIDENCE_CAPTURE_FAILED") {
+      return {
+        state,
+        value: Object.freeze({ kind: "invalid-evidence", message: settlement.specCheck.error }),
       };
     }
     return {
-      state: {
-        ...state,
-        spec_check: resolution.specCheck,
-        wave_gates: reconcileWaveBlock(state.wave_gates, state.tasks, resolution.specCheck, wave),
-      },
+      state: settlement.state,
       value: Object.freeze({
         kind: "stored",
         wave,
-        criticalCount: resolution.specCheck.critical_count,
-        verdict: resolution.specCheck.verdict,
+        criticalCount: settlement.specCheck.critical_count,
+        verdict: settlement.specCheck.verdict,
         overrideReason: override.reason,
       }),
     };

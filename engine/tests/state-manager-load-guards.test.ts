@@ -9,10 +9,16 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   parseCompletedWaveGateRegistration,
   parseTaskGraph,
+  StateManager,
 } from "../src/state-manager";
+import { recordReviewRunEvidence } from "../src/core/findings";
+import type { AcceptedReviewAuthority } from "../src/types";
 import {
   authorizeWaveCompletionSuite,
   defaultVerificationManifest,
@@ -284,6 +290,262 @@ describe("taskFindingsError slot_authority validation", () => {
   });
 });
 
+describe("stored Finding location authority", () => {
+  const finding = {
+    id: "code-reviewer-1",
+    agent: "code-reviewer",
+    severity: "critical",
+    file: null,
+    line: null,
+    claim: "load boundary must prove locations",
+  };
+  const legacyFinding = (({ file: _file, line: _line, ...rest }) => rest)(finding);
+  const refutation = (storedFinding: unknown) => ({
+    finding: storedFinding,
+    refutations: [{ lens: "intent", reason: "not reproducible" }],
+  });
+  const resolution = (storedFinding: unknown) => ({
+    finding: storedFinding,
+    resolution: {
+      kind: "resolved_by_remediation",
+      generation: 1,
+      packet_id: PACKET,
+      head_sha: HEAD,
+      expected_agents: ["code-reviewer"],
+      assessments: [{
+        finding_id: typeof storedFinding === "object" && storedFinding !== null && "id" in storedFinding
+          ? String(storedFinding.id)
+          : finding.id,
+        verdict: "resolved_by_remediation",
+        reason: "fixed",
+        agent: "code-reviewer",
+      }],
+    },
+  });
+
+  it("normalizes omitted legacy locations in every Finding-bearing container", () => {
+    const parsed = parseTaskGraph(graph({
+      tasks: [{
+        ...validTask,
+        findings: [legacyFinding],
+        critical_findings: [finding.claim],
+        advisory_findings: [],
+        refuted_findings: [refutation({ ...legacyFinding, id: "code-reviewer-2" })],
+        resolved_findings: [resolution({ ...legacyFinding, id: "code-reviewer-3" })],
+      }],
+    }));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.tasks[0]?.findings?.[0]).toMatchObject({ file: null, line: null });
+    expect(parsed.value.tasks[0]?.refuted_findings?.[0]?.finding).toMatchObject({ file: null, line: null });
+    expect(parsed.value.tasks[0]?.resolved_findings?.[0]?.finding).toMatchObject({ file: null, line: null });
+  });
+
+  it.each([
+    ["numeric file", { ...finding, file: 42 }],
+    ["object line", { ...finding, line: {} }],
+    ["unsafe line", { ...finding, line: Number.MAX_SAFE_INTEGER + 1 }],
+    ["numeric-string line", { ...finding, line: "42" }],
+  ])("rejects an explicitly noncanonical active Finding with %s", (_label, malformed) => {
+    expect(errorOf(graph({
+      tasks: [{
+        ...validTask,
+        findings: [malformed],
+        critical_findings: [finding.claim],
+        advisory_findings: [],
+      }],
+    }))).toContain("not a well-formed finding");
+  });
+
+  it.each([
+    ["refuted", (malformed: unknown) => refutation(malformed)],
+    ["resolved", (malformed: unknown) => resolution(malformed)],
+  ])("rejects malformed explicit locations nested in %s findings", (container, envelope) => {
+    const field = container === "refuted" ? "refuted_findings" : "resolved_findings";
+    expect(errorOf(graph({
+      tasks: [{ ...validTask, [field]: [envelope({ ...finding, file: 42 })] }],
+    }))).toContain("not a well-formed");
+  });
+
+  const stagedReviewTask = (newFinding: unknown) => reviewedTask({
+    review_run: {
+      ...reviewedTask().review_run,
+      evidence: [{
+        agent: "code-reviewer",
+        prior_assessments: [],
+        new_findings: [newFinding],
+      }],
+    },
+  });
+
+  it.each([
+    ["numeric file", { severity: "critical", file: 42, line: null, claim: "staged blocker" }],
+    ["padded file", { severity: "critical", file: " src/x.ts ", line: null, claim: "staged blocker" }],
+    ["numeric-string line", { severity: "critical", file: null, line: "7", claim: "staged blocker" }],
+    ["zero line", { severity: "critical", file: null, line: 0, claim: "staged blocker" }],
+  ])("rejects a Review Run draft with an explicitly noncanonical %s", (_label, malformed) => {
+    expect(errorOf(graph({ tasks: [stagedReviewTask(malformed)] })))
+      .toContain("review_run.evidence[0].new_findings must be well-formed draft findings");
+  });
+
+  it("loads canonical staged locations and preserves them through Review Run finalization", () => {
+    const parsed = parseTaskGraph(graph({
+      tasks: [stagedReviewTask({
+        severity: "critical",
+        file: "src/x.ts",
+        line: 7,
+        claim: "staged blocker",
+      })],
+    }));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+
+    const transition = recordReviewRunEvidence(parsed.value.tasks[0]!, PACKET, 1, {
+      agent: "silent-failure-hunter",
+      prior_assessments: [],
+      new_findings: [],
+    });
+    expect(transition).toMatchObject({ ok: true, completed: true });
+    if (!transition.ok) return;
+    expect(transition.task.findings).toContainEqual(expect.objectContaining({
+      agent: "code-reviewer",
+      file: "src/x.ts",
+      line: 7,
+      claim: "staged blocker",
+    }));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Requirement Content Hash authority
+// ---------------------------------------------------------------------------
+
+describe("parseTaskGraph spec_anchor_hashes load boundary", () => {
+  it("round-trips a record of strings", () => {
+    const parsed = parseTaskGraph(graph({
+      tasks: [{ ...validTask, spec_anchor_hashes: { "FR-001": DIGEST("a") } }],
+    }));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.tasks[0]?.spec_anchor_hashes).toEqual({ "FR-001": DIGEST("a") });
+    expect(Object.isFrozen(parsed.value.tasks[0]?.spec_anchor_hashes)).toBe(true);
+  });
+
+  it.each([42, null, true, {}, []])("refuses non-string hash value %j", (value) => {
+    expect(errorOf(graph({
+      tasks: [{ ...validTask, spec_anchor_hashes: { "FR-001": value } }],
+    }))).toContain('tasks[0].spec_anchor_hashes["FR-001"] must be a string');
+  });
+
+  it.each([null, [], "hash"])("refuses non-record spec_anchor_hashes %j", (value) => {
+    expect(errorOf(graph({
+      tasks: [{ ...validTask, spec_anchor_hashes: value }],
+    }))).toContain("spec_anchor_hashes must be a record of strings");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Durable decompose-time Spec Index observation
+// ---------------------------------------------------------------------------
+
+describe("parseTaskGraph spec_index_observation load boundary", () => {
+  it("preserves legacy graphs where the observation is absent", () => {
+    const parsed = parseTaskGraph(graph());
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.spec_index_observation).toBeUndefined();
+  });
+
+  it.each([
+    {
+      label: "indexed identity",
+      specFile: "spec.md",
+      observation: { kind: "indexed", path: "spec.md", contentDigest: DIGEST("a") },
+    },
+    {
+      label: "no spec file",
+      specFile: null,
+      observation: { kind: "unavailable", reason: { kind: "no-spec-file" } },
+    },
+    {
+      label: "unreadable spec",
+      specFile: "spec.md",
+      observation: { kind: "unavailable", reason: { kind: "unreadable", path: "spec.md", reason: "EACCES" } },
+    },
+    {
+      label: "invalid encoding",
+      specFile: "spec.md",
+      observation: {
+        kind: "unavailable",
+        reason: { kind: "invalid-encoding", path: "spec.md", contentDigest: DIGEST("b"), reason: "invalid UTF-8" },
+      },
+    },
+    {
+      label: "unparsed spec",
+      specFile: "spec.md",
+      observation: {
+        kind: "unavailable",
+        reason: {
+          kind: "unparsed",
+          path: "spec.md",
+          contentDigest: DIGEST("c"),
+          errors: [{ kind: "entry-not-canonical", section: "Functional Requirements", line: 12 }],
+        },
+      },
+    },
+  ])("parses and deeply freezes $label", ({ specFile, observation }) => {
+    const parsed = parseTaskGraph(graph({ spec_file: specFile, spec_index_observation: observation }));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const stored = parsed.value.spec_index_observation;
+    expect(stored).toEqual(observation);
+    expect(Object.isFrozen(stored)).toBe(true);
+    if (stored?.kind === "unavailable") {
+      expect(Object.isFrozen(stored.reason)).toBe(true);
+      if (stored.reason.kind === "unparsed") {
+        expect(Object.isFrozen(stored.reason.errors)).toBe(true);
+        expect(Object.isFrozen(stored.reason.errors[0])).toBe(true);
+      }
+    }
+  });
+
+  it.each([
+    ["non-object", []],
+    ["unknown tag", { kind: "maybe" }],
+    ["indexed digest", { kind: "indexed", path: "spec.md", contentDigest: "bad" }],
+    ["persisted ParsedSpec", { kind: "indexed", path: "spec.md", contentDigest: DIGEST("a"), index: {} }],
+    ["unavailable surplus field", { kind: "unavailable", reason: { kind: "no-spec-file" }, extra: true }],
+    ["unreadable missing reason", { kind: "unavailable", reason: { kind: "unreadable", path: "spec.md" } }],
+    ["invalid encoding digest", {
+      kind: "unavailable",
+      reason: { kind: "invalid-encoding", path: "spec.md", contentDigest: "bad", reason: "invalid" },
+    }],
+    ["unparsed empty errors", {
+      kind: "unavailable",
+      reason: { kind: "unparsed", path: "spec.md", contentDigest: DIGEST("a"), errors: [] },
+    }],
+    ["unparsed malformed error", {
+      kind: "unavailable",
+      reason: {
+        kind: "unparsed",
+        path: "spec.md",
+        contentDigest: DIGEST("a"),
+        errors: [{ kind: "entry-not-canonical", section: "not-a-section", line: 0 }],
+      },
+    }],
+  ])("fails closed for malformed stored shape: %s", (_label, observation) => {
+    expect(errorOf(graph({ spec_file: "spec.md", spec_index_observation: observation })))
+      .toContain("spec_index_observation");
+  });
+
+  it("refuses an observation that contradicts protected spec_file authority", () => {
+    expect(errorOf(graph({
+      spec_file: "spec.md",
+      spec_index_observation: { kind: "indexed", path: "other.md", contentDigest: DIGEST("a") },
+    }))).toContain("path must match protected spec_file");
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Wave review epoch authority
 // ---------------------------------------------------------------------------
@@ -453,6 +715,38 @@ describe("parseTaskGraph wave_review_epoch authority", () => {
     }))).toContain("paths must match spec_file/plan_file");
   });
 
+  it.each([
+    [
+      "identity-bearing settled",
+      { kind: "settled", count: 2, criticalFindings: ["required one", "required two"] },
+      { kind: "settled", count: 2, criticalFindings: ["required one", "required two"] },
+    ],
+    ["historical count-only", { kind: "settled", count: 3 }, { kind: "legacy-settled", count: 3 }],
+    [
+      "unprojected",
+      { kind: "unprojected", reason: "the TaskGraph records no spec_file" },
+      { kind: "unprojected", reason: "the TaskGraph records no spec_file" },
+    ],
+  ])("parses and freezes a %s Requirement Coverage floor", (_label, floor, expected) => {
+    const parsed = parseTaskGraph(graph({
+      current_wave: 1,
+      wave_review_epoch: waveReviewEpoch({ settledSpecCheckFloor: floor }),
+    }));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.wave_review_epoch?.settledSpecCheckFloor).toEqual(expected);
+    expect(isDeeplyFrozen(parsed.value.wave_review_epoch?.settledSpecCheckFloor)).toBe(true);
+  });
+
+  it("keeps an epoch installed before the floor was recorded readable", () => {
+    // Absent is a historical fact, not corruption; `epochSettledFloor` is where
+    // that absence acquires its stated meaning.
+    const parsed = parseTaskGraph(graph({ current_wave: 1, wave_review_epoch: waveReviewEpoch() }));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.wave_review_epoch?.settledSpecCheckFloor).toBeUndefined();
+  });
+
   it("keeps historical epochs readable without spec-check slot authority", () => {
     const legacy = waveReviewEpoch();
     const { specCheckSlotAuthority: _absent, ...withoutSlotAuthority } = legacy;
@@ -474,6 +768,37 @@ describe("parseTaskGraph wave_review_epoch authority", () => {
     ["bad spec-check attempt", waveReviewEpoch({ specCheckSlotAuthority: { slot_id: "wave-slot:spec-check", attempted: 3 } })],
     ["surplus spec-check slot field", waveReviewEpoch({ specCheckSlotAuthority: { slot_id: "wave-slot:spec-check", attempted: 1, forged: true } })],
     ["unknown field", waveReviewEpoch({ forged: true })],
+    // A corrupt floor must not degrade to "no floor": that would silently
+    // unfloor a live epoch, which is the exact failure recording it prevents.
+    ["forged settled floor", waveReviewEpoch({ settledSpecCheckFloor: "forged" })],
+    ["unknown floor variant", waveReviewEpoch({ settledSpecCheckFloor: { kind: "waived" } })],
+    ["manual override floor", waveReviewEpoch({
+      settledSpecCheckFloor: { kind: "manual-override", reason: "operator" },
+    })],
+    ["settled floor with no count", waveReviewEpoch({ settledSpecCheckFloor: { kind: "settled" } })],
+    ["negative settled floor", waveReviewEpoch({ settledSpecCheckFloor: { kind: "settled", count: -1 } })],
+    ["non-integer settled floor", waveReviewEpoch({ settledSpecCheckFloor: { kind: "settled", count: 1.5 } })],
+    ["unsafe settled floor", waveReviewEpoch({ settledSpecCheckFloor: { kind: "settled", count: 1e100 } })],
+    ["settled identity/count mismatch", waveReviewEpoch({
+      settledSpecCheckFloor: { kind: "settled", count: 2, criticalFindings: ["only one"] },
+    })],
+    ["misspelled settled identity field", waveReviewEpoch({
+      settledSpecCheckFloor: { kind: "settled", count: 1, criticalFinding: ["misspelled"] },
+    })],
+    ["surplus historical settled field", waveReviewEpoch({
+      settledSpecCheckFloor: { kind: "settled", count: 1, forged: true },
+    })],
+    ["surplus current settled field", waveReviewEpoch({
+      settledSpecCheckFloor: { kind: "settled", count: 1, criticalFindings: ["required"], forged: true },
+    })],
+    ["blank settled identity", waveReviewEpoch({
+      settledSpecCheckFloor: { kind: "settled", count: 1, criticalFindings: ["  "] },
+    })],
+    ["duplicate settled identity", waveReviewEpoch({
+      settledSpecCheckFloor: { kind: "settled", count: 2, criticalFindings: ["same", "same"] },
+    })],
+    ["unprojected floor with no reason", waveReviewEpoch({ settledSpecCheckFloor: { kind: "unprojected" } })],
+    ["unprojected floor with a blank reason", waveReviewEpoch({ settledSpecCheckFloor: { kind: "unprojected", reason: "  " } })],
   ])("refuses %s", (_label, epoch) => {
     expect(errorOf(graph({ wave_review_epoch: epoch }))).toContain("wave_review_epoch");
   });
@@ -672,6 +997,105 @@ describe("parseTaskGraph protected completion authority", () => {
 });
 
 // ---------------------------------------------------------------------------
+// persisted spec-check evidence
+// ---------------------------------------------------------------------------
+
+describe("parseTaskGraph spec_check count and provenance authority", () => {
+  const captured = (overrides: Record<string, unknown> = {}) => ({
+    wave: 1,
+    run_at: "now",
+    verdict: "PASSED",
+    critical_count: 0,
+    high_count: 0,
+    critical_findings: [],
+    high_findings: [],
+    medium_findings: [],
+    ...overrides,
+  });
+
+  it.each([1e100, Number.MAX_SAFE_INTEGER + 1])("refuses unsafe captured count %s", (count) => {
+    expect(errorOf(graph({ spec_check: captured({ critical_count: count }) }))).toContain("safe integer");
+  });
+
+  it("normalizes historical UNKNOWN into retryable evidence failure", () => {
+    const parsed = parseTaskGraph(graph({ spec_check: captured({ verdict: "UNKNOWN" }) }));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.spec_check).toMatchObject({
+      verdict: "EVIDENCE_CAPTURE_FAILED",
+      cause: "transcript",
+      error: expect.stringContaining("UNKNOWN"),
+    });
+  });
+
+  it("migrates UNKNOWN with critical findings without leaving a causeless Wave block", () => {
+    const parsed = parseTaskGraph(graph({
+      spec_check: captured({
+        verdict: "UNKNOWN",
+        critical_count: 1,
+        critical_findings: ["historical blocker"],
+      }),
+      wave_gates: {
+        "1": { impl_complete: false, tests_passed: null, reviews_complete: false, blocked: true },
+      },
+    }));
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.spec_check).toMatchObject({
+      verdict: "EVIDENCE_CAPTURE_FAILED",
+      cause: "transcript",
+    });
+    expect(parsed.value.wave_gates["1"]?.blocked).toBe(false);
+  });
+
+  it("preserves a legitimate review block while migrating UNKNOWN evidence", () => {
+    const finding = {
+      id: "code-reviewer-1", agent: "code-reviewer", severity: "critical",
+      file: null, line: null, claim: "review blocker",
+    };
+    const parsed = parseTaskGraph(graph({
+      tasks: [{
+        ...validTask, review_status: "blocked", findings: [finding],
+        critical_findings: [finding.claim], advisory_findings: [],
+      }],
+      spec_check: captured({
+        verdict: "UNKNOWN", critical_count: 1, critical_findings: ["historical blocker"],
+      }),
+      wave_gates: {
+        "1": { impl_complete: false, tests_passed: null, reviews_complete: false, blocked: true },
+      },
+    }));
+
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) expect(parsed.value.wave_gates["1"]?.blocked).toBe(true);
+  });
+
+  it("round-trips a non-empty manual override source", () => {
+    const source = { kind: "manual-override", reason: "operator accepted false-positive" };
+    const parsed = parseTaskGraph(graph({ spec_check: captured({ evidence_source: source }) }));
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) expect(parsed.value.spec_check).toMatchObject({ evidence_source: source });
+  });
+
+  it.each([
+    { kind: "manual-override", reason: "  " },
+    { kind: "registered", reason: "invented" },
+    { kind: "manual-override", reason: "valid", surplus: true },
+  ])("refuses malformed evidence source %j", (evidence_source) => {
+    expect(errorOf(graph({ spec_check: captured({ evidence_source }) }))).toContain("evidence_source");
+  });
+
+  it.each([
+    ["PASSED", 1, ["critical"]],
+    ["BLOCKED", 0, []],
+  ])("refuses contradictory %s/count evidence", (verdict, critical_count, critical_findings) => {
+    expect(errorOf(graph({ spec_check: captured({ verdict, critical_count, critical_findings }) })))
+      .toContain("spec_check.verdict");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // wave_gates keys are persisted canonical Wave identities
 // ---------------------------------------------------------------------------
 
@@ -682,15 +1106,103 @@ const waveGateRecord = {
   blocked: false,
 } as const;
 
+describe("parseTaskGraph safe generation and Wave boundaries", () => {
+  const unsafe = Number.MAX_SAFE_INTEGER + 1;
+
+  it.each([
+    ["Task Wave", { tasks: [{ ...validTask, wave: unsafe }] }],
+    ["current Wave", { current_wave: unsafe }],
+    ["Wave review epoch", { wave_review_epoch: waveReviewEpoch({ wave: unsafe }) }],
+    ["active Wave Gate", { current_wave: unsafe, active_wave_gate: activeWaveGate({ wave: unsafe }) }],
+    ["completed Wave history", { wave_gate_history: [completedEntry({ wave: unsafe })] }],
+  ])("rejects an unsafe %s", (_label, fields) => {
+    expect(errorOf(graph(fields))).toMatch(/safe|wave_review_epoch/u);
+  });
+
+  it("preserves the exact safe Wave diagnostic through the shared integer-bound parser", () => {
+    expect(errorOf(graph({ wave_review_epoch: waveReviewEpoch({ wave: 0 }) }))).toBe(
+      "wave_review_epoch.wave must be an integer >= 1 within the safe-integer range",
+    );
+  });
+
+  it("rejects unsafe Task and accepted-authority review generations", () => {
+    expect(errorOf(graph({ tasks: [{ ...validTask, review_generation: unsafe }] }))).toContain("safe integer");
+    expect(errorOf(graph({ tasks: [{
+      ...validTask,
+      accepted_review_authority: {
+        generation: unsafe,
+        packet_id: PACKET,
+        head_sha: HEAD,
+        scope: ["src/x.ts"],
+      },
+    }] }))).toContain("accepted_review_authority");
+  });
+
+  it("models Accepted Review Run authority as all-or-none and preserves both persisted variants", () => {
+    const legacy: AcceptedReviewAuthority = {
+      generation: 1,
+      packet_id: PACKET,
+      head_sha: HEAD,
+      scope: ["src/x.ts"],
+    };
+    const runBound: AcceptedReviewAuthority = {
+      ...legacy,
+      run_id: "run.wave",
+      authority_digest: DIGEST("a"),
+    };
+    // @ts-expect-error run_id cannot exist without authority_digest.
+    const partialRun: AcceptedReviewAuthority = { ...legacy, run_id: "run.wave" };
+    // @ts-expect-error authority_digest cannot exist without run_id.
+    const partialDigest: AcceptedReviewAuthority = { ...legacy, authority_digest: DIGEST("a") };
+
+    expect(parseTaskGraph(graph({ tasks: [{ ...validTask, accepted_review_authority: legacy }] })).ok).toBe(true);
+    expect(parseTaskGraph(graph({ tasks: [{ ...validTask, accepted_review_authority: runBound }] })).ok).toBe(true);
+    expect(errorOf(graph({ tasks: [{ ...validTask, accepted_review_authority: partialRun }] })))
+      .toContain("run authority must be complete and valid when present");
+    expect(errorOf(graph({ tasks: [{ ...validTask, accepted_review_authority: partialDigest }] })))
+      .toContain("run authority must be complete and valid when present");
+  });
+
+  it.each([
+    ["workspace_scope", {
+      workspace_head_sha: DIGEST("b"),
+      wave_gate_run_id: "run.wave",
+      wave_gate_authority_digest: DIGEST("a"),
+    }],
+    ["workspace_head_sha", {
+      workspace_scope: ["src/x.ts"],
+      wave_gate_run_id: "run.wave",
+      wave_gate_authority_digest: DIGEST("a"),
+    }],
+    ["wave_gate_run_id", {
+      workspace_scope: ["src/x.ts"],
+      workspace_head_sha: DIGEST("b"),
+      wave_gate_authority_digest: DIGEST("a"),
+    }],
+    ["wave_gate_authority_digest", {
+      workspace_scope: ["src/x.ts"],
+      workspace_head_sha: DIGEST("b"),
+      wave_gate_run_id: "run.wave",
+    }],
+  ] as const)(
+    "rejects complete Review Run workspace authority minus %s",
+    (_omitted, partial) => {
+      expect(errorOf(graph({
+        tasks: [reviewedTask({ review_run: { ...reviewedTask().review_run, ...partial } })],
+      }))).toContain("workspace");
+    },
+  );
+});
+
 describe("parseTaskGraph wave_gates load boundary", () => {
   it("accepts canonical positive integer keys (String(wave))", () => {
     expect(parseTaskGraph(graph({ wave_gates: { "1": waveGateRecord } })).ok).toBe(true);
   });
 
   it("rejects non-canonical wave_gates keys — even when the gate value is valid", () => {
-    for (const wave of ["01", "abc", "-1", "1.0", "0", "1e2"]) {
+    for (const wave of ["01", "abc", "-1", "1.0", "0", "1e2", String(Number.MAX_SAFE_INTEGER + 1)]) {
       const err = errorOf(graph({ wave_gates: { [wave]: waveGateRecord } }));
-      expect(err).toContain("wave_gates key must be a canonical positive integer wave number");
+      expect(err).toContain("wave_gates key must be a canonical positive safe-integer wave number");
     }
   });
 
@@ -728,6 +1240,22 @@ describe("untrusted test_result label validation", () => {
 
   it("refuses a non-string untrusted label", () => {
     expect(errorOf(withTestResult(42))).toContain("non-empty label naming the weak source");
+  });
+});
+
+describe("StateManager byte decoding", () => {
+  it("rejects malformed UTF-8 before attempting JSON parsing", () => {
+    const root = mkdtempSync(join(tmpdir(), "loom-invalid-state-utf8-"));
+    const stateDirectory = join(root, ".claude", "state");
+    const statePath = join(stateDirectory, "active_task_graph.json");
+    mkdirSync(stateDirectory, { recursive: true });
+    writeFileSync(statePath, Buffer.from([0x7b, 0x22, 0x78, 0x22, 0x3a, 0x22, 0xc3, 0x28, 0x22, 0x7d]));
+    try {
+      expect(() => new StateManager(statePath).load()).toThrow(/invalid UTF-8/u);
+      expect(() => new StateManager(statePath).load()).not.toThrow(/invalid JSON/u);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

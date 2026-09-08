@@ -32,12 +32,12 @@
  * the invariant is one invariant; splitting them across modules is how it
  * drifted before.
  *
- * Three further lockstep writers live in handlers because none of them is a
- * review step: `updateTaskFindings` (the manual operator override),
- * `fixTaskFindings` (`--fix`), and `sanitizeDecomposedTask` (the decomposition
- * that first admits a task to the graph). The first two derive their views
- * through `claimsOfSeverity` here; `sanitizeDecomposedTask` admits a task with
- * no findings at all, so it writes the empty triple directly. All three are
+ * Three further lockstep writers are not review steps: `updateTaskFindings`
+ * (the manual operator override), `fixTaskFindings` (`--fix`), and `sanitizeTask`
+ * in TaskGraph Population (the decomposition that first admits a Task to the
+ * graph). The first two derive their views through `claimsOfSeverity` here;
+ * `sanitizeTask` admits a Task with no findings at all, so it writes the empty
+ * triple directly. All three are
  * held to the same invariant by `findingsLockstepError` at the load boundary —
  * the enumeration of all seven writers lives on `Task.findings` in types.ts.
  *
@@ -94,9 +94,12 @@ export function parseFindingSeverity(raw: unknown): FindingSeverity | null {
 
 /** Parse the task-local identity that can be safely composed into a
  * `task-id:finding-id` panel identity. Colons and whitespace would make that
- * composition ambiguous or unparsable, so they are rejected at the boundary. */
+ * composition ambiguous or unparsable. A decimal suffix must also be a safe
+ * integer because it participates in monotonic ordinal minting. */
 export function parseFindingId(raw: unknown): string | null {
-  return typeof raw === "string" && /^[^:\s]+$/.test(raw) ? raw : null;
+  if (typeof raw !== "string" || !/^[^:\s]+$/.test(raw)) return null;
+  const suffix = /-(\d+)$/u.exec(raw);
+  return suffix === null || Number.isSafeInteger(Number(suffix[1])) ? raw : null;
 }
 
 /**
@@ -154,10 +157,10 @@ function parseFindingFile(raw: unknown): string | null {
   return file === "" || /[\r\n]/.test(file) ? null : file;
 }
 
-/** A line reference is kept only when it is a positive integer. */
+/** A line reference is kept only when it is a positive safe integer. */
 function parseFindingLine(raw: unknown): number | null {
   const line = typeof raw === "string" && /^\d+$/.test(raw.trim()) ? Number(raw.trim()) : raw;
-  return typeof line === "number" && Number.isInteger(line) && line > 0 ? line : null;
+  return typeof line === "number" && Number.isSafeInteger(line) && line > 0 ? line : null;
 }
 
 /** Build drafts from the legacy severity-grouped claim lists, dropping non-findings. */
@@ -208,9 +211,10 @@ export function removeOnce(claims: readonly string[], toRemove: readonly string[
   return remaining;
 }
 
-/** Id-safe form of an agent name: the id is parsed back apart nowhere, but it
- *  is substituted into prompts and used as a JSON key-like token, so anything
- *  outside `[A-Za-z0-9_-]` is collapsed. */
+/** Id-safe form of an agent name. Normalization makes the trailing ordinal
+ *  suffix deterministic for `ordinalOf` and keeps the resulting Finding id safe
+ *  when substituted into prompts, JSON key-like tokens, and composite
+ *  `task-id:finding-id` panel identities. */
 function idSafeAgent(agent: string): string {
   const safe = agent.trim().replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
   return safe === "" ? "agent" : safe;
@@ -221,7 +225,9 @@ function idSafeAgent(agent: string): string {
  *  findings currently sit in the array (see nextOrdinal). */
 function ordinalOf(id: string, safeAgent: string): number {
   const match = /^(.*)-(\d+)$/.exec(id);
-  return match && match[1] === safeAgent ? Number(match[2]) : 0;
+  if (match === null || match[1] !== safeAgent) return 0;
+  const ordinal = Number(match[2]);
+  return Number.isSafeInteger(ordinal) ? ordinal : 0;
 }
 
 /**
@@ -260,7 +266,11 @@ export function nextOrdinal(
     ...refuted.map((record) => record.finding),
     ...resolved.map((record) => record.finding),
   ].map((finding) => ordinalOf(finding.id, safe));
-  return Math.max(0, ...minted) + 1;
+  const highest = Math.max(0, ...minted);
+  if (highest >= Number.MAX_SAFE_INTEGER) {
+    throw new Error(`finding ordinal space exhausted for ${safe}`);
+  }
+  return highest + 1;
 }
 
 /** Derive identity for a reviewer's drafts. The ONLY place Finding identity is
@@ -274,6 +284,13 @@ export function attributeFindings(
   provenance?: { readonly generation: number; readonly packetId: string },
 ): readonly Finding[] {
   const safe = idSafeAgent(agent);
+  const endOrdinal = startOrdinal + Math.max(0, drafts.length - 1);
+  if (!Number.isSafeInteger(startOrdinal) || startOrdinal < 1 || !Number.isSafeInteger(endOrdinal)) {
+    throw new Error("finding identity minting requires positive safe ordinals");
+  }
+  if (provenance !== undefined && (!Number.isSafeInteger(provenance.generation) || provenance.generation < 0)) {
+    throw new Error("finding provenance generation must be a non-negative safe integer");
+  }
   return drafts.map((draft, index) => {
     const id = parseFindingId(`${safe}-${startOrdinal + index}`);
     if (id === null) throw new Error("finding identity minting produced an invalid id");
@@ -302,10 +319,10 @@ export function attributeFindings(
  * [{ "severity": "critical", "file": "src/x.ts", "line": 42, "claim": "..." }]
  * ```
  *
- * Optional by design. The `CRITICAL_COUNT` / `ADVISORY_COUNT` and
- * `CRITICAL:` / `ADVISORY:` lines remain the contract every reviewer must
- * satisfy; this block only ADDS
- * location and per-claim structure when the reviewer can produce it.
+ * Optional by design. `CRITICAL_COUNT` / `ADVISORY_COUNT` remain the reviewer's
+ * authoritative tallies. Marker claims and this preferred structured evidence
+ * are reconciled as a union: the block contributes file/line structure and may
+ * preserve block-only claims, while marker-only claims remain visible too.
  * Verification quality degrades without file/line — it does not break.
  */
 const FINDINGS_BLOCK = /^[ \t]*```[ \t]*findings[ \t]*\r?\n([\s\S]*?)^[ \t]*```[ \t]*$/gm;
@@ -385,25 +402,27 @@ function parseStoredFinding(raw: unknown): Finding | null {
     file: record.file,
     line: record.line,
   });
+  if (draft !== null && (
+    ("file" in record && record.file !== draft.file) ||
+    ("line" in record && record.line !== draft.line)
+  )) return null;
   const reviewGeneration = record.review_generation;
   if (reviewGeneration !== undefined && (
-    typeof reviewGeneration !== "number" || !Number.isInteger(reviewGeneration) || reviewGeneration < 0
+    typeof reviewGeneration !== "number" || !Number.isSafeInteger(reviewGeneration) || reviewGeneration < 0
   )) return null;
   const packetId = record.review_packet_id;
   if (packetId !== undefined && (typeof packetId !== "string" || !/^[0-9a-f]{64}$/.test(packetId))) {
     return null;
   }
   if ((reviewGeneration === undefined) !== (packetId === undefined)) return null;
-  return draft === null
-    ? null
-    : {
-        ...draft,
-        id,
-        agent: record.agent.trim(),
-        ...(reviewGeneration === undefined
-          ? {}
-          : { review_generation: reviewGeneration, review_packet_id: packetId as string }),
-      };
+  return draft === null ? null : {
+    ...draft,
+    id,
+    agent: record.agent.trim(),
+    ...(reviewGeneration === undefined
+      ? {}
+      : { review_generation: reviewGeneration, review_packet_id: packetId as string }),
+  };
 }
 
 function parseStoredAssessment(raw: unknown): PriorFindingAssessment | null {
@@ -453,7 +472,7 @@ function parseStoredResolution(raw: unknown): ResolvedFinding | null {
       Array.isArray(record.resolution)) return null;
   const resolution = record.resolution as Record<string, unknown>;
   if (resolution.kind !== "resolved_by_remediation") return null;
-  if (typeof resolution.generation !== "number" || !Number.isInteger(resolution.generation) ||
+  if (typeof resolution.generation !== "number" || !Number.isSafeInteger(resolution.generation) ||
       resolution.generation < 0) return null;
   if (finding.review_generation !== undefined && resolution.generation <= finding.review_generation) return null;
   if (typeof resolution.packet_id !== "string" || !/^[0-9a-f]{64}$/.test(resolution.packet_id)) return null;
@@ -689,46 +708,48 @@ export function findingsLockstepError(
   return null;
 }
 
-/** Load-boundary check for `Task.refuted_findings`. */
-export function refutationsUnionError(raw: unknown, label: string): string | null {
+function retiredFindingsUnionError<T extends Readonly<{ finding: Finding }>>(
+  raw: unknown,
+  label: string,
+  parse: (entry: unknown) => T | null,
+  recordKind: "refutation" | "resolution",
+  findingKind: "refuted" | "resolved",
+): string | null {
   if (raw === undefined) return null;
   if (!Array.isArray(raw)) return `${label} must be an array when present`;
-  const parsed = raw.map(parseStoredRefutation);
+  const parsed = raw.map(parse);
   const index = parsed.findIndex((entry) => entry === null);
-  if (index >= 0) {
-    return `${label}[${index}] is not a well-formed refutation record (${REPAIR_HINT})`;
-  }
-  // Within `refuted_findings`, for the reason `findingsUnionError` proves it
-  // within `findings`: two records under one id attach two different verdicts
-  // to the same claim, and the audit trail can no longer say which was applied.
+  if (index >= 0) return `${label}[${index}] is not a well-formed ${recordKind} record (${REPAIR_HINT})`;
   const ids = parsed.flatMap((entry) => entry === null ? [] : [entry.finding.id]);
   const duplicate = ids.findIndex((id, at) => ids.indexOf(id) !== at);
   return duplicate < 0
     ? null
-    : `${label}[${duplicate}] repeats refuted finding id '${ids[duplicate]}' (${REPAIR_HINT})`;
+    : `${label}[${duplicate}] repeats ${findingKind} finding id '${ids[duplicate]}' (${REPAIR_HINT})`;
+}
+
+/** Load-boundary check for `Task.refuted_findings`. */
+export function refutationsUnionError(raw: unknown, label: string): string | null {
+  // Two records under one id attach different verdicts to the same claim, so
+  // the audit trail can no longer say which verdict was applied.
+  return retiredFindingsUnionError(raw, label, parseStoredRefutation, "refutation", "refuted");
 }
 
 /** Load-boundary check for findings retired because a later implementation fixed them. */
 export function resolutionsUnionError(raw: unknown, label: string): string | null {
-  if (raw === undefined) return null;
-  if (!Array.isArray(raw)) return `${label} must be an array when present`;
-  const parsed = raw.map(parseStoredResolution);
-  const index = parsed.findIndex((entry) => entry === null);
-  if (index >= 0) return `${label}[${index}] is not a well-formed resolution record (${REPAIR_HINT})`;
-  const ids = parsed.flatMap((entry) => entry === null ? [] : [entry.finding.id]);
-  const duplicate = ids.findIndex((id, at) => ids.indexOf(id) !== at);
-  return duplicate < 0
-    ? null
-    : `${label}[${duplicate}] repeats resolved finding id '${ids[duplicate]}' (${REPAIR_HINT})`;
+  return retiredFindingsUnionError(raw, label, parseStoredResolution, "resolution", "resolved");
 }
 
 function parseStoredDraft(raw: unknown): DraftFinding | null {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
   const record = raw as Record<string, unknown>;
   const severity = parseFindingSeverity(record.severity);
-  return severity === null || typeof record.claim !== "string"
-    ? null
-    : makeDraftFinding({ severity, claim: record.claim, file: record.file, line: record.line });
+  if (severity === null || typeof record.claim !== "string") return null;
+  const draft = makeDraftFinding({ severity, claim: record.claim, file: record.file, line: record.line });
+  if (draft !== null && (
+    ("file" in record && record.file !== draft.file) ||
+    ("line" in record && record.line !== draft.line)
+  )) return null;
+  return draft;
 }
 
 /** Prove the packet-bound in-progress review run before the Task cast. */
@@ -741,8 +762,8 @@ export function reviewRunError(
   if (raw === undefined) return null;
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return `${label} must be an object`;
   const run = raw as Record<string, unknown>;
-  if (typeof run.generation !== "number" || !Number.isInteger(run.generation) || run.generation < 0) {
-    return `${label}.generation must be a non-negative integer`;
+  if (typeof run.generation !== "number" || !Number.isSafeInteger(run.generation) || run.generation < 0) {
+    return `${label}.generation must be a non-negative safe integer`;
   }
   if (run.generation !== taskGeneration) return `${label}.generation must equal task review_generation`;
   if (typeof run.packet_id !== "string" || !/^[0-9a-f]{64}$/.test(run.packet_id)) {
@@ -785,8 +806,9 @@ export function reviewRunError(
         typeof run.wave_gate_authority_digest !== "string" || !/^[0-9a-f]{64}$/.test(run.wave_gate_authority_digest)) {
       return `${label}.workspace_scope requires exact Wave Gate run authority`;
     }
-  } else if (run.wave_gate_run_id !== undefined || run.wave_gate_authority_digest !== undefined) {
-    return `${label}.Wave Gate authority requires workspace_scope`;
+  } else if (run.workspace_head_sha !== undefined || run.wave_gate_run_id !== undefined ||
+      run.wave_gate_authority_digest !== undefined) {
+    return `${label}.Wave Gate workspace authority requires workspace_scope`;
   }
   if (!Array.isArray(run.evidence)) return `${label}.evidence must be an array`;
   const evidenceAgents: string[] = [];
@@ -949,7 +971,7 @@ export function findingIdCollisionError(
 }
 
 // ---------------------------------------------------------------------------
-// The three writers that must keep `findings` and its derived views in lockstep
+// Review-path writers that keep `findings` and its derived views in lockstep
 // ---------------------------------------------------------------------------
 
 // `NonEmptyRefutations` is defined in `types` and re-exported at the top of
@@ -1117,7 +1139,7 @@ export function deduplicateFindingIds(
       kept.push(finding);
       continue;
     }
-    // `nextOrdinal` reads only `kept` and `refuted`, so on its own it can hand
+    // `nextOrdinal` reads `kept`, `refuted`, and `resolved`, but can still hand
     // back an ordinal a LATER, still-unprocessed finding already holds:
     // ["x-1","x-1","x-2"] re-minted the second x-1 as x-2 and produced a graph
     // `findingsUnionError` still rejects — pointing the operator at THIS repair.
@@ -1465,7 +1487,8 @@ export function recordReviewRunEvidence(
  *
  * `findings` (structured, identified) and the two `string[]` fields (derived
  * views) are appended in lockstep, so every claim added through this function
- * appears in exactly one place in each. Ids continue past every ordinal `agent`
+ * appears once in `findings` and in exactly the derived view matching its
+ * severity. Ids continue past every ordinal `agent`
  * has ever been issued on this task, including ones now sitting in
  * `refuted_findings` (see nextOrdinal).
  */

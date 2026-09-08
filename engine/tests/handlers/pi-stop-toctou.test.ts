@@ -17,6 +17,7 @@ import {
 } from "../../src/core/implementation-application";
 import type { Task, TaskGraph, TaskTestResult } from "../../src/types";
 import { taskFixture, type TaskFixtureInput } from "../fixtures/task-lifecycle";
+import { capturedSpecCheck } from "../../src/core/spec-check";
 
 const task = (overrides: Partial<TaskFixtureInput> & { id: string }): Task => taskFixture({
   description: "impl",
@@ -161,10 +162,7 @@ describe("applyUntrustedStopResolution — trust and freshness are re-checked at
         new_tests_required: false,
         review_status: "passed",
       })], ["T1"]),
-      spec_check: {
-        wave: 1, run_at: "now", verdict: "PASSED", critical_count: 0, high_count: 0,
-        critical_findings: [], high_findings: [], medium_findings: [],
-      },
+      spec_check: capturedSpecCheck({ wave: 1, runAt: "now", criticalFindings: [] }),
     };
     const unobservedChange: UntrustedStopResolution = {
       ...untrustedPass,
@@ -259,10 +257,7 @@ describe("applyUntrustedStopResolution — trust and freshness are re-checked at
     })], ["T1"]);
     const s: TaskGraph = {
       ...initial,
-      spec_check: {
-        wave: 1, run_at: "now", verdict: "PASSED", critical_count: 0, high_count: 0,
-        critical_findings: [], high_findings: [], medium_findings: [],
-      },
+      spec_check: capturedSpecCheck({ wave: 1, runAt: "now", criticalFindings: [] }),
       wave_gates: { ...initial.wave_gates, "1": {
         impl_complete: true, tests_passed: true, reviews_complete: true, blocked: false,
       } },

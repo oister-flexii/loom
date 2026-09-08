@@ -564,7 +564,7 @@ describe("the load boundary proves wave_gates and spec_check, not just tasks", (
     const raw = {
       wave: 1,
       run_at: "t",
-      verdict: "PASSED",
+      verdict: "BLOCKED",
       critical_count: 1,
       high_count: 0,
       critical_findings: ["real finding"],
@@ -579,7 +579,7 @@ describe("the load boundary proves wave_gates and spec_check, not just tasks", (
     raw.critical_findings.push("smuggled after the proof");
 
     const stored = parsed.value.spec_check;
-    expect(stored?.verdict).toBe("PASSED");
+    expect(stored?.verdict).toBe("BLOCKED");
     if (stored === undefined || stored.verdict === "EVIDENCE_CAPTURE_FAILED") return;
     expect(stored.critical_count).toBe(1);
     expect(stored.critical_findings).toEqual(["real finding"]);

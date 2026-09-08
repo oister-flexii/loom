@@ -10,18 +10,12 @@
 import { execFileSync } from "node:child_process";
 import { lstatSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import type { HookHandler, TaskGraph, Task, WaveGate } from "../../types";
-import { newWaveGate } from "../../types";
+import type { HookHandler, TaskGraph } from "../../types";
 import { taskGraphPath } from "../../config";
 import { StateManager } from "../../state-manager";
 import { validateFull, fixFull } from "./validate-task-graph";
 import { checkPlanModelBindings, productionModelBindingDeps } from "./validate-model-bindings";
-import { derivePendingTaskProof } from "../../core/proof-obligations";
 import { argumentValue, hasFlag } from "./cli-args";
-import {
-  serializeVerificationPolicy,
-  taskVerificationPolicy,
-} from "../../core/verification-policy";
 import {
   VERIFICATION_MANIFEST_SOURCE_PATH,
   defaultVerificationManifest,
@@ -29,23 +23,18 @@ import {
   type FrozenVerificationManifest,
 } from "../../core/verification-manifest";
 import { readRunBytesNoFollow } from "../../orchestration/no-follow-fs";
+import { observeSpecIndex } from "../../orchestration/spec-index-observation";
+import { specIndexUnavailableMessage } from "../../core/requirement-coverage";
+import {
+  parseAuthoredTaskRoster,
+  populateTaskGraph,
+  resolvedSpecFile,
+  type AuthoredTask,
+  type TaskGraphPopulationCommand,
+  type TaskGraphPopulationResult,
+} from "../../core/task-graph-population";
 
-type AuthoredTask = Readonly<
-  Pick<
-    Task,
-    | "id"
-    | "description"
-    | "agent"
-    | "wave"
-    | "depends_on"
-    | "spec_anchors"
-    | "spec_contributions"
-    | "plan_context"
-  > & {
-    verification_policy: NonNullable<Task["verification_policy"]>;
-    file_list: readonly string[];
-  }
->;
+export { resolvedSpecFile };
 
 interface DecomposeInput {
   spec_trace_version: 2;
@@ -70,7 +59,7 @@ type ManifestFile =
   | Readonly<{ kind: "default"; value: FrozenVerificationManifest }>
   | Readonly<{ kind: "error"; error: string }>;
 
-function defaultManifestIfMissing(path: string, error: unknown): ManifestFile | null {
+function defaultManifestIfMissing(path: string, error: unknown): ManifestFile {
   if ((error as NodeJS.ErrnoException).code === "ENOENT") {
     return { kind: "default", value: defaultVerificationManifest() };
   }
@@ -98,8 +87,7 @@ function readManifestFile(manifestPath: string): ManifestFile {
       return { kind: "error", error: `${manifestPath} must be a regular non-symlink file` };
     }
   } catch (error) {
-    const missing = defaultManifestIfMissing(manifestPath, error);
-    if (missing !== null) return missing;
+    return defaultManifestIfMissing(manifestPath, error);
   }
   try {
     return { kind: "bytes", value: Uint8Array.from(readRunBytesNoFollow(manifestPath)) };
@@ -209,12 +197,7 @@ function prepareVerificationManifest(statePath: string): PreparedManifest {
     : { ok: false, error: `${manifestPath} is invalid: ${parsed.error.errors.join("; ")}` };
 }
 
-/**
- * Through `cli-args`, not by hand: the hand-rolled loop this replaced accepted
- * the NEXT FLAG as a value, so `--issue --fix` read as `issue = NaN` with
- * `--fix` silently consumed — the exact divergence `argumentValue` exists to
- * end.
- */
+/** Validated CLI authority supplied to the population shell. */
 type PopulateArgs = Readonly<{
   issue?: number;
   repo?: string;
@@ -261,47 +244,6 @@ function parseArgs(args: string[]): ParsedPopulateArgs {
  * verdicts exist only via the evidence ledger, mirroring the refusal in
  * store-test-evidence.
  */
-function sanitizeDecomposedTask(t: AuthoredTask): Task {
-  const verificationPolicy = taskVerificationPolicy(t);
-  return {
-    id: t.id,
-    description: t.description,
-    agent: t.agent,
-    wave: t.wave,
-    status: "pending",
-    depends_on: t.depends_on ?? [],
-    spec_anchors: Object.freeze([...(t.spec_anchors ?? [])]),
-    spec_contributions: Object.freeze([...(t.spec_contributions ?? [])]),
-    verification_policy: serializeVerificationPolicy(verificationPolicy),
-    ...(t.plan_context !== undefined ? { plan_context: t.plan_context } : {}),
-    ...(t.file_list !== undefined ? { file_list: t.file_list } : {}),
-    proof: derivePendingTaskProof({
-      verificationPolicy,
-      declaredArtifacts: t.file_list ?? [],
-    }),
-    review_status: "pending",
-    review_generation: 0,
-    findings: [],
-    critical_findings: [],
-    advisory_findings: [],
-    refuted_findings: [],
-    resolved_findings: [],
-  };
-}
-
-function taskWaves(tasks: readonly AuthoredTask[]): readonly number[] {
-  return [...new Set(tasks.map((task) => task.wave))].sort((left, right) => left - right);
-}
-
-/** Build wave gates for all waves */
-function buildWaveGates(waves: readonly number[]): Record<string, WaveGate> {
-  const gates: Record<string, WaveGate> = {};
-  for (const w of waves) {
-    gates[String(w)] = newWaveGate();
-  }
-  return gates;
-}
-
 const handler: HookHandler = async (stdin, args) => {
   // Resolved at call time (not import time) so env re-pointing is honored.
   const statePath = taskGraphPath();
@@ -339,9 +281,9 @@ const handler: HookHandler = async (stdin, args) => {
   }
 
   // Validate decompose output before merging. Scoped to the PAYLOAD: the
-  // findings aggregate is agent-forgeable here and `sanitizeDecomposedTask`
-  // strips it below, so holding this to the load-boundary findings rules would
-  // reject exactly the input that sanitization exists to clean.
+  // findings aggregate is agent-forgeable here and core `sanitizeTask`
+  // strips it during population, so holding this to the load-boundary findings
+  // rules would reject exactly the input that sanitization exists to clean.
   const validation = validateFull(decompose as unknown as Record<string, unknown>, "decompose-payload");
   if (!validation.ok) {
     if (fix) {
@@ -409,15 +351,6 @@ const handler: HookHandler = async (stdin, args) => {
   }
   // checkPlanModelBindings only passes when planFile is a readable string
   const validatedPlanFile = planFile as string;
-  const waves = taskWaves(decompose.tasks);
-
-  // Guard against overwriting non-pending tasks
-  if (!force && existingState.tasks.some((t) => t.status !== "pending")) {
-    return {
-      kind: "error",
-      message: "Cannot overwrite task graph with non-pending tasks. Use --force to override.",
-    };
-  }
 
   // Operator command authority is observed once in the repository shell before
   // lock acquisition. The locked transform below carries this prepared value;
@@ -427,51 +360,52 @@ const handler: HookHandler = async (stdin, args) => {
     return { kind: "error", message: `Verification manifest authority unavailable: ${preparedManifest.error}` };
   }
 
-  const populate = async (): Promise<void> => mgr.update((existing) => {
-    // Re-check the guard INSIDE the locked transform. The check above ran on a
-    // snapshot loaded before the lock, and this callback receives a freshly
-    // reloaded graph — so a task that left "pending" in between (an agent
-    // starting, a wave completing) had its real status silently overwritten by
-    // the unconditional `tasks:` assignment below. The pre-lock check stays: it
-    // gives the operator the clean CLI error in the common case; this one makes
-    // the overwrite impossible in the racing case.
-    if (!force && existing.tasks.some((t) => t.status !== "pending")) {
-      throw new Error(
-        "Cannot overwrite task graph with non-pending tasks: a task left \"pending\" while this " +
-        "population was being prepared. Use --force to override.",
-      );
-    }
-    const { active_wave_completion_suite: staleCompletionSuite, ...existingWithoutCompletionSuite } = existing;
-    void staleCompletionSuite;
-    const merged: TaskGraph = {
-      ...existingWithoutCompletionSuite,
-      spec_trace_version: 2,
-      plan_title: decompose.plan_title,
-      plan_file: validatedPlanFile,
-      spec_file: existing.spec_file ?? decompose.spec_file ?? null,
-      tasks: decompose.tasks.map(sanitizeDecomposedTask),
-      current_wave: 1,
-      executing_tasks: [],
-      wave_gates: buildWaveGates(waves),
-      verification_manifest: preparedManifest.value,
-      ...(issue === undefined ? {} : { github_issue: issue }),
-      ...(repo === undefined ? {} : { github_repo: repo }),
-    };
-
-    return merged;
-  });
-
-  try {
-    await populate();
-  } catch (error) {
-    // The locked re-check refuses by throwing (the only way out of a transform);
-    // surface it as the same clean CLI error the pre-lock check produces rather
-    // than as an unhandled rejection.
-    return { kind: "error", message: error instanceof Error ? error.message : String(error) };
+  // The Spec Index is observed here, beside the manifest, for the same reason:
+  // the locked transform stamps a prepared value and never reads mutable source
+  // bytes itself. Unlike the manifest this one degrades: if a later Wave Gate
+  // can project the Spec, missing recorded hashes make drift unverifiable; if
+  // projection remains unavailable, settlement blocks as projection-unavailable.
+  const observedSpecFile = resolvedSpecFile(existingState.spec_file, decompose.spec_file);
+  const specIndex = observeSpecIndex(observedSpecFile);
+  if (specIndex.kind === "unavailable") {
+    process.stderr.write(
+      `Requirement content hashes NOT recorded: ${specIndexUnavailableMessage(specIndex.reason)}\n` +
+      "If a later Wave Gate projects the Spec, drift will be unverifiable; continued projection unavailability blocks settlement.\n",
+    );
   }
 
+  const taskRoster = parseAuthoredTaskRoster(decompose.tasks);
+  if (!taskRoster.ok) return { kind: "error", message: taskRoster.error };
+  const command: TaskGraphPopulationCommand = Object.freeze({
+    planTitle: decompose.plan_title,
+    validatedPlanFile,
+    ...(decompose.spec_file === undefined ? {} : { authoredSpecFile: decompose.spec_file }),
+    tasks: taskRoster.value,
+    verificationManifest: preparedManifest.value,
+    specIndex,
+    observedSpecFile,
+    force,
+    ...(issue === undefined ? {} : { issue }),
+    ...(repo === undefined ? {} : { repo }),
+  });
+  const preflight = populateTaskGraph(existingState, command);
+  if (!preflight.ok) return { kind: "error", message: preflight.error.message };
+
+  let applied: TaskGraphPopulationResult;
+  try {
+    applied = await mgr.updateAndReturn<TaskGraphPopulationResult>((existing) => {
+      const transition = populateTaskGraph(existing, command);
+      return transition.ok
+        ? { state: transition.value.state, value: transition }
+        : { state: existing, value: transition };
+    });
+  } catch (error) {
+    return { kind: "error", message: error instanceof Error ? error.message : String(error) };
+  }
+  if (!applied.ok) return { kind: "error", message: applied.error.message };
+
   const taskCount = decompose.tasks.length;
-  process.stderr.write(`Task graph populated: ${taskCount} tasks, waves: ${waves.join(", ")}\n`);
+  process.stderr.write(`Task graph populated: ${taskCount} tasks, waves: ${applied.value.waves.join(", ")}\n`);
 
   return { kind: "passthrough" };
 };

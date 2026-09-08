@@ -25,6 +25,7 @@ import type {
 } from "./core/completion-suite";
 import type { FrozenVerificationManifest } from "./core/verification-manifest";
 import type { Phase } from "./core/phases";
+import type { SettledFloor, SpecIndexObservation } from "./core/requirement-coverage";
 export type { IssuedReviewPacketRegistration } from "./core/review-packet";
 export { PHASES, type Phase } from "./core/phases";
 import type {
@@ -174,7 +175,7 @@ export type FindingSeverity = (typeof FINDING_SEVERITIES)[number];
  */
 export interface DraftFinding {
   readonly severity: FindingSeverity;
-  /** Repo-relative path the claim concerns, or null when the reviewer gave none. */
+  /** Unverified reviewer-supplied single-line location hint, or null. */
   readonly file: string | null;
   /** 1-based line, or null. */
   readonly line: number | null;
@@ -238,33 +239,51 @@ export interface ReviewRunSlotAuthority {
  * In-progress, packet-bound review run. Every expected reviewer must cover every
  * prior finding exactly once before any prior finding can leave the active set.
  */
-export interface ReviewRun {
-  readonly generation: number;
-  readonly packet_id: string;
-  readonly head_sha: string;
-  readonly expected_agents: readonly [string, ...string[]];
-  readonly prior_finding_ids: readonly string[];
-  readonly evidence: readonly ReviewRunEvidence[];
+type ReviewRunBase = Readonly<{
+  generation: number;
+  packet_id: string;
+  head_sha: string;
+  expected_agents: readonly [string, ...string[]];
+  prior_finding_ids: readonly string[];
+  evidence: readonly ReviewRunEvidence[];
   /** Present on engine-owned Wave runs; ordered exactly like expected_agents. */
-  readonly slot_authority?: readonly [ReviewRunSlotAuthority, ...ReviewRunSlotAuthority[]];
-  /** Exact Wave authority that issued this byte snapshot. */
-  readonly workspace_scope?: readonly string[];
-  readonly workspace_head_sha?: string;
-  readonly wave_gate_run_id?: string;
-  readonly wave_gate_authority_digest?: string;
-}
+  slot_authority?: readonly [ReviewRunSlotAuthority, ...ReviewRunSlotAuthority[]];
+}>;
+
+type ReviewRunWorkspaceAuthority =
+  | Readonly<{
+      workspace_scope?: never;
+      workspace_head_sha?: never;
+      wave_gate_run_id?: never;
+      wave_gate_authority_digest?: never;
+    }>
+  | Readonly<{
+      /** Exact Wave authority that issued this byte snapshot. */
+      workspace_scope: readonly string[];
+      workspace_head_sha: string;
+      wave_gate_run_id: string;
+      wave_gate_authority_digest: string;
+    }>;
+
+/** Workspace authority is either wholly absent on an unbound/legacy run or complete. */
+export type ReviewRun = Readonly<ReviewRunBase & ReviewRunWorkspaceAuthority>;
+
+type AcceptedReviewAuthorityBase = Readonly<{
+  generation: number;
+  packet_id: string;
+  head_sha: string;
+  scope: readonly string[];
+}>;
+
+type AcceptedReviewRunAuthority =
+  | Readonly<{ run_id?: never; authority_digest?: never }>
+  | Readonly<{ run_id: string; authority_digest: string }>;
 
 /** Review authority retained after a roster closes. It is the immutable source
  * for completion integrity and completed-Wave reopening; graph summaries are
- * never substituted for it. */
-export interface AcceptedReviewAuthority {
-  readonly generation: number;
-  readonly packet_id: string;
-  readonly head_sha: string;
-  readonly scope: readonly string[];
-  readonly run_id?: string;
-  readonly authority_digest?: string;
-}
+ * never substituted for it. Run authority is either wholly absent for legacy
+ * evidence or complete, so a partially bound accepted run is unrepresentable. */
+export type AcceptedReviewAuthority = Readonly<AcceptedReviewAuthorityBase & AcceptedReviewRunAuthority>;
 
 export interface FindingResolutionAssessment extends PriorFindingAssessment {
   readonly agent: string;
@@ -410,6 +429,17 @@ interface TaskCommonMetadataBase {
   readonly spec_anchors?: readonly string[];
   /** Partial Requirement Contributions; never part of Wave Gate spec-check completion scope. */
   readonly spec_contributions?: readonly string[];
+  /**
+   * Spec Index content hash per Requirement Completion Claim, recorded by the
+   * engine when the Task→Requirement edge was created. Engine-derived, never
+   * authored: decompose describes WHICH Requirements a Task completes, and the
+   * specification's own bytes decide what those Requirements SAID at that
+   * moment. Absent on graphs decomposed before this field existed and on graphs
+   * whose spec file did not project during population. A later successful gate
+   * projection reports that absence as unverifiable drift; if projection still
+   * cannot be established, settlement refuses with `projection-unavailable`.
+   */
+  readonly spec_anchor_hashes?: Readonly<Record<string, string>>;
   /** Explicit independent regression/new-test policy. New graphs carry this;
    * new_tests_required remains a read-compatible legacy projection. */
   readonly verification_policy?: StoredVerificationPolicy;
@@ -471,8 +501,8 @@ interface TaskCommonMetadataBase {
    * migrate opportunistically.
    *
    * The coordinated writers keep the three in lockstep, and every one of them
-   * writes all three together: `sanitizeDecomposedTask` (the initializer, in
-   * handlers/helpers/populate-task-graph); `mergeFindings` (legacy/unbound
+   * writes all three together: `sanitizeTask` (the initializer, in
+   * core/task-graph-population); `mergeFindings` (legacy/unbound
    * review), `finalizeReviewRun` (packet-bound review),
    * `applyFindingOutcomes` (panel adjudication), and
    * `preserveAcceptedReviewRunFindings` (incomplete-run retirement), all in
@@ -613,9 +643,25 @@ interface SpecCheckBase {
   readonly run_at: string;
 }
 
-/** Captured evidence is complete: count/view lockstep is established at construction. */
+export type ManualSpecCheckEvidenceSource = Readonly<{
+  kind: "manual-override";
+  reason: string;
+}>;
+
+/**
+ * Captured evidence is complete: count/view lockstep is established at
+ * construction. Registered and historical captures need no duplicate source
+ * field because their Wave epoch is the authority; a manual bypass always
+ * carries its attributable reason in the evidence itself.
+ */
+export type CapturedSpecCheckVerdict = Extract<SpecCheckVerdict, "PASSED" | "BLOCKED">;
+
+declare const CAPTURED_SPEC_CHECK: unique symbol;
+
 export type CapturedSpecCheck = Readonly<SpecCheckBase & {
-  verdict: Exclude<SpecCheckVerdict, "EVIDENCE_CAPTURE_FAILED">;
+  /** Nominal constructor-origin witness; only core/spec-check mints this type. */
+  readonly [CAPTURED_SPEC_CHECK]: true;
+  verdict: CapturedSpecCheckVerdict;
   critical_count: number;
   high_count: number;
   /** `readonly` for the reason `Task.critical_findings` is: a holder that can
@@ -625,12 +671,31 @@ export type CapturedSpecCheck = Readonly<SpecCheckBase & {
   high_findings: readonly string[];
   medium_findings: readonly string[];
   error?: never;
-}>;
+} & (
+  | Readonly<{ evidence_source?: never }>
+  | Readonly<{ evidence_source: ManualSpecCheckEvidenceSource }>
+)>;
+
+/**
+ * Why a spec-check capture failed, as a closed set rather than prose.
+ *
+ * `transcript` is a capture the harness could not read or whose footer does not
+ * parse, and is the only re-applyable arm. `settled-floor` means a parsed report
+ * omitted engine-settled findings. `projection-unavailable` means no structural
+ * projection could be proved, which is an absence of evidence and therefore a
+ * decided refusal. The `error` string is for operators; control flow branches
+ * only on this closed cause.
+ */
+export type SpecCheckEvidenceFailureCause =
+  | "transcript"
+  | "settled-floor"
+  | "projection-unavailable";
 
 /** A failed capture carries a cause and cannot masquerade as usable counts. */
 export type EvidenceFailedSpecCheck = Readonly<SpecCheckBase & {
   verdict: "EVIDENCE_CAPTURE_FAILED";
   error: string;
+  cause: SpecCheckEvidenceFailureCause;
   critical_count?: never;
   high_count?: never;
   critical_findings?: never;
@@ -687,9 +752,10 @@ export type CompletedWaveGateRegistration =
       completionSuite: AcceptedWaveCompletionReceipt;
     }>;
 
-/** Immutable audit evidence for an active authority whose authoritative Run
- * Directory was proven absent before a replacement was installed. This is not
- * terminal Wave history: the replacement still owns the same active Wave. */
+/** Immutable audit of a completed Wave reopened because exact workspace
+ * bytes drifted, or because legacy completion authority could not prove those
+ * bytes. This is completed-Wave history; orphaned active-run replacement is
+ * modeled separately by `OrphanedWaveGateRetirement`. */
 export type WaveReopeningAudit = Readonly<{
   schemaVersion: 1;
   kind: "completed-wave-reopened-for-review-integrity";
@@ -1055,6 +1121,18 @@ export interface WaveReviewEpochAuthority {
    * epochs and while modern task-attempt invalidation awaits reissuance; exact
    * recovery refuses to infer it from evidence. */
   readonly specCheckSlotAuthority?: WaveSpecCheckSlotAuthority;
+  /**
+   * The exact settled CRITICAL authority rendered into this epoch's spec-check
+   * packet: current epochs carry both count and Finding identities; historical
+   * epochs may carry count only.
+   *
+   * Recorded at installation because it is the ONLY authority the Agent was
+   * actually shown. Re-projecting it at capture time reads `spec_anchor_hashes`
+   * and out-of-Wave `spec_anchors` that no epoch digest covers, so enforcement
+   * could drift from the packet. Absent on epochs installed before any floor
+   * existed; `epochSettledFloor` maps that absence to stated unavailability.
+   */
+  readonly settledSpecCheckFloor?: SettledFloor;
 }
 
 export interface TaskGraph {
@@ -1066,6 +1144,10 @@ export interface TaskGraph {
   readonly skipped_phases: readonly Phase[];
   readonly spec_dir?: string | null;
   readonly spec_file: string | null;
+  /** Compact identity/reason from the exact Spec Index observation used when
+   * Tasks and Requirement Content Hashes were populated. Absent on legacy
+   * graphs; never contains the derived ParsedSpec itself. */
+  readonly spec_index_observation?: SpecIndexObservation;
   readonly plan_file: string | null;
   readonly plan_title?: string;
   /** `readonly` for the same reason `Task.findings` is: every producer already

@@ -10,6 +10,8 @@ import {
   mergeFindings,
   recoverViewOnlyClaims,
   refutationsUnionError,
+  resolutionsUnionError,
+  reviewRunError,
   type AdjudicatedFinding,
 } from "../../src/core/findings";
 import { makeParsedFindings } from "../../src/core/review-output";
@@ -60,9 +62,16 @@ describe("parseFindingSeverity", () => {
 });
 
 describe("parseFindingId", () => {
-  it("accepts task-local ids and rejects panel-ambiguous spellings", () => {
+  it("accepts task-local ids and rejects panel-ambiguous or ordinal-unsafe spellings", () => {
     expect(parseFindingId("code-reviewer-1")).toBe("code-reviewer-1");
-    for (const raw of ["bad:id", "bad id", "bad\tid", "", "  code-reviewer-1  "]) {
+    for (const raw of [
+      "bad:id",
+      "bad id",
+      "bad\tid",
+      "",
+      "  code-reviewer-1  ",
+      `code-reviewer-${Number.MAX_SAFE_INTEGER}0`,
+    ]) {
       expect(parseFindingId(raw)).toBeNull();
     }
   });
@@ -152,6 +161,25 @@ describe("attributeFindings — derived, never agent-chosen identity", () => {
     );
     expect(second[0]!.id).toBe("code-reviewer-3");
     expect(new Set([...first, ...second].map((f) => f.id)).size).toBe(3);
+  });
+
+  it("refuses unsafe constructor ordinals and an exhausted persisted high-water mark", () => {
+    expect(() => attributeFindings([draft()], "code-reviewer", Number.MAX_SAFE_INTEGER + 1))
+      .toThrow(/positive safe ordinals/u);
+    const exhausted: Finding = {
+      ...draft(),
+      id: `code-reviewer-${Number.MAX_SAFE_INTEGER}`,
+      agent: "code-reviewer",
+    };
+    expect(() => nextOrdinal([exhausted], [], "code-reviewer")).toThrow(/ordinal space exhausted/u);
+  });
+
+  it("rejects end-ordinal overflow when multiple drafts start at the maximum safe ordinal", () => {
+    expect(() => attributeFindings(
+      [draft(), draft({ claim: "overflows the suffix" })],
+      "code-reviewer",
+      Number.MAX_SAFE_INTEGER,
+    )).toThrow(/positive safe ordinals/u);
   });
 
   it("counts ordinals per agent, not per task", () => {
@@ -258,6 +286,14 @@ describe("parseStoredFindings — untrusted state file", () => {
 
   it("round-trips a well-formed record", () => {
     expect(parseStoredFindings([stored])).toEqual([stored]);
+  });
+
+  it("drops unsafe Finding provenance generations", () => {
+    expect(parseStoredFindings([{
+      ...stored,
+      review_generation: Number.MAX_SAFE_INTEGER + 1,
+      review_packet_id: "a".repeat(64),
+    }])).toEqual([]);
   });
 
   it("drops entries missing or carrying panel-incompatible identity rather than failing the whole task", () => {
@@ -484,6 +520,69 @@ describe("the load boundary proves what the Task type asserts", () => {
     const error = findingsUnionError(raw, "tasks[0].findings");
     expect(error).not.toBeNull();
     expect(error).toContain("tasks[0].findings");
+  });
+
+  it("rejects unsafe Review Run and resolution generations", () => {
+    expect(reviewRunError({
+      generation: Number.MAX_SAFE_INTEGER + 1,
+      packet_id: "a".repeat(64),
+      head_sha: "b".repeat(40),
+      expected_agents: ["code-reviewer"],
+      prior_finding_ids: [],
+      evidence: [],
+    }, Number.MAX_SAFE_INTEGER + 1, [], "run")).toContain("safe integer");
+    expect(resolutionsUnionError([{
+      finding: wellFormed,
+      resolution: {
+        kind: "resolved_by_remediation",
+        generation: Number.MAX_SAFE_INTEGER + 1,
+        packet_id: "a".repeat(64),
+        head_sha: "b".repeat(40),
+        expected_agents: ["code-reviewer"],
+        assessments: [{
+          finding_id: wellFormed.id,
+          verdict: "resolved_by_remediation",
+          reason: "fixed",
+          agent: "code-reviewer",
+        }],
+      },
+    }], "resolved")).toContain("not a well-formed resolution");
+  });
+
+  it("preserves exact retired-container malformed and duplicate diagnostics", () => {
+    const refuted = {
+      finding: wellFormed,
+      refutations: [{ lens: "intent", reason: "deliberate" }],
+    };
+    const resolved = {
+      finding: wellFormed,
+      resolution: {
+        kind: "resolved_by_remediation",
+        generation: 1,
+        packet_id: "a".repeat(64),
+        head_sha: "b".repeat(40),
+        expected_agents: ["code-reviewer"],
+        assessments: [{
+          finding_id: wellFormed.id,
+          verdict: "resolved_by_remediation",
+          reason: "fixed",
+          agent: "code-reviewer",
+        }],
+      },
+    };
+
+    expect(refutationsUnionError([{}], "refuted")).toBe(
+      "refuted[0] is not a well-formed refutation record (repair and install atomically with: helper repair-task-graph)",
+    );
+    expect(refutationsUnionError([refuted, refuted], "refuted")).toBe(
+      "refuted[1] repeats refuted finding id 'code-reviewer-1' (repair and install atomically with: helper repair-task-graph)",
+    );
+    expect(resolutionsUnionError([{}], "resolved")).toBe(
+      "resolved[0] is not a well-formed resolution record (repair and install atomically with: helper repair-task-graph)",
+    );
+    expect(resolutionsUnionError([resolved, resolved], "resolved")).toBe(
+      "resolved[1] repeats resolved finding id 'code-reviewer-1' (repair and install atomically with: helper repair-task-graph)",
+    );
   });
 
   it("points at the repair command rather than leaving the operator stuck", () => {

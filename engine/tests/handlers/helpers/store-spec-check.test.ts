@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execSync, spawnSync } from "node:child_process";
 import type { TaskGraph } from "../../../src/types";
+import { capturedSpecCheck } from "../../../src/core/spec-check";
 
 const CLI_PATH = join(__dirname, "../../../src/cli.ts");
 
@@ -85,10 +86,9 @@ describe("store-spec-check helper", () => {
   it("replaces a prior critical spec-check and clears its derived Wave block", () => {
     const blocked: TaskGraph = {
       ...readState(),
-      spec_check: {
-        wave: 1, run_at: "earlier", verdict: "BLOCKED", critical_count: 1, high_count: 0,
-        critical_findings: ["earlier blocker"], high_findings: [], medium_findings: [],
-      },
+      spec_check: capturedSpecCheck({
+        wave: 1, runAt: "earlier", criticalFindings: ["earlier blocker"],
+      }),
       wave_gates: {
         "1": { impl_complete: false, tests_passed: null, reviews_complete: false, blocked: true },
       },
@@ -110,6 +110,7 @@ describe("store-spec-check helper", () => {
   it("fails closed when CRITICAL_COUNT disagrees with the CRITICAL: lines (forged-zero shape)", () => {
     const { exitCode, stderr } = runHelper(
       [
+        "SPEC_CHECK_WAVE: 1",
         "CRITICAL: requirement REQ-1 not implemented",
         "SPEC_CHECK_CRITICAL_COUNT: 0",
         "SPEC_CHECK_HIGH_COUNT: 0",
@@ -124,6 +125,7 @@ describe("store-spec-check helper", () => {
   it("fails closed when HIGH_COUNT disagrees with the HIGH: lines", () => {
     const { exitCode, stderr } = runHelper(
       [
+        "SPEC_CHECK_WAVE: 1",
         "HIGH: partial coverage of REQ-2",
         "SPEC_CHECK_CRITICAL_COUNT: 0",
         "SPEC_CHECK_HIGH_COUNT: 3",
@@ -163,7 +165,69 @@ describe("store-spec-check helper", () => {
 
     expect(exitCode).toBe(0);
     expect(stderr).toContain("manual operator override: FRs 12-14 are covered in wave 3");
-    expect(readState().spec_check?.verdict).toBe("PASSED");
+    expect(readState().spec_check).toMatchObject({
+      verdict: "PASSED",
+      evidence_source: {
+        kind: "manual-override",
+        reason: "FRs 12-14 are covered in wave 3",
+      },
+    });
+  });
+
+  it("pins the floor argument: the operator override imposes no floor even when a projection would settle rows", () => {
+    // The helper's manual settlement path carries separately authorized,
+    // attributable `manualOverrideFloor` authority: the operator supplies the
+    // transcript on stdin, there is no packet, and the override exists to
+    // correct a structural verdict a human judged wrong. A regression
+    // to `settledFloorOf(coverageTasks(graph, wave))` would re-project the live
+    // graph's count and refuse this honest 0-CRITICAL override against a
+    // number the operator was never shown. This fixture has a canonical spec
+    // file whose projection settles rows, so only explicit manual authority
+    // admits the write.
+    const specPath = join(tmpDir, "spec.md");
+    writeFileSync(specPath, [
+      "# Feature: Override floor pin",
+      "",
+      "## User Scenarios",
+      "",
+      "### US1: [P1] Pin the operator override floor",
+      "",
+      "**Acceptance Scenarios:**",
+      "- AS-001: Given a settled row, When the operator overrides, Then no floor is imposed",
+      "",
+      "## Functional Requirements",
+      "",
+      "- FR-001: System MUST floor the reported CRITICAL count at the settled count",
+      "",
+      "## Out of Scope",
+      "",
+      "- OOS-001: Symbol-level source indexing",
+      "",
+      "## Appendix: Glossary",
+      "",
+      "| Term | Definition |",
+      "|------|------------|",
+      "| Spec Index | A deterministic projection of specification entries |",
+    ].join("\n"));
+    writeFileSync(statePath, JSON.stringify({
+      ...readState(),
+      spec_trace_version: 2,
+      spec_file: specPath,
+    }, null, 2));
+
+    const { exitCode, stderr } = runHelper([
+      "SPEC_CHECK_WAVE: 1",
+      "SPEC_CHECK_OVERRIDE: the structural verdict is wrong, human-judged",
+      "SPEC_CHECK_CRITICAL_COUNT: 0",
+      "SPEC_CHECK_HIGH_COUNT: 0",
+      "SPEC_CHECK_VERDICT: PASSED",
+    ].join("\n"));
+
+    expect(exitCode).toBe(0);
+    expect(stderr).toContain("manual operator override");
+    const spec = readState().spec_check;
+    expect(spec?.verdict).toBe("PASSED");
+    expect(spec?.critical_count).toBe(0);
   });
 
   it("fails when the required CRITICAL_COUNT marker is absent", () => {

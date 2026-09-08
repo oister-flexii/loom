@@ -3,10 +3,9 @@
  * Modern Wave evidence requires exact capture-correlated request authority.
  */
 
-import { reconcileWaveBlock } from "../../core/wave-gate-model";
 import {
   parseSpecCheckOutput,
-  reconcileSpecCheck,
+  settleSpecCheck,
   specCheckAuthorityProblem,
   type SpecCheckRequestAuthority,
 } from "../../core/spec-check";
@@ -18,6 +17,7 @@ import { readTranscriptWithRetry } from "../../utils/read-transcript-with-retry"
 import { resolveAgentTranscriptPath, resolveAgentType } from "../../utils/agent-transcript-path";
 import { stripNamespace } from "../../utils/strip-namespace";
 import { observeWaveSpecCheckDocuments } from "../../orchestration/wave-spec-check-documents";
+import { epochSettledFloor } from "../../core/wave-review-authority";
 
 export const runStoreSpecCheckFindings = async (
   stdin: string,
@@ -71,16 +71,17 @@ export const runStoreSpecCheckFindings = async (
     }
   }
   const findings = parseSpecCheckOutput(transcript ?? "");
-  let documents;
+  let observation;
   try {
     const observedState = manager.load();
-    documents = observeWaveSpecCheckDocuments(observedState.spec_file, observedState.plan_file);
+    observation = observeWaveSpecCheckDocuments(observedState.spec_file, observedState.plan_file);
   } catch (error) {
     return {
       kind: "error",
       message: `store-spec-check-findings: spec/plan authority is unreadable — spec-check findings NOT stored: ${error instanceof Error ? error.message : String(error)}`,
     };
   }
+  const documents = observation.authority;
   const applied = await manager.updateAndReturn((state) => {
     const authorityProblem = specCheckAuthorityProblem(state, requestAuthority, documents);
     if (authorityProblem !== null) {
@@ -92,31 +93,35 @@ export const runStoreSpecCheckFindings = async (
         },
       };
     }
-    const wave = state.wave_review_epoch?.wave ?? findings.wave ?? state.current_wave ?? 1;
-    const resolution = transcriptFailure === null
-      ? reconcileSpecCheck(findings, wave, new Date().toISOString())
-      : {
-          kind: "evidence-failed" as const,
-          specCheck: {
-            wave,
-            run_at: new Date().toISOString(),
-            verdict: "EVIDENCE_CAPTURE_FAILED" as const,
-            error: `${transcriptFailure} - re-run /wave-gate`,
-          },
-        };
-    const value = resolution.kind === "evidence-failed"
-      ? passthroughResult(`WARNING: ${resolution.specCheck.error} — marking evidence_capture_failed`)
+    // The Wave never comes from the Agent's SPEC_CHECK_WAVE marker. Protected
+    // epoch authority chooses evidence filing and the Wave block target; on the
+    // legacy path the protected current Wave is the engine's belief. The
+    // reported party selects neither destination.
+    const epochWave = state.wave_review_epoch?.wave ?? null;
+    const wave = epochWave ?? state.current_wave ?? 1;
+    // Read back from the epoch, never re-projected: only a packet-correlated
+    // capture carries floor authority, and it is exactly what this Agent saw.
+    const runAt = new Date().toISOString();
+    const settlement = transcriptFailure === null
+      ? settleSpecCheck(state, {
+          kind: "registered-transcript",
+          parsed: findings,
+          wave,
+          runAt,
+          floor: epochSettledFloor(state.wave_review_epoch),
+        })
+      : settleSpecCheck(state, {
+          kind: "capture-failure",
+          wave,
+          runAt,
+          error: `${transcriptFailure} - re-run /wave-gate`,
+        });
+    const value = settlement.specCheck.verdict === "EVIDENCE_CAPTURE_FAILED"
+      ? passthroughResult(`WARNING: ${settlement.specCheck.error} — marking evidence_capture_failed`)
       : passthroughResult(
-          `Spec-check: ${resolution.specCheck.critical_count} critical, ${resolution.specCheck.high_count} high`,
+          `Spec-check: ${settlement.specCheck.critical_count} critical, ${settlement.specCheck.high_count} high`,
         );
-    return {
-      state: {
-        ...state,
-        spec_check: resolution.specCheck,
-        wave_gates: reconcileWaveBlock(state.wave_gates, state.tasks, resolution.specCheck, wave),
-      },
-      value,
-    };
+    return { state: settlement.state, value };
   });
   if (applied.kind === "passthrough" && applied.systemMessage !== undefined) {
     process.stderr.write(`${applied.systemMessage}\n`);

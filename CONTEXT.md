@@ -101,7 +101,7 @@ An immutable review-and-adjudication record outside the wave lifecycle. It binds
 _Avoid_: Synthetic Task, fake Wave, ad-hoc review output
 
 **State File**:
-The single source of truth for orchestration progress (`active_task_graph.json`). Write-protected; only hooks mutate it.
+The single source of truth for orchestration progress (`active_task_graph.json`). Write-protected; Hooks and explicitly whitelisted StateManager-backed CLI helpers are its only mutation paths.
 _Avoid_: Config, manifest, plan file
 
 **Session TaskGraph Pointer Lease Registry**:
@@ -221,8 +221,28 @@ An engine-authored requirement a Task must discharge before its status can becom
 _Avoid_: Checklist item, self-report, completion claim
 
 **Spec Index**:
-A pure deterministic projection of one canonical specification into Functional Requirement (`FR-NNN`), Acceptance Scenario (`AS-NNN`), Out-of-Scope (`OOS-NNN`), and glossary entries with canonical content hashes. It is derived join input, not a second source of truth; malformed or duplicate identifiers fail parsing. Each family is a distinct type and each entry's content hash is derived at construction, so the three collections cannot be substituted for one another and an entry whose hash disagrees with its content is unrepresentable. The colon and the contiguous family token are the deliberate prose-disambiguation boundaries: an ID-shaped line without a colon ("FR-002 and FR-003 are related") or with a spaced family token ("F R-002:") is prose, not a malformed identifier, and stays legal; every Markdown marker-run form (`> >`, `- -`, `* *`, `1. 2.`) before a colon-full ID fails closed.
+A pure deterministic projection of one canonical specification into Functional Requirement (`FR-NNN`), Acceptance Scenario (`AS-NNN`), Out-of-Scope (`OOS-NNN`), and glossary entries with canonical content hashes. It is derived join input, not a second source of truth; malformed or duplicate identifiers fail parsing. Each FR/AS/OOS entry's complete Markdown list-item body — physical bullet, directly adjacent lazy paragraph continuations, and blank-separated paragraphs indented beneath the marker — is one canonical content value and one hash input; an unindented block after a blank ends the entry, so wrapping a mandatory clause cannot remove it from drift authority and unrelated prose cannot enter it. Owned nested prose, headings, thematic breaks, and fence-shaped text remain content; colon-full FR/AS/OOS identifiers inside that owned body refuse the specification instead of becoming hidden or absorbed declarations. Genuine top-level examples remain excluded. This is a bounded Spec grammar, not complete CommonMark conformance. Each family is a distinct type and each parser-minted entry's content hash is derived at construction, so the three collections cannot be substituted for one another and engine-produced entries keep content/hash construction in one place. The phantom constructor-origin brand is not forgery-proof: structural spreading can preserve its static type while replacing content, so runtime consumers trust parser provenance rather than the brand as a security boundary. The colon and the contiguous family token are the deliberate prose-disambiguation boundaries: an ID-shaped line without a colon ("FR-002 and FR-003 are related") or with a spaced family token ("F R-002:") is prose, not a malformed identifier, and stays legal; every Markdown marker-run form (`> >`, `- -`, `* *`, `1. 2.`) before a colon-full ID fails closed.
 _Avoid_: TaskGraph, specification database, LLM requirement summary
+
+**Spec Index Observation**:
+The compact immutable record of the Spec observation prepared during TaskGraph Population, stored in `spec_index_observation`. It retains either indexed document path/digest or the typed unavailable reason; it never copies ParsedSpec or Requirement text into the TaskGraph. Population replaces it with the Tasks, the load boundary checks its shape and protected document path, and later Wave packets can explain missing Requirement hashes from it. It is explanatory provenance, not an independent settlement floor or proof that a missing hash is stable. Legacy absence stays absent.
+_Avoid_: Cached Spec Index, current Spec verdict, settlement authority
+
+**Requirement Coverage Projection**:
+The pure deterministic join of one Spec Index against the whole protected Task roster — rows for the current Wave, unclaimed lists over every Wave — classifying every Requirement Completion Claim before any Agent reads a file. Four outcomes are decided by structure alone and are not a model's to overturn — the claim names no Spec Index entry, it claims completion of an explicitly excluded item, its Task declared no artifacts, or its Task modified no files — and what survives is a candidate the Agent assesses for behaviour. **Severity and settlement are separate facts**: who decides a row follows from its verdict kind, while severity says how bad the structural fact is, so a drifted or altered-hash candidate carries a severity AND still owes an assessment. It names the Functional Requirements and the Acceptance Scenarios whose completion has no planned owner at any Wave — Requirement Contributions are deliberately not counted there, because they never assert completion. A Wave that claims no completion but carries valid Contributions is a legitimate foundation Wave and is rendered as one, never as work that traces nowhere. The settled floor contains every canonical structural CRITICAL Finding line, including an altered-hash candidate even though an Agent still assesses its implementation, plus the unclaimed identifiers and synthetic no-trace Finding. The immutable packet renders those exact lines; the Wave epoch records their identities and safe count; capture requires every identity while allowing additional Agent Findings. Historical count-only floors remain count-enforced for their original packet and upgrade on the next byte-identical installation. Enforced and rendered authority is the same value by construction: nothing re-projects it later, because the inputs that decide it are not all covered by the epoch digest. When no Spec Index can be projected the projection is an honest absence with a stated reason, never a pass, and it then carries no Requirement text, scenario roster, exclusion list or glossary. Registered settlement records a typed projection-unavailable evidence failure; only the separately authorized, parser-minted manual operator override may settle without projection authority, and its reason is persisted on the captured evidence.
+_Avoid_: Coverage report, spec-check result, requirement checklist, LLM verdict
+
+**Spec-check Settlement**:
+The pure TaskGraph aggregate command that consumes validated Wave/manual authority plus a parsed transcript or capture failure and produces exactly one deeply immutable settlement: applied evidence with `spec_check` and its derived Wave block changed together, or a manual-evidence refusal that preserves the graph. Captured evidence has exactly two usable verdicts, `PASSED` and `BLOCKED`; a historical `UNKNOWN` count record parses into retryable transcript evidence failure rather than a third captured state. Transport shells own byte observation, request/document authority, locking, and persistence; none independently constructs or commits spec-check state.
+_Avoid_: Spec-check store, transport-specific settlement, evidence write
+
+**TaskGraph Population**:
+The pure aggregate command that consumes a non-empty parser-proven authored Task roster, prepared Spec/verification authority, overwrite authority, and one locked TaskGraph and returns either a typed population refusal or the complete reset graph. It owns Task sanitization, Requirement Content Hash stamping, Wave Gate construction, current-Wave reset, and removal of every active or historical Wave/epoch/spec-check/completion authority tied to the replaced Tasks; the Hook owns JSON/CLI parsing, Git/filesystem observation, model checks, locking, and persistence.
+_Avoid_: Populate hook policy, task merge, graph initializer
+
+**Requirement Content Hash**:
+The Spec Index content hash recorded per Requirement Completion Claim at the moment the Task→Requirement edge is created. Engine-derived, never authored: decompose says WHICH Requirements a Task completes, and the specification's own bytes say what they SAID. It is taken from the entry itself rather than re-derived, so no second canonicalization can disagree with the parser's; an identifier the specification does not define records nothing, because there is no text to assert about. Three absences are three different facts and none may be rendered as another: a Task with no recorded hash yields *unverifiable*, never *stable*; a stored value this engine could not have minted is corrupt authority, not missing authority; and a recorded hash that disagrees with the current text is drift.
+_Avoid_: Anchor checksum, spec fingerprint, decompose-supplied hash
 
 **Spec Parse Error**:
 One structured reason a specification failed to project into a Spec Index — the failure's kind plus its payload (section, document-absolute line, identifier, term). It is the parse failure itself, not a rendering of it: callers discriminate on the kind, and one total renderer owns the operator-facing text, so rewording a diagnostic cannot change any caller's behavior and a new failure reason cannot reach an operator without text.
@@ -257,7 +277,7 @@ A typed durable record that an authorized orchestration side effect completed. R
 _Avoid_: Log line, success flag, checkpoint
 
 **Orchestration Façade**:
-The single parent-facing engine interface for status and registered architecture/refutation/standalone-review/Wave-Gate/remediation programs. It returns only spawn-batch, await-user, blocked, or done at external boundaries.
+The single parent-facing engine interface for status and registered architecture/refutation/standalone-review/Wave-Gate/remediation programs. A new Wave Gate publishes its recoverable Run Directory program before installing protected `active_wave_gate` authority, so failed program publication leaves the TaskGraph unchanged; the locked install re-derives the exact Wave roster and authority digest, so TaskGraph drift after publication leaves only the recoverable Run Directory registration. It returns only spawn-batch, await-user, blocked, or done at external boundaries.
 _Avoid_: Helper collection, workflow script, shell runbook
 
 **Inline-Program Stdin Inheritance**:
@@ -316,10 +336,12 @@ _Avoid_: Constraint (too generic), rule (alone), enforced guideline (advisory ru
 - An **Effect Receipt** makes an authorized side effect reconcilable and idempotent across resume
 - A **Standalone Review Run** feeds identified critical Findings through the same **Refutation Panel** without creating a Task or mutating the State File
 - A **Skill** is loaded into an **Agent** to provide domain expertise
-- **Hooks** enforce invariants on the **State File** — no other actor writes to it
+- **Hooks** and explicitly whitelisted StateManager-backed CLI helpers enforce mutation invariants on the **State File** — no other actor writes to it
 - A **Spec** contains **Clarification Markers** resolved by the clarify **Phase**
 - An **Aggregate** is immutable data; command functions in the **Functional Core** produce new instances
 - The **Imperative Shell** orchestrates: load via **Port** → call **Functional Core** → persist via **Port**
+- Every spec-check transport delegates its TaskGraph transition to **Spec-check Settlement**
+- The populate Hook delegates its locked TaskGraph transition to **TaskGraph Population**
 - **Domain Events** are returned by pure command functions; the **Imperative Shell** publishes them
 - A **Plan** may declare **Executable Models**; decompose validation blocks a declared model that no **Task** binds to an artifact
 - A **Lifecycle Machine** is implemented by a dedicated **Task** in the earliest wave; dependent **Tasks** import it

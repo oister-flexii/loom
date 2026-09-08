@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
@@ -716,6 +716,186 @@ describe("Pi extension review tool_result integration", () => {
     expect(errors).toEqual(["roster: lock unavailable"]);
   });
 
+  it("continues startup cleanup and attempts every reporting channel", async () => {
+    const extensionSpecifier = "../../pi/extension.ts";
+    const module = await import(/* @vite-ignore */ extensionSpecifier) as {
+      runPiStartupSweeps: (
+        sweeps: readonly { name: string; run: () => void }[],
+        ports: {
+          writeDiagnostic: (diagnostic: string) => boolean;
+          notifyWarning: (message: string) => boolean;
+          writeStderr: (diagnostic: string) => boolean;
+        },
+      ) => void;
+    };
+    const calls: string[] = [];
+    const diagnostics: string[] = [];
+    const warnings: string[] = [];
+    const stderr: string[] = [];
+
+    module.runPiStartupSweeps([
+      { name: "stale-sessions", run: () => { calls.push("stale"); throw new Error("registry unavailable"); } },
+      { name: "expired-grants", run: () => { calls.push("grants"); } },
+    ], {
+      writeDiagnostic: (diagnostic) => { diagnostics.push(diagnostic); return true; },
+      notifyWarning: (message) => { warnings.push(message); return true; },
+      writeStderr: (diagnostic) => { stderr.push(diagnostic); return true; },
+    });
+
+    expect(calls).toEqual(["stale", "grants"]);
+    expect(diagnostics.join("\n")).toContain("Error: registry unavailable");
+    expect(diagnostics.join("\n")).toContain("pi-extension-review-events.test.ts");
+    expect(warnings).toEqual([
+      expect.stringContaining("Loom session_start sweep failed: stale-sessions: registry unavailable"),
+    ]);
+    expect(stderr.join("\n")).toContain("session_start sweep failed: stale-sessions");
+  });
+
+  it("does not throw when one reporting channel receives the sweep failure", async () => {
+    const extensionSpecifier = "../../pi/extension.ts";
+    const module = await import(/* @vite-ignore */ extensionSpecifier) as {
+      runPiStartupSweeps: (
+        sweeps: readonly { name: string; run: () => void }[],
+        ports: {
+          writeDiagnostic: (diagnostic: string) => boolean;
+          notifyWarning: (message: string) => boolean;
+          writeStderr: (diagnostic: string) => boolean;
+        },
+      ) => void;
+    };
+    const reportingCalls: string[] = [];
+
+    expect(() => module.runPiStartupSweeps([
+      { name: "reported", run: () => { throw new Error("reported sweep failure"); } },
+    ], {
+      writeDiagnostic: () => { reportingCalls.push("diagnostic"); return true; },
+      notifyWarning: () => { reportingCalls.push("ui"); throw new Error("UI route exploded"); },
+      writeStderr: () => { reportingCalls.push("stderr"); throw new Error("stderr route exploded"); },
+    })).not.toThrow();
+
+    expect(reportingCalls).toEqual(["diagnostic", "ui", "stderr"]);
+  });
+
+  it("throws one stack-preserving aggregate only after all reporting routes and later sweeps fail", async () => {
+    const extensionSpecifier = "../../pi/extension.ts";
+    const module = await import(/* @vite-ignore */ extensionSpecifier) as {
+      runPiStartupSweeps: (
+        sweeps: readonly { name: string; run: () => void }[],
+        ports: {
+          writeDiagnostic: (diagnostic: string) => boolean;
+          notifyWarning: (message: string) => boolean;
+          writeStderr: (diagnostic: string) => boolean;
+        },
+      ) => void;
+    };
+    const calls: string[] = [];
+    const reportingCalls: string[] = [];
+    const sweepError = new Error("sweep exploded");
+    const laterError = new Error("later sweep exploded");
+    let thrown: unknown;
+
+    try {
+      module.runPiStartupSweeps([
+        { name: "broken", run: () => { calls.push("broken"); throw sweepError; } },
+        { name: "later", run: () => { calls.push("later"); throw laterError; } },
+      ], {
+        writeDiagnostic: () => { reportingCalls.push("diagnostic"); throw new Error("diagnostic route exploded"); },
+        notifyWarning: () => { reportingCalls.push("ui"); throw new Error("UI route exploded"); },
+        writeStderr: () => { reportingCalls.push("stderr"); throw new Error("stderr route exploded"); },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(calls).toEqual(["broken", "later"]);
+    expect(reportingCalls).toEqual([
+      "diagnostic", "ui", "stderr",
+      "diagnostic", "ui", "stderr",
+    ]);
+    expect(thrown).toBeInstanceOf(AggregateError);
+    expect((thrown as AggregateError).errors).toEqual([sweepError, laterError]);
+    expect((thrown as Error).message).toContain("diagnostic route exploded");
+    expect((thrown as Error).message).toContain("UI route exploded");
+    expect((thrown as Error).message).toContain("stderr route exploded");
+  });
+
+  it("surfaces an unreported real session_start sweep failure after later sweeps run", async () => {
+    const extensionSpecifier = "../../pi/extension.ts";
+    const module = await import(/* @vite-ignore */ extensionSpecifier) as {
+      default: (
+        pi: unknown,
+        startupSweepSource?: () => readonly { name: string; run: () => void }[],
+      ) => void;
+    };
+    const pi = new FakePi();
+    const sweepCalls: string[] = [];
+    const uiCalls: string[] = [];
+    const sweepError = new Error("injected startup sweep failure");
+    module.default(pi as never, () => [
+      { name: "injected-failure", run: () => { sweepCalls.push("failed"); throw sweepError; } },
+      { name: "injected-later", run: () => { sweepCalls.push("later"); } },
+    ]);
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => {
+      throw new Error("injected stderr failure");
+    });
+    let thrown: unknown;
+    let stderrCalls = 0;
+    try {
+      await pi.emit("session_start", {}, {
+        hasUI: true,
+        ui: {
+          notify: () => {
+            uiCalls.push("ui");
+            throw new Error("injected UI failure");
+          },
+        },
+        sessionManager: { getSessionId: () => "019fca39-f989-7510-8e62-50dadbcad4ee" },
+      });
+    } catch (error) {
+      thrown = error;
+    } finally {
+      stderrCalls = stderr.mock.calls.length;
+      stderr.mockRestore();
+    }
+
+    expect(sweepCalls).toEqual(["failed", "later"]);
+    expect(uiCalls).toEqual(["ui"]);
+    expect(stderrCalls).toBe(2);
+    expect(thrown).toBeInstanceOf(AggregateError);
+    expect((thrown as AggregateError).errors).toEqual([sweepError]);
+  });
+
+  it("runs both production startup sweeps through the real session_start event", async () => {
+    const stale = join(subagentDir, "event-stale.active");
+    const grants = join(subagentDir, "pi-write-grants");
+    const malformedGrant = join(grants, "event-malformed.json");
+    mkdirSync(grants, { recursive: true });
+    writeFileSync(stale, "stale\n");
+    const old = new Date(Date.now() - 2 * 24 * 60 * 60_000);
+    utimesSync(stale, old, old);
+    writeFileSync(malformedGrant, "{not-json");
+    const notifications: Array<{ message: string; level: string }> = [];
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      const pi = await extension();
+      await pi.emit("session_start", {}, {
+        hasUI: true,
+        ui: { notify: (message: string, level: string) => notifications.push({ message, level }) },
+        sessionManager: { getSessionId: () => "019fca39-f989-7510-8e62-50dadbcad4ef" },
+      });
+
+      expect(existsSync(stale), "stale session roster was swept").toBe(false);
+      expect(existsSync(malformedGrant), "malformed grant was swept").toBe(false);
+      expect(stderr.mock.calls.map(([text]) => String(text)).join(""))
+        .toContain("removing malformed write grant");
+      expect(notifications).toEqual([]);
+    } finally {
+      stderr.mockRestore();
+      rmSync(stale, { force: true });
+      rmSync(malformedGrant, { force: true });
+    }
+  });
+
   it("makes rejected child write grants an unconditional direct-edit denial", async () => {
     const extensionSpecifier = "../../pi/extension.ts";
     const module = await import(/* @vite-ignore */ extensionSpecifier) as {
@@ -924,15 +1104,15 @@ describe("Pi extension review tool_result integration", () => {
       sessionManager: { getSessionId: () => "019fca39-f989-7510-8e62-50dadbcad40a" },
     };
     const { StateManager } = await import("../src/state-manager");
-    const originalUpdate = StateManager.prototype.update;
-    const update = vi.spyOn(StateManager.prototype, "update").mockImplementation(async function (
+    const originalUpdateAndReturn = StateManager.prototype.updateAndReturn;
+    const updateAndReturn = vi.spyOn(StateManager.prototype, "updateAndReturn").mockImplementation(async function (
       this: typeof StateManager.prototype,
       updater,
     ) {
       const current = JSON.parse(readFileSync(statePath, "utf-8"));
       current.tasks[0].review_generation = 1;
       writeState(current);
-      return originalUpdate.call(this, updater);
+      return originalUpdateAndReturn.call(this, updater);
     });
     try {
       await pi.emit("tool_result", reviewResult("Task: T1", "stale Pi review"), context);
@@ -941,7 +1121,7 @@ describe("Pi extension review tool_result integration", () => {
       expect(stored.review_status).toBe("pending");
       expect(stored.findings).toBeUndefined();
     } finally {
-      update.mockRestore();
+      updateAndReturn.mockRestore();
     }
   });
 
@@ -4394,6 +4574,7 @@ describe("Pi extension review tool_result integration", () => {
     expect(state.spec_check).toMatchObject({
       wave: 1,
       verdict: "EVIDENCE_CAPTURE_FAILED",
+      cause: "transcript",
       error: expect.stringContaining("reserved spec-check result 1"),
     });
     expect(state.wave_gates["1"].blocked).toBe(false);
@@ -5452,7 +5633,7 @@ describe("Pi extension review tool_result integration", () => {
     const context = { sessionManager: { getSessionId: () => "019fca39-f989-7510-8e62-50dadbcad40a" } };
     const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const { StateManager } = await import("../src/state-manager");
-    const update = vi.spyOn(StateManager.prototype, "update")
+    const updateAndReturn = vi.spyOn(StateManager.prototype, "updateAndReturn")
       .mockRejectedValueOnce(new Error("injected first-result failure"));
     try {
       const first = reviewResult("Task: T1", "first result discarded").details.results[0];
@@ -5472,7 +5653,7 @@ describe("Pi extension review tool_result integration", () => {
       expect(JSON.parse(readFileSync(statePath, "utf-8")).tasks[0].critical_findings)
         .toEqual(["second result still stored"]);
     } finally {
-      update.mockRestore();
+      updateAndReturn.mockRestore();
       stderr.mockRestore();
     }
   });

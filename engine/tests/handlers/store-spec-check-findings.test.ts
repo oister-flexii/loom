@@ -8,6 +8,11 @@ import { parseSpecCheckOutput } from "../../src/handlers/subagent-stop/store-spe
 import handler, { runStoreSpecCheckFindings } from "../../src/handlers/subagent-stop/store-spec-check-findings";
 import { projectSlug } from "../../src/utils/agent-transcript-path";
 import { reconcileSpecCheck } from "../../src/core/spec-check";
+import { parseSettledFloor } from "../../src/core/requirement-coverage";
+
+/** These cases exercise footer parsing under a valid zero settled floor. */
+const ZERO_FLOOR = parseSettledFloor({ kind: "settled", count: 0 });
+if (ZERO_FLOOR === null) throw new Error("zero-floor fixture must parse");
 import { parseOrchestrationRunId, parseSlotId } from "../../src/core/orchestration-contract";
 
 describe("parseSpecCheckOutput (pure)", () => {
@@ -63,11 +68,12 @@ describe("parseSpecCheckOutput (pure)", () => {
 
   it("fails evidence reconciliation when the required verdict marker is absent", () => {
     const parsed = parseSpecCheckOutput([
+      "SPEC_CHECK_WAVE: 1",
       "SPEC_CHECK_CRITICAL_COUNT: 0",
       "SPEC_CHECK_HIGH_COUNT: 0",
     ].join("\n"));
 
-    const resolution = reconcileSpecCheck(parsed, 1, "now");
+    const resolution = reconcileSpecCheck(parsed, 1, "now", ZERO_FLOOR);
     expect(resolution).toEqual({
       kind: "evidence-failed",
       specCheck: {
@@ -75,6 +81,7 @@ describe("parseSpecCheckOutput (pure)", () => {
         run_at: "now",
         verdict: "EVIDENCE_CAPTURE_FAILED",
         error: "SPEC_CHECK_VERDICT marker not found - re-run /wave-gate",
+        cause: "transcript",
       },
     });
   });
@@ -84,11 +91,12 @@ describe("parseSpecCheckOutput (pure)", () => {
     // lines either, so coercing the missing marker to 0 made the count agree
     // with the itemization and recorded a truncated report as a clean one.
     const parsed = parseSpecCheckOutput([
+      "SPEC_CHECK_WAVE: 1",
       "SPEC_CHECK_CRITICAL_COUNT: 0",
       "SPEC_CHECK_VERDICT: PASSED",
     ].join("\n"));
 
-    const resolution = reconcileSpecCheck(parsed, 1, "now");
+    const resolution = reconcileSpecCheck(parsed, 1, "now", ZERO_FLOOR);
     expect(resolution).toEqual({
       kind: "evidence-failed",
       specCheck: {
@@ -96,18 +104,20 @@ describe("parseSpecCheckOutput (pure)", () => {
         run_at: "now",
         verdict: "EVIDENCE_CAPTURE_FAILED",
         error: "SPEC_CHECK_HIGH_COUNT marker not found - re-run /wave-gate",
+        cause: "transcript",
       },
     });
   });
 
-  it("captures a genuinely clean report that emits all three markers", () => {
+  it("captures a genuinely clean report that emits every required marker", () => {
     const parsed = parseSpecCheckOutput([
+      "SPEC_CHECK_WAVE: 1",
       "SPEC_CHECK_CRITICAL_COUNT: 0",
       "SPEC_CHECK_HIGH_COUNT: 0",
       "SPEC_CHECK_VERDICT: PASSED",
     ].join("\n"));
 
-    const resolution = reconcileSpecCheck(parsed, 1, "now");
+    const resolution = reconcileSpecCheck(parsed, 1, "now", ZERO_FLOOR);
     expect(resolution.kind).toBe("captured");
     if (resolution.kind !== "captured") return;
     expect(resolution.specCheck.high_count).toBe(0);
@@ -124,7 +134,7 @@ describe("parseSpecCheckOutput (pure)", () => {
     ].join("\n"));
 
     expect(parsed.duplicateMarkers).toEqual(["SPEC_CHECK_CRITICAL_COUNT"]);
-    expect(reconcileSpecCheck(parsed, 1, "now")).toMatchObject({
+    expect(reconcileSpecCheck(parsed, 1, "now", ZERO_FLOOR)).toMatchObject({
       kind: "evidence-failed",
       specCheck: {
         verdict: "EVIDENCE_CAPTURE_FAILED",
@@ -143,7 +153,7 @@ describe("parseSpecCheckOutput (pure)", () => {
     ].join("\n"));
 
     expect(parsed.duplicateMarkers).toEqual(["SPEC_CHECK_VERDICT"]);
-    expect(reconcileSpecCheck(parsed, 1, "now")).toMatchObject({
+    expect(reconcileSpecCheck(parsed, 1, "now", ZERO_FLOOR)).toMatchObject({
       kind: "evidence-failed",
       specCheck: {
         verdict: "EVIDENCE_CAPTURE_FAILED",
@@ -176,7 +186,7 @@ describe("parseSpecCheckOutput (pure)", () => {
           `${marker}: ${value(second)}`,
           "SPEC_CHECK_VERDICT: PASSED",
         ].join("\n"));
-        const resolution = reconcileSpecCheck(parsed, 1, "now");
+        const resolution = reconcileSpecCheck(parsed, 1, "now", ZERO_FLOOR);
 
         expect(parsed.duplicateMarkers).toContain(marker);
         expect(resolution.kind).toBe("evidence-failed");
@@ -189,13 +199,14 @@ describe("parseSpecCheckOutput (pure)", () => {
 
   it("fails evidence reconciliation when the high count drifts from HIGH lines", () => {
     const parsed = parseSpecCheckOutput([
+      "SPEC_CHECK_WAVE: 1",
       "HIGH: uncounted risk",
       "SPEC_CHECK_CRITICAL_COUNT: 0",
       "SPEC_CHECK_HIGH_COUNT: 0",
       "SPEC_CHECK_VERDICT: PASSED",
     ].join("\n"));
 
-    const resolution = reconcileSpecCheck(parsed, 1, "now");
+    const resolution = reconcileSpecCheck(parsed, 1, "now", ZERO_FLOOR);
     expect(resolution.kind).toBe("evidence-failed");
     if (resolution.kind === "evidence-failed") {
       expect(resolution.specCheck.error).toContain("SPEC_CHECK_HIGH_COUNT");
@@ -720,8 +731,8 @@ describe("handler fail-closed paths (round-10 Fix 2 + gap 20)", () => {
       const state = JSON.parse(readFileSync(statePath, "utf-8"));
       expect(state.spec_check).toMatchObject({
         wave: 2,
-        verdict: "PASSED",
-        critical_count: 0,
+        verdict: "EVIDENCE_CAPTURE_FAILED",
+        cause: "projection-unavailable",
       });
     } finally {
       if (previousConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR;
@@ -826,3 +837,233 @@ describe("handler fail-closed paths (round-10 Fix 2 + gap 20)", () => {
     }
   });
 });
+
+describe("the Requirement Coverage Projection is enforced, not merely rendered", () => {
+  const spec = `# Feature: Enforced
+
+## User Scenarios
+
+### US1: [P1] Enforce the floor
+
+**Acceptance Scenarios:**
+- AS-001: Given a settled row, When the Agent drops it, Then evidence capture fails
+
+## Functional Requirements
+
+- FR-001: System MUST floor the reported CRITICAL count at the settled count
+
+## Out of Scope
+
+- OOS-001: Symbol-level source indexing
+
+## Appendix: Glossary
+
+| Term | Definition |
+|------|------------|
+| Spec Index | A deterministic projection of specification entries |
+`;
+
+  /**
+   * One Wave whose single Task claims an identifier the spec does not define —
+   * a settled CRITICAL — and a spec-check transcript reporting `reported`
+   * CRITICAL findings. Returns the persisted `spec_check` record.
+   *
+   * `floor` is what the epoch RECORDED when the packet was installed, which is
+   * the only number the engine enforces. Passing it explicitly is what lets a
+   * test tell the recorded floor apart from anything re-projected at capture:
+   * the live graph here settles 3, so a recorded 1 that admits a 1-CRITICAL
+   * report proves the recorded value is the one in force.
+   */
+  async function storedSpecCheck(
+    reported: number,
+    // `null`, never `undefined`: a default parameter answers for `undefined`,
+    // so an omitted-floor case written that way would silently receive the
+    // default and test the opposite of what it claims.
+    floor: Readonly<Record<string, unknown>> | null = { kind: "settled", count: 3 },
+  ): Promise<Record<string, unknown>> {
+    const tmpRoot = join(tmpdir(), `spec-check-floor-${reported}-${Date.now()}`);
+    mkdirSync(tmpRoot, { recursive: true });
+    const tmpDir = realpathSync.native(tmpRoot);
+    const statePath = join(tmpDir, "active_task_graph.json");
+    const specPath = join(tmpDir, "spec.md");
+    writeFileSync(specPath, spec);
+    const specDigest = createHash("sha256").update(readFileSync(specPath)).digest("hex");
+    const transcriptPath = join(tmpDir, "transcript.jsonl");
+    const criticalLines = Array.from({ length: reported }, (_, at) => `CRITICAL: finding ${at + 1}`);
+    writeFileSync(transcriptPath, JSON.stringify({
+      type: "assistant",
+      message: { content: [{ type: "text", text: [
+        "SPEC_CHECK_WAVE: 5",
+        ...criticalLines,
+        `SPEC_CHECK_CRITICAL_COUNT: ${reported}`,
+        "SPEC_CHECK_HIGH_COUNT: 0",
+        `SPEC_CHECK_VERDICT: ${reported === 0 ? "PASSED" : "BLOCKED"}`,
+      ].join("\n") }] },
+    }));
+    const runId = parseOrchestrationRunId(`run.spec-floor-${reported}`);
+    const slotId = parseSlotId(`wave-slot:spec-floor-${reported}`);
+    if (!runId.ok || !slotId.ok) throw new Error("invalid floor authority fixture");
+    writeFileSync(statePath, JSON.stringify({
+      spec_trace_version: 2,
+      current_phase: "execute", phase_artifacts: {}, skipped_phases: [],
+      spec_file: specPath, plan_file: null, current_wave: 5,
+      tasks: [{
+        id: "T1", description: "claims an undefined Requirement", agent: "code-implementer-agent",
+        wave: 5, status: "completed", depends_on: [],
+        spec_anchors: ["FR-404"], spec_contributions: [],
+        file_list: ["src/a.ts"], files_modified: ["src/a.ts"],
+      }],
+      wave_gates: {},
+      active_wave_gate: {
+        schemaVersion: 1, kind: "active-wave-gate", runId: runId.value, wave: 5,
+        authorityDigest: "a".repeat(64), revision: 1, terminalOutcome: null,
+      },
+      wave_review_epoch: {
+        runId: runId.value, wave: 5, batchEpoch: "b".repeat(64),
+        specCheckDocuments: {
+          spec: { path: specPath, contentDigest: specDigest },
+          plan: { path: null, contentDigest: null },
+        },
+        specCheckSlotAuthority: { slot_id: slotId.value, attempted: 1 },
+        ...(floor === null ? {} : { settledSpecCheckFloor: floor }),
+      },
+    }));
+    const session = `spec-check-floor-${reported}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    await withTaskGraphPointer(session, statePath, async () => {
+      await runStoreSpecCheckFindings(JSON.stringify({
+        session_id: session,
+        agent_type: "spec-check-invoker",
+        agent_transcript_path: transcriptPath,
+      }), [], { runId: runId.value, slotId: slotId.value, attempt: 1, role: "spec-check-invoker" });
+    });
+    const stored = JSON.parse(readFileSync(statePath, "utf8")).spec_check as Record<string, unknown>;
+    rmSync(tmpDir, { recursive: true, force: true });
+    return stored;
+  }
+
+  it("fails evidence capture when the report drops a row the engine settled", async () => {
+    // The defect this closes: the engine settled FR-404 as CRITICAL, rendered
+    // it into the packet, and then accepted a transcript claiming zero. The
+    // Wave Gate opened on the model's own arithmetic.
+    const stored = await storedSpecCheck(0);
+    expect(stored).toMatchObject({ wave: 5, verdict: "EVIDENCE_CAPTURE_FAILED", cause: "settled-floor" });
+    expect(String(stored.error)).toContain("the Requirement Coverage Projection settled");
+    expect(String(stored.error)).toContain("re-run /wave-gate");
+  });
+
+  it("enforces the floor the epoch recorded, not one re-projected at capture", async () => {
+    // The divergence this closes: `spec_anchor_hashes` and the `spec_anchors`
+    // of Tasks outside the reviewed Wave both move the projected count and are
+    // both absent from `batchEpoch`, so a re-projection at capture could
+    // enforce a number the Agent was never shown. This fixture's live graph
+    // settles 3; the epoch recorded 1; a 1-CRITICAL report must be accepted.
+    const stored = await storedSpecCheck(1, { kind: "settled", count: 1 });
+    expect(stored).toMatchObject({ wave: 5, critical_count: 1 });
+    expect(stored.verdict).not.toBe("EVIDENCE_CAPTURE_FAILED");
+  });
+
+  it("fails closed on an epoch installed before floor authority was recorded", async () => {
+    const stored = await storedSpecCheck(0, null);
+    expect(stored).toMatchObject({
+      wave: 5,
+      verdict: "EVIDENCE_CAPTURE_FAILED",
+      cause: "projection-unavailable",
+    });
+    expect(String(stored.error)).toContain("predates recorded Requirement Coverage floor authority");
+  });
+
+  it("accepts a report that meets the floor", async () => {
+    // FR-404 is the one settled CRITICAL: unknown-requirement, and no FR or AS
+    // in the fixture goes unclaimed except the ones the Task does not name.
+    const settled = 3; // FR-404 row + FR-001 unclaimed + AS-001 unclaimed
+    const stored = await storedSpecCheck(settled, { kind: "settled", count: settled });
+    expect(stored).toMatchObject({ wave: 5, critical_count: settled });
+    expect(stored.verdict).not.toBe("EVIDENCE_CAPTURE_FAILED");
+  });
+});
+
+describe("round-6: the reported party selects no Wave", () => {
+  it("files a wrong-Wave transcript refusal on the engine's wave", async () => {
+    // The defect this closes: the Wave chain took findings.wave — the Agent's
+    // own SPEC_CHECK_WAVE marker — so on the legacy path (epoch absent) the
+    // Agent chose both the roster its floor is derived from and, through
+    // reconcileWaveBlock's cause attribution, the veto's target. One Wave
+    // variable feeds the stored record and the block; it takes the epoch when
+    // the engine has one, else the state's current wave.
+    const tmpRoot = join(tmpdir(), `spec-check-block-wave-${Date.now()}`);
+    mkdirSync(tmpRoot, { recursive: true });
+    const tmpDir = realpathSync.native(tmpRoot);
+    const statePath = join(tmpDir, "active_task_graph.json");
+    writeFileSync(statePath, JSON.stringify({
+      current_phase: "execute",
+      phase_artifacts: {},
+      skipped_phases: [],
+      spec_file: null,
+      plan_file: null,
+      // Legacy path: no wave_review_epoch, so the epoch chain is absent — the
+      // exact path where the Agent's claimed wave used to select the target.
+      current_wave: 3,
+      tasks: [],
+      spec_check: {
+        wave: 1, run_at: "earlier", verdict: "PASSED", critical_count: 0, high_count: 0,
+        critical_findings: [], high_findings: [], medium_findings: [],
+      },
+      wave_gates: {
+        "3": { impl_complete: false, tests_passed: null, reviews_complete: false, blocked: false },
+        "5": { impl_complete: false, tests_passed: null, reviews_complete: false, blocked: false },
+      },
+    }));
+    const transcriptPath = join(tmpDir, "transcript.jsonl");
+    writeFileSync(transcriptPath, JSON.stringify({
+      type: "assistant",
+      message: { content: [{ type: "text", text: [
+        "SPEC_CHECK_WAVE: 5",
+        "CRITICAL: the Agent's claimed wave must not choose the veto's target",
+        "SPEC_CHECK_CRITICAL_COUNT: 1",
+        "SPEC_CHECK_HIGH_COUNT: 0",
+        "SPEC_CHECK_VERDICT: BLOCKED",
+      ].join("\n") }] },
+    }));
+    const session = `spec-check-block-wave-${process.pid}-${Date.now()}`;
+    try {
+      await withTaskGraphPointer(session, statePath, async () => {
+        const result = await handler(JSON.stringify({
+          session_id: session,
+          agent_type: "spec-check-invoker",
+          agent_transcript_path: transcriptPath,
+        }), []);
+        expect(result.kind).toBe("passthrough");
+
+        const state = JSON.parse(readFileSync(statePath, "utf-8"));
+        // The record files under the engine's wave (state.current_wave), not
+        // the Agent's claimed wave 5.
+        expect(state.spec_check.wave).toBe(3);
+        expect(state.spec_check).toMatchObject({
+          verdict: "EVIDENCE_CAPTURE_FAILED",
+          cause: "transcript",
+          error: expect.stringContaining("does not match protected Wave 3"),
+        });
+        // Evidence failure carries no accepted critical count, so neither Wave
+        // receives a content block; the engine-selected filing Wave remains 3.
+        expect(state.wave_gates["3"].blocked).toBe(false);
+        expect(state.wave_gates["5"].blocked).toBe(false);
+      });
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+function withTaskGraphPointer<T>(session: string, statePath: string, run: () => Promise<T>): Promise<T> {
+  return (async () => {
+    const { SUBAGENT_DIR } = await import("../../src/config");
+    mkdirSync(SUBAGENT_DIR, { recursive: true, mode: 0o700 });
+    const pointer = join(SUBAGENT_DIR, `${session}.task_graph`);
+    writeFileSync(pointer, statePath);
+    try {
+      return await run();
+    } finally {
+      rmSync(pointer, { force: true });
+    }
+  })();
+}

@@ -57,6 +57,8 @@ import {
 } from "../../src/core/implementation-completion";
 import { taskFixture, type TaskFixtureInput } from "../fixtures/task-lifecycle";
 import { defaultVerificationManifest } from "../../src/core/verification-manifest";
+import { capturedSpecCheck } from "../../src/core/spec-check";
+import { waveGateAuthorityDigest } from "../../src/core/wave-review-authority";
 import {
   commitWaveGateCompletion,
   createWaveGateState,
@@ -447,16 +449,13 @@ describe("checkCriticalFindings (pure)", () => {
 });
 
 describe("checkSpecAlignment (pure)", () => {
-  const captured = (overrides: Partial<CapturedSpecCheck> = {}): CapturedSpecCheck => ({
-    wave: 1,
-    run_at: "",
-    verdict: "PASSED",
-    critical_count: 0,
-    high_count: 0,
-    critical_findings: [],
-    high_findings: [],
-    medium_findings: [],
-    ...overrides,
+  const captured = (overrides: Readonly<{
+    wave?: number;
+    criticalFindings?: readonly string[];
+  }> = {}): CapturedSpecCheck => capturedSpecCheck({
+    wave: overrides.wave ?? 1,
+    runAt: "",
+    criticalFindings: overrides.criticalFindings ?? [],
   });
   const mkState = (overrides: Partial<TaskGraph> = {}): TaskGraph => ({
     current_phase: "execute",
@@ -496,24 +495,19 @@ describe("checkSpecAlignment (pure)", () => {
 
   it("fails when spec-check has critical findings", () => {
     const state = mkState({
-      spec_check: captured({
-        verdict: "BLOCKED",
-        critical_count: 2,
-        critical_findings: ["drift", "missing"],
-      }),
+      spec_check: captured({ criticalFindings: ["drift", "missing"] }),
     });
     const result = checkSpecAlignment(state, 1);
     expect(result.passed).toBe(false);
     expect(gateCheckMessage(result)).toContain("2 critical");
   });
 
-  for (const verdict of ["UNKNOWN", "BLOCKED"] as const) {
-    it(`fails when a zero-critical spec-check verdict is ${verdict}`, () => {
-      const result = checkSpecAlignment(mkState({ spec_check: captured({ verdict }) }), 1);
-      expect(result.passed).toBe(false);
-      expect(gateCheckMessage(result)).toContain(`verdict is ${verdict}`);
-    });
-  }
+  it("fails when a forged zero-critical spec-check verdict is BLOCKED", () => {
+    const forged = { ...captured(), verdict: "BLOCKED" } as unknown as CapturedSpecCheck;
+    const result = checkSpecAlignment(mkState({ spec_check: forged }), 1);
+    expect(result.passed).toBe(false);
+    expect(gateCheckMessage(result)).toContain("verdict is BLOCKED");
+  });
 
   // The `captured()` helper cannot produce this verdict — an evidence failure
   // carries a cause and NO counts, which is the whole point of the separate
@@ -527,6 +521,7 @@ describe("checkSpecAlignment (pure)", () => {
         run_at: "",
         verdict: "EVIDENCE_CAPTURE_FAILED",
         error: "SPEC_CHECK_CRITICAL_COUNT marker not found",
+        cause: "transcript",
       },
     });
 
@@ -547,6 +542,7 @@ describe("checkSpecAlignment (pure)", () => {
         run_at: "",
         verdict: "EVIDENCE_CAPTURE_FAILED",
         error: "transcript truncated",
+        cause: "transcript",
       },
     });
 
@@ -598,16 +594,12 @@ describe("generateWaveGateSummary (pure)", () => {
       mkTask("T2", { critical_findings: [], advisory_findings: [] }),
     ];
 
-    const specCheck: CapturedSpecCheck = {
+    const specCheck = capturedSpecCheck({
       wave: 1,
-      run_at: "2024-01-01",
-      verdict: "PASSED",
-      critical_count: 0,
-      high_count: 0,
-      critical_findings: [],
-      high_findings: [],
-      medium_findings: ["Minor drift in validation"],
-    };
+      runAt: "2024-01-01",
+      criticalFindings: [],
+      mediumFindings: ["Minor drift in validation"],
+    });
 
     const summary = generateWaveGateSummary(1, tasks, specCheck);
 
@@ -712,16 +704,8 @@ describe("generateWaveGateSummary (pure)", () => {
 });
 
 describe("evaluateWaveGate + applyGateDecision — fs resolved once before the lock, checks on locked state", () => {
-  const specCheck = (wave: number): CapturedSpecCheck => ({
-    wave,
-    run_at: "",
-    verdict: "PASSED",
-    critical_count: 0,
-    high_count: 0,
-    critical_findings: [],
-    high_findings: [],
-    medium_findings: [],
-  });
+  const specCheck = (wave: number): CapturedSpecCheck =>
+    capturedSpecCheck({ wave, runAt: "", criticalFindings: [] });
 
   const mkGraph = (overrides: Partial<TaskGraph> = {}): TaskGraph => ({
     current_phase: "execute",
@@ -2424,17 +2408,23 @@ describe("protected active Wave Gate registration", () => {
   it("registers atomically, replays idempotently, and refuses a competing active run", async () => {
     const root = canonicalTempDir("loom-active-wave-");
     const path = join(root, "active_task_graph.json");
-    writeFileSync(path, JSON.stringify({
+    const taskIds = ["T1"];
+    const initial: TaskGraph = {
       current_phase: "execute", current_wave: 1, phase_artifacts: {}, skipped_phases: [],
-      spec_file: null, plan_file: null, tasks: [], wave_gates: {},
-    }));
+      spec_file: null, plan_file: null, tasks: [baseTask], wave_gates: {},
+    };
+    const exactRegistration = {
+      ...registration,
+      authorityDigest: waveGateAuthorityDigest(1, taskIds, initial),
+    };
+    writeFileSync(path, JSON.stringify(initial));
     const manager = new StateManager(path);
     try {
-      const first = await manager.registerActiveWaveGate(registration);
-      const replay = await manager.registerActiveWaveGate(registration);
+      const first = await manager.registerActiveWaveGate(exactRegistration, taskIds);
+      const replay = await manager.registerActiveWaveGate(exactRegistration, taskIds);
       expect(replay).toEqual(first);
       expect(manager.load().active_wave_gate).toEqual(first);
-      await expect(manager.registerActiveWaveGate({ ...registration, runId: "competing-run" }))
+      await expect(manager.registerActiveWaveGate({ ...exactRegistration, runId: "competing-run" }, taskIds))
         .rejects.toThrow("already owns wave 1");
       expect(manager.load().active_wave_gate).toEqual(first);
     } finally {
@@ -2464,7 +2454,7 @@ describe("protected active Wave Gate registration", () => {
         terminalOutcome: null,
       }));
       expect(replay).toEqual(committed.completedRegistration);
-      await expect(manager.registerActiveWaveGate(registration))
+      await expect(manager.registerActiveWaveGate(registration, ["T1"]))
         .rejects.toThrow("already completed or older than terminal Wave history");
       expect(manager.load().active_wave_gate).toBeUndefined();
     } finally {

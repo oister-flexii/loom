@@ -135,7 +135,7 @@ describe("validateFull (pure)", () => {
       tasks: [validTask],
     };
     expect(errorsOf(validateFull(graph))).toContain(
-      'current_wave must be an integer >= 1 when present, got "2"',
+      'current_wave must be an integer >= 1 within the safe-integer range when present, got "2"',
     );
   });
 
@@ -1021,6 +1021,25 @@ describe("validateFull agrees with the load boundary about the findings aggregat
     expect(parseTaskGraph(repaired).ok).toBe(true);
   });
 
+  it.each([
+    ["active Wave Gate", { active_wave_gate: "forged" }],
+    ["Wave review epoch", { wave_review_epoch: "forged" }],
+    ["verification manifest", { verification_manifest: "forged" }],
+    ["completion suite", { active_wave_completion_suite: "forged" }],
+    ["terminal history", { wave_gate_history: "forged" }],
+    ["reopening history", { wave_reopening_history: "forged" }],
+    ["orphan history", { orphaned_wave_gate_history: "forged" }],
+    ["trace retirement history", { spec_trace_wave_gate_retirements: "forged" }],
+  ])("uses the complete State File decoder to reject malformed %s authority", (_label, authority) => {
+    const malformed = { ...graph({}), ...authority };
+    const decoded = parseTaskGraph(malformed);
+    expect(validateFull(malformed, "state-file").ok).toBe(false);
+    expect(decoded.ok).toBe(false);
+    if (!decoded.ok) {
+      expect(errorsOf(validateFull(malformed, "state-file"))).toContain(decoded.error);
+    }
+  });
+
   it("rejects the same invalid execution-state union as the load boundary", () => {
     const invalid = graph({ status: "nonsense" });
     expect(validateFull(invalid, "state-file").ok).toBe(false);
@@ -1040,8 +1059,8 @@ describe("validateFull agrees with the load boundary about the findings aggregat
   });
 
   it("does NOT apply the findings rules to the agent-controlled decompose payload", () => {
-    // populate-task-graph validates the payload BEFORE sanitizeDecomposedTask
-    // strips the execution state a planner must never mint. Holding it to the
+    // populate-task-graph validates the payload BEFORE TaskGraph Population's
+    // sanitizeTask strips execution state a planner must never mint. Holding it to the
     // findings invariants would reject exactly the forged input that
     // sanitization exists to clean, turning a successful strip into a hard fail.
     const forged = graph({ findings: [], critical_findings: ["planted"], advisory_findings: [] });

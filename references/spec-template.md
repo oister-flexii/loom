@@ -156,6 +156,17 @@ Known risks and mitigation thoughts (not solutions):
 
 ## Section Guidelines
 
+### Canonical entry bodies
+
+FR, AS, and OOS entries use top-level `- FAMILY-NNN: text` bullets in their respective sections or Acceptance Scenarios block. Keep each identifier unique within its family.
+
+- Directly adjacent lazy paragraph continuations and blank-separated paragraphs indented beneath the bullet belong to that entry's content and hash. Two leading spaces suffice for the canonical `- ` marker; leading tabs expand to four-column tab stops.
+- Ordinary nested clauses, headings, thematic breaks, and fence-shaped text at owned indentation remain part of that content. They must not disappear during example filtering.
+- Do not put a colon-full FR/AS/OOS identifier inside another entry's owned body, including inside owned fence-shaped text. The parser refuses the specification rather than silently absorbing or discarding a nested identifier. Put independent entries at top level. Colon-less ID references and spaced-family prose are not declarations.
+- Genuine top-level fenced examples are excluded from the Spec Index. Top-level indented code is excluded when no open list item owns its indentation; moving text beneath an open entry changes that ownership.
+
+This is the supported Spec grammar, not a claim of complete CommonMark conformance. The executable matrices live in `engine/tests/core/parse-spec.test.ts` and `spec-parser-coverage-contract.test.ts`.
+
 ### User Scenarios
 
 **Purpose:** Capture user intent, not system behavior.

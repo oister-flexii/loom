@@ -35,6 +35,12 @@ const ENGINE = fileURLToPath(new URL("../../../", import.meta.url));
 const PACKAGE_ROOT = fileURLToPath(new URL("../../../../", import.meta.url));
 const CURRENT_RUNTIME = captureLoomRuntimeIdentity(PACKAGE_ROOT);
 const CLI = join(ENGINE, "src", "cli.ts");
+const PASSING_SPEC_CHECK_FOOTER = [
+  "SPEC_CHECK_WAVE: 1",
+  "SPEC_CHECK_CRITICAL_COUNT: 0",
+  "SPEC_CHECK_HIGH_COUNT: 0",
+  "SPEC_CHECK_VERDICT: PASSED",
+].join("\n");
 const cleanup: string[] = [];
 
 afterEach(async () => {
@@ -88,11 +94,50 @@ function modelFreePlan(root: string): string {
   return path;
 }
 
+function canonicalSpec(root: string): string {
+  const path = join(root, "spec.md");
+  writeFileSync(path, [
+    "# Feature: Orchestration fixture",
+    "",
+    "## User Scenarios",
+    "",
+    "### US1: [P1] Complete a Wave review",
+    "",
+    "**Acceptance Scenarios:**",
+    "- AS-001: Given accepted evidence, When the gate resumes, Then the Wave progresses",
+    "",
+    "## Functional Requirements",
+    "",
+    "- FR-001: System MUST process the exact current Wave evidence",
+    "",
+    "## Out of Scope",
+    "",
+    "- OOS-001: Unrelated feature work",
+    "",
+    "## Appendix: Glossary",
+    "",
+    "| Term | Definition |",
+    "|------|------------|",
+    "| Wave evidence | Evidence bound to the current Wave authority |",
+    "",
+  ].join("\n"));
+  return path;
+}
+
 function specCheckDocuments(specFile: string | null, planFile: string | null) {
   const document = (path: string | null) => path === null
     ? { path: null, contentDigest: null }
     : { path, contentDigest: createHash("sha256").update(readFileSync(path)).digest("hex") };
   return { spec: document(specFile), plan: document(planFile) };
+}
+
+function passingWaveTaskProof() {
+  const proof = evaluateTaskProof(
+    { newTestsRequired: true, declaredArtifacts: ["src/x.ts"] },
+    { taskCompleted: true, testResult: { verdict: "trusted-pass" }, filesModified: ["src/x.ts"], newTestsWritten: true },
+  );
+  if (proof.state !== "satisfied") throw new Error("passing Wave Task proof fixture must be satisfied");
+  return proof;
 }
 
 function replayFromCapturedEvidence(handle: RunDirHandle) {
@@ -1134,10 +1179,7 @@ describe("orchestration CLI", () => {
 
   it("rejects a Wave reviewer submission when its packet-bound task disappeared", () => {
     const root = repository();
-    const proof = evaluateTaskProof(
-      { newTestsRequired: true, declaredArtifacts: ["src/x.ts"] },
-      { taskCompleted: true, testResult: { verdict: "trusted-pass" }, filesModified: ["src/x.ts"], newTestsWritten: true },
-    );
+    const proof = passingWaveTaskProof();
     expect(proof.state).toBe("satisfied");
     writeFileSync(join(root, "src-x.ts"), "export const x = 1;\n");
     const graph = {
@@ -1179,10 +1221,7 @@ describe("orchestration CLI", () => {
 
   it("rejects a stale issued reviewer request after current Review Packet authority changes", () => {
     const root = repository();
-    const proof = evaluateTaskProof(
-      { newTestsRequired: true, declaredArtifacts: ["src/x.ts"] },
-      { taskCompleted: true, testResult: { verdict: "trusted-pass" }, filesModified: ["src/x.ts"], newTestsWritten: true },
-    );
+    const proof = passingWaveTaskProof();
     writeFileSync(join(root, "src-x.ts"), "export const x = 1;\n");
     const statePath = join(root, ".claude", "state", "active_task_graph.json");
     writeFileSync(statePath, JSON.stringify({
@@ -1215,6 +1254,7 @@ describe("orchestration CLI", () => {
         review_run: { ...task.review_run, packet_id: "f".repeat(64), head_sha: "e".repeat(64) },
       })),
     }));
+    const beforeSubmission = readFileSync(statePath);
     const submitted = runCli([
       "submit", "--runs-root", runsRoot, "--run", runDir,
       "--request", reviewer.requestId, "--slot", reviewer.slotId, "--attempt", "1",
@@ -1226,14 +1266,13 @@ describe("orchestration CLI", () => {
 
     expect(submitted.status).not.toBe(0);
     expect(submitted.stderr).toContain("does not belong to Task T1's exact current Review Packet slot");
+    expect(submitted.stderr).not.toContain("internal Wave Gate failure");
+    expect(readFileSync(statePath)).toEqual(beforeSubmission);
   }, 15_000);
 
   it("issues a fresh current packet batch after implementation invalidates a completed review generation", () => {
     const root = repository();
-    const proof = evaluateTaskProof(
-      { newTestsRequired: true, declaredArtifacts: ["src/x.ts"] },
-      { taskCompleted: true, testResult: { verdict: "trusted-pass" }, filesModified: ["src/x.ts"], newTestsWritten: true },
-    );
+    const proof = passingWaveTaskProof();
     writeFileSync(join(root, "src-x.ts"), "export const x = 1;\n");
     const statePath = join(root, ".claude", "state", "active_task_graph.json");
     writeFileSync(statePath, JSON.stringify({
@@ -1282,7 +1321,7 @@ describe("orchestration CLI", () => {
     const staleSubmission = runCli([
       "submit", "--runs-root", runsRoot, "--run", runDir,
       "--request", staleSpec.requestId, "--slot", staleSpec.slotId, "--attempt", "1",
-    ], "SPEC_CHECK_WAVE: 1\nSPEC_CHECK_CRITICAL_COUNT: 0\nSPEC_CHECK_HIGH_COUNT: 0\nSPEC_CHECK_VERDICT: PASSED", root);
+    ], PASSING_SPEC_CHECK_FOOTER, root);
     expect(staleSubmission.status).not.toBe(0);
     expect(staleSubmission.stderr).toContain("does not belong to the exact current review epoch");
     expect((JSON.parse(readFileSync(statePath, "utf8")) as { spec_check?: unknown }).spec_check).toBeUndefined();
@@ -1290,10 +1329,7 @@ describe("orchestration CLI", () => {
 
   it("keeps sibling packet recovery authority stable after one task finalizes new findings", () => {
     const root = repository();
-    const proof = evaluateTaskProof(
-      { newTestsRequired: true, declaredArtifacts: ["src/x.ts"] },
-      { taskCompleted: true, testResult: { verdict: "trusted-pass" }, filesModified: ["src/x.ts"], newTestsWritten: true },
-    );
+    const proof = passingWaveTaskProof();
     writeFileSync(join(root, "src-x.ts"), "export const x = 1;\n");
     const task = (id: string) => ({
       id, description: `review ${id}`, agent: "code-implementer-agent", wave: 1, status: "implemented", proof,
@@ -1348,10 +1384,7 @@ describe("orchestration CLI", () => {
 
   it("recovers current Wave Review Packets with attempt 2 before stale criticals can start refutation", async () => {
     const root = repository();
-    const proof = evaluateTaskProof(
-      { newTestsRequired: true, declaredArtifacts: ["src/x.ts"] },
-      { taskCompleted: true, testResult: { verdict: "trusted-pass" }, filesModified: ["src/x.ts"], newTestsWritten: true },
-    );
+    const proof = passingWaveTaskProof();
     expect(proof.state).toBe("satisfied");
     writeFileSync(join(root, "src-x.ts"), "export const x = 1;\n");
     const finding = {
@@ -1359,11 +1392,13 @@ describe("orchestration CLI", () => {
       file: "src/x.ts", line: 1, claim: "current packet must finish before this finding is adjudicated",
     };
     const graph = {
+      spec_trace_version: 2,
       current_phase: "execute", current_wave: 1, phase_artifacts: {}, skipped_phases: [],
-      spec_file: null, plan_file: null, wave_gates: {},
+      spec_file: canonicalSpec(root), plan_file: null, wave_gates: {},
       tasks: [{
         id: "T10", description: "review target", agent: "code-implementer-agent", wave: 1,
         status: "implemented", proof, depends_on: [], file_list: ["src/x.ts"], files_modified: ["src/x.ts"],
+        spec_anchors: ["FR-001", "AS-001"], spec_contributions: [],
         test_result: { verdict: "trusted-pass" }, test_evidence: "passed", new_tests_written: true,
         new_test_evidence: "present", review_status: "blocked", review_generation: 0,
         findings: [finding], critical_findings: [finding.claim], advisory_findings: [],
@@ -1380,7 +1415,7 @@ describe("orchestration CLI", () => {
     ], JSON.stringify({ wave: 1 }), root);
     expect(started.status, started.stderr).toBe(0);
     const initial = JSON.parse(started.stdout) as { kind: string; requests: readonly { authority: AgentRequestAuthority }[] };
-    expect(initial.kind).toBe("spawn-batch");
+    expect(initial.kind, started.stdout).toBe("spawn-batch");
     const opened = openRunDirectory(runsRoot, runDir);
     if (!opened.ok) throw new Error(opened.error.message);
     for (const { authority } of initial.requests) {
@@ -1500,7 +1535,7 @@ describe("orchestration CLI", () => {
     const afterSpec = runCli([
       "submit", "--runs-root", runsRoot, "--run", runDir,
       "--request", specAuthority.requestId, "--slot", specAuthority.slotId, "--attempt", "2",
-    ], "SPEC_CHECK_WAVE: 1\nSPEC_CHECK_CRITICAL_COUNT: 0\nSPEC_CHECK_HIGH_COUNT: 0\nSPEC_CHECK_VERDICT: PASSED", root);
+    ], PASSING_SPEC_CHECK_FOOTER, root);
     expect(afterSpec.status, afterSpec.stderr).toBe(0);
     const freshPanel = JSON.parse(afterSpec.stdout) as { kind: string; requests: readonly { authority: AgentRequestAuthority }[] };
     expect(freshPanel.kind, afterSpec.stdout).toBe("spawn-batch");
@@ -1550,10 +1585,7 @@ describe("orchestration CLI", () => {
 
   it("derives the spec-check retry from the CURRENT epoch when the journal holds an older epoch's spec-check attempt 1 (loom#20 Finding 5)", async () => {
     const root = repository();
-    const proof = evaluateTaskProof(
-      { newTestsRequired: true, declaredArtifacts: ["src/x.ts"] },
-      { taskCompleted: true, testResult: { verdict: "trusted-pass" }, filesModified: ["src/x.ts"], newTestsWritten: true },
-    );
+    const proof = passingWaveTaskProof();
     writeFileSync(join(root, "src-x.ts"), "export const x = 1;\n");
     const finding = {
       id: "finding-1", agent: "silent-failure-hunter", severity: "critical" as const,
@@ -1561,10 +1593,12 @@ describe("orchestration CLI", () => {
     };
     const statePath = join(root, ".claude", "state", "active_task_graph.json");
     writeFileSync(statePath, JSON.stringify({
+      spec_trace_version: 2,
       current_phase: "execute", current_wave: 1, phase_artifacts: {}, skipped_phases: [],
-      spec_file: null, plan_file: modelFreePlan(root), wave_gates: {}, tasks: [{
+      spec_file: canonicalSpec(root), plan_file: modelFreePlan(root), wave_gates: {}, tasks: [{
         id: "T1", description: "review target", agent: "code-implementer-agent", wave: 1,
         status: "implemented", proof, depends_on: [], file_list: ["src/x.ts"], files_modified: ["src/x.ts"],
+        spec_anchors: ["FR-001", "AS-001"], spec_contributions: [],
         test_result: { verdict: "trusted-pass" }, test_evidence: "passed", new_tests_written: true,
         new_test_evidence: "present", review_status: "pending", review_generation: 0,
         findings: [finding], critical_findings: [finding.claim], advisory_findings: [],
@@ -1577,7 +1611,7 @@ describe("orchestration CLI", () => {
     const started = runCli(["start", "wave-gate", "--runs-root", runsRoot, "--run", runDir], JSON.stringify({ wave: 1 }), root);
     expect(started.status, started.stderr).toBe(0);
     const initial = JSON.parse(started.stdout) as { kind: string; requests: readonly { authority: AgentRequestAuthority }[] };
-    expect(initial.kind).toBe("spawn-batch");
+    expect(initial.kind, started.stdout).toBe("spawn-batch");
     expect(initial.requests.some(({ authority }) => authority.role === "spec-check-invoker" && authority.attempt === 1)).toBe(true);
     const opened = openRunDirectory(runsRoot, runDir);
     if (!opened.ok) throw new Error(opened.error.message);
@@ -1619,8 +1653,6 @@ describe("orchestration CLI", () => {
       "HIGH: a spec gap claim that breaks count reconciliation",
       "SPEC_CHECK_VERDICT: BLOCKED",
     ].join("\n");
-    const specPassOutput = "SPEC_CHECK_WAVE: 1\nSPEC_CHECK_CRITICAL_COUNT: 0\nSPEC_CHECK_HIGH_COUNT: 0\nSPEC_CHECK_VERDICT: PASSED";
-
     // --- epoch 1: every attempt-1 transcript is captured but unusable, so the
     // gate issues attempt-2 retries for the reviewers. Applying those captured
     // retries closes the packets, and the recursion that follows derives the
@@ -1722,7 +1754,7 @@ describe("orchestration CLI", () => {
     const afterSpec = runCli([
       "submit", "--runs-root", runsRoot, "--run", runDir,
       "--request", retryAuthority.requestId, "--slot", retryAuthority.slotId, "--attempt", "2",
-    ], specPassOutput, root);
+    ], PASSING_SPEC_CHECK_FOOTER, root);
     expect(afterSpec.status, afterSpec.stderr).toBe(0);
     expect(afterSpec.stdout).not.toContain("could not be reconciled");
     const finalAction = JSON.parse(afterSpec.stdout) as { kind: string };
@@ -1731,10 +1763,7 @@ describe("orchestration CLI", () => {
 
   it("degrades to a wave-blocked verdict when the spec-check attempt-1 context is unreadable (never throws)", async () => {
     const root = repository();
-    const proof = evaluateTaskProof(
-      { newTestsRequired: true, declaredArtifacts: ["src/x.ts"] },
-      { taskCompleted: true, testResult: { verdict: "trusted-pass" }, filesModified: ["src/x.ts"], newTestsWritten: true },
-    );
+    const proof = passingWaveTaskProof();
     writeFileSync(join(root, "src-x.ts"), "export const x = 1;\n");
     const finding = {
       id: "finding-1", agent: "silent-failure-hunter", severity: "critical" as const,
@@ -1782,12 +1811,109 @@ describe("orchestration CLI", () => {
     expect(verdict.diagnostic?.message.length).toBeGreaterThan(0);
   }, 30_000);
 
+  it("refuses a below-floor spec-check through the facade and keeps the refusal across resumes", async () => {
+    // Two gaps in one end-to-end path. Every other fixture here records
+    // `spec_file: null`, so the facade's floor had never once been exercised
+    // behaviourally - the suite would have stayed green with the enforcement
+    // removed. And the resume loop re-applies a durable capture exactly when
+    // the recorded verdict is EVIDENCE_CAPTURE_FAILED, which is what a floor
+    // violation writes, so the refusal used to be overwritten in place.
+    const root = repository();
+    const proof = passingWaveTaskProof();
+    writeFileSync(join(root, "src-x.ts"), "export const x = 1;\n");
+    const specPath = join(root, "spec.md");
+    writeFileSync(specPath, [
+      "# Feature: Floored",
+      "",
+      "## User Scenarios",
+      "",
+      "### US1: [P1] Enforce the floor at the facade",
+      "",
+      "**Acceptance Scenarios:**",
+      "- AS-001: Given a settled row, When the Agent drops it, Then evidence capture fails",
+      "",
+      "## Functional Requirements",
+      "",
+      "- FR-001: System MUST floor the reported CRITICAL count at the settled count",
+      "",
+      "## Out of Scope",
+      "",
+      "- OOS-001: Symbol-level source indexing",
+      "",
+      "## Appendix: Glossary",
+      "",
+      "| Term | Definition |",
+      "|------|------------|",
+      "| Spec Index | A deterministic projection of specification entries |",
+      "",
+    ].join("\n"));
+    const statePath = join(root, ".claude", "state", "active_task_graph.json");
+    writeFileSync(statePath, JSON.stringify({
+      spec_trace_version: 2,
+      current_phase: "execute", current_wave: 1, phase_artifacts: {}, skipped_phases: [],
+      spec_file: specPath, plan_file: null, wave_gates: {}, tasks: [{
+        id: "T1", description: "claims an undefined Requirement", agent: "code-implementer-agent", wave: 1,
+        status: "implemented", proof, depends_on: [], file_list: ["src/x.ts"], files_modified: ["src/x.ts"],
+        spec_anchors: ["FR-404"], spec_contributions: [],
+        test_result: { verdict: "trusted-pass" }, test_evidence: "passed", new_tests_written: true,
+        new_test_evidence: "present", review_status: "passed", review_generation: 0,
+        findings: [], critical_findings: [], advisory_findings: [],
+      }],
+    }));
+    const runsRoot = realpathSync.native(mkdtempSync(join(tmpdir(), "loom-wave-facade-floor-runs-")));
+    cleanup.push(runsRoot);
+    const runDir = join(runsRoot, "run.wave-facade-floor");
+    mkdirSync(runDir);
+    const started = runCli(["start", "wave-gate", "--runs-root", runsRoot, "--run", runDir], JSON.stringify({ wave: 1 }), root);
+    expect(started.status, started.stderr).toBe(0);
+    const initial = JSON.parse(started.stdout) as { kind: string; requests: readonly { authority: AgentRequestAuthority }[] };
+    expect(initial.kind, started.stdout).toBe("spawn-batch");
+
+    // The epoch records the floor the packet rendered: FR-404 is an unknown
+    // Requirement, and FR-001 and AS-001 go unclaimed. Three settled rows.
+    const epochFloor = (JSON.parse(readFileSync(statePath, "utf8")) as {
+      wave_review_epoch?: {
+        settledSpecCheckFloor?: { kind: string; count?: number; criticalFindings?: readonly string[] };
+      };
+    }).wave_review_epoch?.settledSpecCheckFloor;
+    expect(epochFloor).toMatchObject({
+      kind: "settled",
+      count: 3,
+      criticalFindings: expect.arrayContaining([
+        expect.stringContaining('claim "FR-404"'),
+        "FR-001 has no planned completion owner",
+        "AS-001 has no planned completion owner",
+      ]),
+    });
+
+    const opened = openRunDirectory(runsRoot, runDir);
+    if (!opened.ok) throw new Error(opened.error.message);
+    const specCheck = initial.requests
+      .find(({ authority }) => authority.role === "spec-check-invoker" && authority.attempt === 1)!.authority;
+    expect((await opened.value.captureTranscript(specCheck, [...Buffer.from(
+      PASSING_SPEC_CHECK_FOOTER)])).ok).toBe(true);
+
+    const firstResume = runCli(["resume", "--runs-root", runsRoot, "--run", runDir], "", root);
+    expect(firstResume.status, firstResume.stderr).toBe(0);
+    const refused = (JSON.parse(readFileSync(statePath, "utf8")) as {
+      spec_check?: { verdict: string; cause?: string; error?: string; run_at: string };
+    }).spec_check;
+    expect(refused).toMatchObject({ verdict: "EVIDENCE_CAPTURE_FAILED", cause: "settled-floor" });
+    expect(String(refused?.error)).toContain("the Requirement Coverage Projection settled 3");
+
+    const secondResume = runCli(["resume", "--runs-root", runsRoot, "--run", runDir], "", root);
+    expect(secondResume.status, secondResume.stderr).toBe(0);
+    const afterResume = (JSON.parse(readFileSync(statePath, "utf8")) as {
+      spec_check?: { verdict: string; cause?: string; run_at: string };
+    }).spec_check;
+    // Byte-identical, `run_at` included: the refusal was not re-decided, and a
+    // fresh timestamp would mean the loop had re-entered and rewritten it.
+    expect(afterResume).toEqual(refused);
+  }, 30_000);
+
   it("advances a capture-rejected Wave reviewer attempt 1 to diagnostic-rich attempt 2", async () => {
     const root = repository();
-    const proof = evaluateTaskProof(
-      { newTestsRequired: true, declaredArtifacts: ["src/x.ts"] },
-      { taskCompleted: true, testResult: { verdict: "trusted-pass" }, filesModified: ["src/x.ts"], newTestsWritten: true },
-    );
+    const proof = passingWaveTaskProof();
     writeFileSync(join(root, "src-x.ts"), "export const x = 1;\n");
     const statePath = join(root, ".claude", "state", "active_task_graph.json");
     writeFileSync(statePath, JSON.stringify({
@@ -1825,7 +1951,7 @@ describe("orchestration CLI", () => {
     });
     for (const { authority } of initial.requests.filter(({ authority }) => authority.requestId !== rejected.requestId)) {
       const task = authority.role === "spec-check-invoker"
-        ? "SPEC_CHECK_WAVE: 1\nSPEC_CHECK_CRITICAL_COUNT: 0\nSPEC_CHECK_HIGH_COUNT: 0\nSPEC_CHECK_VERDICT: PASSED"
+        ? PASSING_SPEC_CHECK_FOOTER
         : (() => {
             const graph = JSON.parse(readFileSync(statePath, "utf8")) as { tasks: readonly { review_run?: { generation: number; packet_id: string } }[] };
             const run = graph.tasks[0]!.review_run!;
@@ -1861,10 +1987,7 @@ describe("orchestration CLI", () => {
 
   it("drains safe sibling retries before blocking an exhausted Wave reviewer generation", async () => {
     const root = repository();
-    const proof = evaluateTaskProof(
-      { newTestsRequired: true, declaredArtifacts: ["src/x.ts"] },
-      { taskCompleted: true, testResult: { verdict: "trusted-pass" }, filesModified: ["src/x.ts"], newTestsWritten: true },
-    );
+    const proof = passingWaveTaskProof();
     writeFileSync(join(root, "src-x.ts"), "export const x = 1;\n");
     const statePath = join(root, ".claude", "state", "active_task_graph.json");
     writeFileSync(statePath, JSON.stringify({
@@ -1936,10 +2059,7 @@ describe("orchestration CLI", () => {
 
   it("atomically recovers an orphaned active Wave Gate without losing review history", async () => {
     const root = repository();
-    const proof = evaluateTaskProof(
-      { newTestsRequired: true, declaredArtifacts: ["src/x.ts"] },
-      { taskCompleted: true, testResult: { verdict: "trusted-pass" }, filesModified: ["src/x.ts"], newTestsWritten: true },
-    );
+    const proof = passingWaveTaskProof();
     writeFileSync(join(root, "src-x.ts"), "export const x = 1;\n");
     const activeFinding = {
       id: "code-reviewer-7", agent: "code-reviewer", severity: "critical" as const,
@@ -2181,10 +2301,7 @@ describe("orchestration CLI", () => {
 
   it("atomically restarts an exhausted Wave reviewer run with new generations and authority", async () => {
     const root = repository();
-    const proof = evaluateTaskProof(
-      { newTestsRequired: true, declaredArtifacts: ["src/x.ts"] },
-      { taskCompleted: true, testResult: { verdict: "trusted-pass" }, filesModified: ["src/x.ts"], newTestsWritten: true },
-    );
+    const proof = passingWaveTaskProof();
     expect(proof.state).toBe("satisfied");
     writeFileSync(join(root, "src-x.ts"), "export const x = 1;\n");
     const statePath = join(root, ".claude", "state", "active_task_graph.json");
@@ -2427,10 +2544,7 @@ describe("orchestration CLI", () => {
 
   it("preserves accepted partial findings and accepts durable capture rejection during restart", async () => {
     const root = repository();
-    const proof = evaluateTaskProof(
-      { newTestsRequired: true, declaredArtifacts: ["src/x.ts"] },
-      { taskCompleted: true, testResult: { verdict: "trusted-pass" }, filesModified: ["src/x.ts"], newTestsWritten: true },
-    );
+    const proof = passingWaveTaskProof();
     writeFileSync(join(root, "src-x.ts"), "export const x = 1;\n");
     const statePath = join(root, ".claude", "state", "active_task_graph.json");
     writeFileSync(statePath, JSON.stringify({
@@ -2509,10 +2623,7 @@ describe("orchestration CLI", () => {
 
   it("refuses restart when captured attempt 2 is valid but has not been applied", async () => {
     const root = repository();
-    const proof = evaluateTaskProof(
-      { newTestsRequired: true, declaredArtifacts: ["src/x.ts"] },
-      { taskCompleted: true, testResult: { verdict: "trusted-pass" }, filesModified: ["src/x.ts"], newTestsWritten: true },
-    );
+    const proof = passingWaveTaskProof();
     writeFileSync(join(root, "src-x.ts"), "export const x = 1;\n");
     const statePath = join(root, ".claude", "state", "active_task_graph.json");
     writeFileSync(statePath, JSON.stringify({
@@ -2568,10 +2679,7 @@ describe("orchestration CLI", () => {
 
   it("heals a Wave completion crash between the graph commit and the checkpoint write", async () => {
     const root = repository();
-    const proof = evaluateTaskProof(
-      { newTestsRequired: true, declaredArtifacts: ["src/x.ts"] },
-      { taskCompleted: true, testResult: { verdict: "trusted-pass" }, filesModified: ["src/x.ts"], newTestsWritten: true },
-    );
+    const proof = passingWaveTaskProof();
     writeFileSync(join(root, "src-x.ts"), "export const x = 1;\n");
     const statePath = join(root, ".claude", "state", "active_task_graph.json");
     writeFileSync(statePath, JSON.stringify({
@@ -2657,10 +2765,7 @@ describe("orchestration CLI", () => {
 
   it("blocks instead of spinning when a Wave refutation tally upholds every critical (loom#20 Finding 4)", async () => {
     const root = repository();
-    const proof = evaluateTaskProof(
-      { newTestsRequired: true, declaredArtifacts: ["src/x.ts"] },
-      { taskCompleted: true, testResult: { verdict: "trusted-pass" }, filesModified: ["src/x.ts"], newTestsWritten: true },
-    );
+    const proof = passingWaveTaskProof();
     expect(proof.state).toBe("satisfied");
     const finding = {
       id: "code-reviewer-7", agent: "code-reviewer", severity: "critical" as const,
@@ -2747,10 +2852,7 @@ describe("orchestration CLI", () => {
 
   it("passes a Wave whose refutation tally refutes every critical", async () => {
     const root = repository();
-    const proof = evaluateTaskProof(
-      { newTestsRequired: true, declaredArtifacts: ["src/x.ts"] },
-      { taskCompleted: true, testResult: { verdict: "trusted-pass" }, filesModified: ["src/x.ts"], newTestsWritten: true },
-    );
+    const proof = passingWaveTaskProof();
     expect(proof.state).toBe("satisfied");
     const finding = {
       id: "code-reviewer-7", agent: "code-reviewer", severity: "critical" as const,
@@ -2820,10 +2922,7 @@ describe("orchestration CLI", () => {
 
   it("blocks protected completion when automatic full-tier lint fails", () => {
     const root = repository();
-    const proof = evaluateTaskProof(
-      { newTestsRequired: true, declaredArtifacts: ["src/x.ts"] },
-      { taskCompleted: true, testResult: { verdict: "trusted-pass" }, filesModified: ["src/x.ts"], newTestsWritten: true },
-    );
+    const proof = passingWaveTaskProof();
     mkdirSync(join(root, "src"));
     writeFileSync(join(root, "src", "x.ts"), "console.log('full-tier violation');\n");
     const statePath = join(root, ".claude", "state", "active_task_graph.json");
@@ -3706,10 +3805,7 @@ describe("orchestration CLI", () => {
     /** A Wave-Gate run whose registration is live, so `decide` takes its wave branch. */
     function startedWaveRun(label: string) {
       const root = repository();
-      const proof = evaluateTaskProof(
-        { newTestsRequired: true, declaredArtifacts: ["src/x.ts"] },
-        { taskCompleted: true, testResult: { verdict: "trusted-pass" }, filesModified: ["src/x.ts"], newTestsWritten: true },
-      );
+      const proof = passingWaveTaskProof();
       mkdirSync(join(root, "src"));
       writeFileSync(join(root, "src", "x.ts"), "export const x = 1;\n");
       const statePath = join(root, ".claude", "state", "active_task_graph.json");

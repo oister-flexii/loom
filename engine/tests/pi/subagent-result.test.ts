@@ -1,3 +1,9 @@
+import {
+  parseSettledFloor,
+  unprojectedFloor,
+  type SettledFloor,
+} from "../../src/core/requirement-coverage";
+import { capturedSpecCheck } from "../../src/core/spec-check";
 import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -33,6 +39,7 @@ import {
   parsePiSubagentResults,
   resolveImplementationTaskId,
   writtenPathsOf,
+  type PiReviewAttemptAuthority,
   type PiSubagentResult,
   type TaskGraphStore,
 } from "../../../pi/subagent-result";
@@ -59,6 +66,12 @@ if (!parsedWaveRunId.ok || !parsedWaveAuthorityDigest.ok || !parsedWaveBatchEpoc
 const WAVE_RUN_ID = parsedWaveRunId.value;
 const WAVE_AUTHORITY_DIGEST = parsedWaveAuthorityDigest.value;
 const WAVE_BATCH_EPOCH = parsedWaveBatchEpoch.value;
+
+function settledFloor(count: number): SettledFloor {
+  const parsed = parseSettledFloor({ kind: "settled", count });
+  if (parsed === null) throw new Error("fixture settled floor must parse");
+  return parsed;
+}
 
 function graph(overrides: Partial<TaskGraph> = {}): TaskGraph {
   return {
@@ -92,7 +105,10 @@ function parsedGraph(graph: TaskGraph): ParsedTaskGraph {
   return parsed.value;
 }
 
-function graphWithSpecCheckAuthority(wave = 1) {
+function graphWithSpecCheckAuthority(
+  wave = 1,
+  settledSpecCheckFloor: SettledFloor | null = settledFloor(0),
+) {
   const state = parsedGraph(graph({
     current_wave: wave,
     active_wave_gate: {
@@ -113,6 +129,7 @@ function graphWithSpecCheckAuthority(wave = 1) {
         plan: { path: null, contentDigest: null },
       },
       specCheckSlotAuthority: { slot_id: "wave-slot:spec-check", attempted: 1 },
+      ...(settledSpecCheckFloor === null ? {} : { settledSpecCheckFloor }),
     },
   }));
   const authority = currentPiSpecCheckAuthority(state);
@@ -416,6 +433,46 @@ describe("applyPhaseAgentPiResult", () => {
   });
 });
 
+describe("PiReviewAttemptAuthority", () => {
+  it("mints only explicit legacy or exact slot-bound authority", () => {
+    expect(currentPiReviewAuthority(parsedGraph(graph()), "code-reviewer", "T1")).toEqual({
+      kind: "legacy",
+      taskId: "T1",
+      agentType: "code-reviewer",
+      generation: 0,
+    });
+
+    const base = graph();
+    const modern = parsedGraph(graph({
+      tasks: [{
+        ...base.tasks[0]!,
+        review_generation: 2,
+        review_run: {
+          generation: 2,
+          packet_id: "b".repeat(64),
+          head_sha: "2".repeat(40),
+          expected_agents: ["code-reviewer"],
+          prior_finding_ids: [],
+          evidence: [],
+          slot_authority: [{ agent: "code-reviewer", slot_id: "review-slot:current", attempted: 1 }],
+        },
+      }],
+    }));
+    expect(currentPiReviewAuthority(modern, "code-reviewer", "T1")).toMatchObject({
+      kind: "slot-bound",
+      packetId: "b".repeat(64),
+      slotId: "review-slot:current",
+      attempted: 1,
+    });
+
+    if (Date.now() < 0) {
+      // @ts-expect-error a legacy authority cannot carry one member of slot-bound identity.
+      const mixed: PiReviewAttemptAuthority = { kind: "legacy", taskId: "T1", agentType: "code-reviewer", generation: 0, packetId: null };
+      expect(mixed.kind).toBe("legacy");
+    }
+  });
+});
+
 describe("applyFailedPiResult", () => {
   it("reports a failed phase agent as a processing error without advancing", async () => {
     const store = fakeStore(graph({ current_phase: "architecture" }));
@@ -512,6 +569,7 @@ describe("applyFailedPiResult", () => {
         agentType: "code-reviewer",
         taskId: "T1",
         reviewAuthority: {
+          kind: "slot-bound",
           taskId: "T1",
           agentType: "code-reviewer",
           generation: 1,
@@ -555,6 +613,7 @@ describe("applyFailedPiResult", () => {
         agentType: "code-reviewer",
         taskId: "T1",
         reviewAuthority: {
+          kind: "slot-bound",
           taskId: "T1",
           agentType: "code-reviewer",
           generation: 1,
@@ -598,6 +657,7 @@ describe("applyFailedPiResult", () => {
         agentType: "code-reviewer",
         taskId: "T1",
         reviewAuthority: {
+          kind: "slot-bound",
           taskId: "T1", agentType: "code-reviewer", generation: 1,
           packetId: "c".repeat(64), slotId: "review-slot:old-malformed", attempted: 1,
         },
@@ -708,10 +768,9 @@ describe("applyFailedPiResult", () => {
     const fixture = graphWithSpecCheckAuthority();
     const store = fakeStore({
       ...fixture.state,
-      spec_check: {
-        wave: 1, run_at: "earlier", verdict: "BLOCKED", critical_count: 1, high_count: 0,
-        critical_findings: ["earlier blocker"], high_findings: [], medium_findings: [],
-      },
+      spec_check: capturedSpecCheck({
+        wave: 1, runAt: "earlier", criticalFindings: ["earlier blocker"],
+      }),
       wave_gates: {
         "1": { impl_complete: false, tests_passed: null, reviews_complete: false, blocked: true },
       },
@@ -868,6 +927,37 @@ describe("applyReviewPiResult", () => {
     });
 
     expect(store.current().tasks[0]).toMatchObject({
+      review_status: "blocked",
+      critical_findings: ["a real blocker"],
+    });
+  });
+
+  it("returns review application data from the locked updateAndReturn transition", async () => {
+    let current = parsedGraph(graph());
+    let updateAndReturnCalls = 0;
+    const store: TaskGraphStore = {
+      load: () => current,
+      update: async () => { throw new Error("legacy update must not be used"); },
+      updateAndReturn: async (mutate) => {
+        updateAndReturnCalls += 1;
+        const applied = mutate(current);
+        current = parsedGraph(applied.state);
+        return applied.value;
+      },
+    };
+
+    const applied = await applyReviewPiResult({
+      store,
+      agentType: "code-reviewer",
+      result: result({ messages: assistantText(machineSummary) }),
+      reservedSlot: { agentType: "code-reviewer", taskId: "T1" },
+      parentPrompt: "",
+    });
+
+    expect(updateAndReturnCalls).toBe(1);
+    expect(applied.processingErrors).toEqual([]);
+    expect(applied.log).toEqual([expect.stringContaining("Task T1 review: blocked")]);
+    expect(current.tasks[0]).toMatchObject({
       review_status: "blocked",
       critical_findings: ["a real blocker"],
     });
@@ -1082,6 +1172,23 @@ describe("applySpecCheckPiResult", () => {
     expect(store.current().wave_gates["1"]?.blocked ?? false).toBe(false);
   });
 
+  it("fails closed when the epoch records an unavailable projection", async () => {
+    const fixture = graphWithSpecCheckAuthority(1, unprojectedFloor("specification did not parse"));
+    const store = fakeStore(fixture.state);
+    await applySpecCheckPiResult({
+      store,
+      result: result({ agent: "spec-check-invoker", messages: assistantText(specCheckText(0)) }),
+      reservedSlot: fixture.reservedSlot,
+      now: NOW,
+    });
+
+    expect(store.current().spec_check).toMatchObject({
+      verdict: "EVIDENCE_CAPTURE_FAILED",
+      cause: "projection-unavailable",
+      error: expect.stringContaining("specification did not parse"),
+    });
+  });
+
   it.each([
     ["malformed messages", [{ role: 42 }]],
     ["count-mismatched evidence", assistantText([
@@ -1095,10 +1202,9 @@ describe("applySpecCheckPiResult", () => {
     const fixture = graphWithSpecCheckAuthority();
     const store = fakeStore({
       ...fixture.state,
-      spec_check: {
-        wave: 1, run_at: "earlier", verdict: "BLOCKED", critical_count: 1, high_count: 0,
-        critical_findings: ["earlier blocker"], high_findings: [], medium_findings: [],
-      },
+      spec_check: capturedSpecCheck({
+        wave: 1, runAt: "earlier", criticalFindings: ["earlier blocker"],
+      }),
       wave_gates: {
         "1": { impl_complete: false, tests_passed: null, reviews_complete: false, blocked: true },
       },
@@ -1114,7 +1220,7 @@ describe("applySpecCheckPiResult", () => {
     expect(store.current().wave_gates["1"]?.blocked).toBe(false);
   });
 
-  it("uses locked current_wave when the transcript omits its Wave despite a stale load", async () => {
+  it("files a missing-Wave transcript refusal under locked authority despite a stale load", async () => {
     const stale = graphWithSpecCheckAuthority(1).state;
     const currentFixture = graphWithSpecCheckAuthority(3);
     let current = currentFixture.state;
@@ -1138,8 +1244,13 @@ describe("applySpecCheckPiResult", () => {
     });
 
     expect(loadCount).toBe(1);
-    expect(store.current().spec_check).toMatchObject({ wave: 3, verdict: "BLOCKED" });
-    expect(store.current().wave_gates["3"]).toMatchObject({ blocked: true });
+    expect(store.current().spec_check).toMatchObject({
+      wave: 3,
+      verdict: "EVIDENCE_CAPTURE_FAILED",
+      cause: "transcript",
+      error: expect.stringContaining("SPEC_CHECK_WAVE marker not found"),
+    });
+    expect(store.current().wave_gates["3"]).toMatchObject({ blocked: false });
     expect(store.current().wave_gates["1"]).toBeUndefined();
   });
 
@@ -1206,6 +1317,40 @@ describe("applySpecCheckPiResult", () => {
       expect.stringContaining("does not match current"),
     ]);
     expect(store.current()).toEqual(current.state);
+  });
+
+  it("refuses a Pi report that falls below the floor its epoch recorded", async () => {
+    // The gap this closes: every Pi fixture used an epoch with no recorded
+    // floor, so the transport's enforcement was never once exercised - the
+    // suite would have stayed green with the floor argument removed entirely.
+    const fixture = graphWithSpecCheckAuthority(1, settledFloor(2));
+    const store = fakeStore(fixture.state);
+    await applySpecCheckPiResult({
+      store,
+      result: result({ agent: "spec-check-invoker", messages: assistantText(specCheckText(0)) }),
+      reservedSlot: fixture.reservedSlot,
+      now: NOW,
+    });
+
+    expect(store.current().spec_check).toMatchObject({
+      verdict: "EVIDENCE_CAPTURE_FAILED",
+      cause: "settled-floor",
+    });
+    expect(String(store.current().spec_check?.error))
+      .toContain("the Requirement Coverage Projection settled 2");
+  });
+
+  it("accepts a Pi report that meets the floor its epoch recorded", async () => {
+    const fixture = graphWithSpecCheckAuthority(1, settledFloor(1));
+    const store = fakeStore(fixture.state);
+    await applySpecCheckPiResult({
+      store,
+      result: result({ agent: "spec-check-invoker", messages: assistantText(specCheckText(1)) }),
+      reservedSlot: fixture.reservedSlot,
+      now: NOW,
+    });
+
+    expect(store.current().spec_check).toMatchObject({ verdict: "BLOCKED", critical_count: 1 });
   });
 
   it("rejects unreserved spec-check evidence without mutating protected state", async () => {
@@ -1632,10 +1777,7 @@ describe("applyImplementationPiResult", () => {
     });
     const store = fakeStore({
       ...initial,
-      spec_check: {
-        wave: 1, run_at: NOW, verdict: "PASSED", critical_count: 0, high_count: 0,
-        critical_findings: [], high_findings: [], medium_findings: [],
-      },
+      spec_check: capturedSpecCheck({ wave: 1, runAt: NOW, criticalFindings: [] }),
       wave_gates: {
         "1": { impl_complete: true, tests_passed: true, reviews_complete: true, blocked: false },
       },
@@ -1701,16 +1843,7 @@ describe("applyImplementationPiResult", () => {
     });
     const store = fakeStore({
       ...initial,
-      spec_check: {
-        wave: 1,
-        run_at: NOW,
-        verdict: "PASSED",
-        critical_count: 0,
-        high_count: 0,
-        critical_findings: [],
-        high_findings: [],
-        medium_findings: [],
-      },
+      spec_check: capturedSpecCheck({ wave: 1, runAt: NOW, criticalFindings: [] }),
       wave_gates: {
         "1": { impl_complete: true, tests_passed: true, reviews_complete: true, blocked: false },
       },
@@ -2044,10 +2177,7 @@ describe("applyImplementationPiResult", () => {
     });
     const modern = modernize({
       ...base,
-      spec_check: {
-        wave: 1, run_at: NOW, verdict: "PASSED", critical_count: 0, high_count: 0,
-        critical_findings: [], high_findings: [], medium_findings: [],
-      },
+      spec_check: capturedSpecCheck({ wave: 1, runAt: NOW, criticalFindings: [] }),
       wave_gates: {
         "1": { impl_complete: false, tests_passed: true, reviews_complete: true, blocked: false },
       },

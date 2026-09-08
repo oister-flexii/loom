@@ -17,10 +17,10 @@ export type SpecEntryId<F extends SpecFamily = SpecFamily> = string & { readonly
 export type SpecContentHash = string & { readonly [SPEC_CONTENT_HASH]: true };
 
 /**
- * Phantom witness that the carrier's `contentHash` was derived from the
- * carrier's own content. It has no runtime representation; its only job is to
- * make the smart constructors below the sole origin of an entry, so an entry
- * whose hash disagrees with its content is unrepresentable outside this module.
+ * Phantom constructor-origin witness. It has no runtime representation and is
+ * not forgery-proof: structural spreading can preserve the static brand while
+ * replacing content. Parser-minted entries still derive their hash in one smart
+ * constructor, and runtime property tests enforce that construction contract.
  */
 type HashedByConstruction = Readonly<{ [HASHED_BY_CONSTRUCTION]: true }>;
 
@@ -184,6 +184,21 @@ export function specContentHash(content: string): SpecContentHash {
   return createHash("sha256").update(canonicalContent(content), "utf8").digest("hex") as SpecContentHash;
 }
 
+/** The exact shape `specContentHash` mints: lowercase SHA-256 hex. */
+const SPEC_CONTENT_HASH_SHAPE = /^[0-9a-f]{64}$/u;
+
+/**
+ * The only way a hash persisted by an earlier phase re-enters the type. Its
+ * content is deliberately unavailable here — a recorded hash is compared
+ * against a freshly derived one, never re-derived — so this admits the minted
+ * shape and nothing else. `null` for anything else, which stops a truncated or
+ * hand-edited value from entering the type and then merely failing to match,
+ * where it would read as ordinary Requirement drift.
+ */
+export function parseSpecContentHash(raw: unknown): SpecContentHash | null {
+  return typeof raw === "string" && SPEC_CONTENT_HASH_SHAPE.test(raw) ? raw as SpecContentHash : null;
+}
+
 /** The only mint for a `SpecEntry`: canonicalizes the content and derives the
  * hash from that same canonical text, so the pair cannot disagree. */
 function specEntry<F extends SpecFamily>(id: string, rawContent: string): SpecEntry<F> {
@@ -231,6 +246,27 @@ function expandLeadingTabs(line: string): string {
   return expanded + line.slice(head.length);
 }
 
+/** Classify a non-marker line after the outer list-ownership check. */
+function nonFenceLine(
+  line: string,
+  context: Readonly<{ insideFence: boolean; contentIndent: number | null; previousBlank: boolean }>,
+): Readonly<{ text: string; contentIndent: number | null; previousBlank: boolean }> {
+  const indentation = leadingSpaces(line);
+  // Owned content has already returned; only fence content and top-level code remain.
+  if (context.insideFence || (context.previousBlank && indentation >= 4)) {
+    return Object.freeze({ text: "", contentIndent: context.contentIndent, previousBlank: true });
+  }
+  let contentIndent = context.contentIndent;
+  const listMarker = /^ {0,3}(?:[-+*]|\d+[.)]) +/u.exec(line);
+  if (listMarker !== null) {
+    contentIndent = listMarker[0].length;
+  } else if (line.trim() !== "" && contentIndent !== null && indentation < contentIndent &&
+      (context.previousBlank || startsMarkdownBlock(line.trim()))) {
+    contentIndent = null;
+  }
+  return Object.freeze({ text: line, contentIndent, previousBlank: line.trim().length === 0 });
+}
+
 /**
  * Blank fenced examples and indented-code furniture while preserving headings
  * and line numbers outside them, aligned with CommonMark in both directions:
@@ -239,38 +275,39 @@ function expandLeadingTabs(line: string): string {
  * info string may not contain a backtick (CommonMark calls such a line
  * paragraph text); a closer is a marker-only line (nothing but whitespace
  * after) of the same character, equal or longer. Lines indented four or more
- * spaces are furniture only after a blank line, a fence line, or the start of
- * the document (an indented code block cannot interrupt a paragraph); lazy
+ * spaces are top-level furniture only after a blank line, a fence line, or the
+ * start of the document; indentation owned by an open list item remains item
+ * content, and an indented code block cannot interrupt a paragraph. Lazy
  * continuations are real content. The returned flag marks an unterminated
  * fence so parseSpec can fail closed.
  */
 function withoutFences(markdown: string): Readonly<{ text: string; unterminated: boolean }> {
   let marker: Readonly<{ char: string; length: number }> | null = null;
+  let activeListContentIndent: number | null = null;
   let previousBlank = true;
   const out: string[] = [];
   for (const rawLine of markdown.replace(/\r\n?/gu, "\n").split("\n")) {
-    // CommonMark expands each tab to the next 4-column tab stop: a
-    // tab-indented line after a blank line is indented code, never spec text,
-    // and a tab-indented fence marker at 4+ columns is code furniture, not a
-    // fence boundary. Tabs inside content are untouched.
+    // CommonMark expands each tab to the next 4-column tab stop: at top level,
+    // a tab-indented line after a blank is code rather than spec text. An open
+    // list may own that indentation, while a tab-indented fence marker at 4+
+    // columns is never a fence boundary. Tabs inside content are untouched.
     const line = expandLeadingTabs(rawLine);
-    const fence = /^ {0,3}(`{3,}|~{3,})(.*)$/u.exec(line);
-    if (fence === null) {
-      if (marker !== null) {
-        out.push("");
-        previousBlank = true;
-        continue;
-      }
-      // An indented code block cannot interrupt a paragraph: a 4+-space
-      // indented line is furniture only after a blank line (or the start of
-      // the document); a lazy continuation is real content.
-      if (previousBlank && /^ {4,}/u.test(line)) {
-        out.push("");
-        previousBlank = true;
-        continue;
-      }
+    const indentation = leadingSpaces(line);
+    if (marker === null && activeListContentIndent !== null && indentation >= activeListContentIndent) {
+      // The outer list owns its complete body, including nested markers and
+      // fence-shaped text. Do not strip it or replace the parent's indentation
+      // with a nested list's: parseEntries owns content and nested-ID refusal.
       out.push(line);
       previousBlank = line.trim().length === 0;
+      continue;
+    }
+    const fence = /^ {0,3}(`{3,}|~{3,})(.*)$/u.exec(line);
+    if (fence === null) {
+      const classified = nonFenceLine(line, {
+        insideFence: marker !== null, contentIndent: activeListContentIndent, previousBlank,
+      });
+      out.push(classified.text);
+      ({ contentIndent: activeListContentIndent, previousBlank } = classified);
       continue;
     }
     const rawMarker = fence[1];
@@ -286,6 +323,7 @@ function withoutFences(markdown: string): Readonly<{ text: string; unterminated:
       continue;
     }
     if (marker === null) {
+      activeListContentIndent = null;
       marker = Object.freeze({ char: rawMarker[0], length: rawMarker.length });
     } else if (marker.char === rawMarker[0] && rawMarker.length >= marker.length && info.trim().length === 0) {
       marker = null;
@@ -347,6 +385,21 @@ function sectionLines(section: MarkdownSection | undefined): readonly SourceLine
   return sourceLines(section?.body ?? "", section?.startLine ?? 1);
 }
 
+function leadingSpaces(raw: string): number {
+  return /^ */u.exec(raw)?.[0].length ?? 0;
+}
+
+/** Any Markdown list marker; only `- ID: content` is a canonical Spec entry. */
+function startsMarkdownListItem(line: string): boolean {
+  return /^(?:[-+*]|\d+[.)])\s+/u.test(line);
+}
+
+/** Recognized block syntax that cannot be a lazy paragraph continuation. */
+function startsMarkdownBlock(line: string): boolean {
+  return /^(?:#{1,6}\s|>|\*\*Acceptance Scenarios:\*\*$)/u.test(line) ||
+    startsMarkdownListItem(line) || isThematicBreak(line);
+}
+
 /** Returns the family's entries, or `null` after recording why none exist. An
  * empty section is a parse failure, so the success shape cannot represent it. */
 function parseEntries<F extends SpecFamily>(
@@ -356,25 +409,82 @@ function parseEntries<F extends SpecFamily>(
 ): NonEmpty<SpecEntry<F>> | null {
   const { section, pattern } = ENTRY_GRAMMARS[family];
   const entries: SpecEntry<F>[] = [];
+  let current: { id: string; content: string[]; continuationIndent: number } | null = null;
+  let previousBlank = false;
+  const finishCurrent = (): void => {
+    if (current === null) return;
+    entries.push(specEntry<F>(current.id, current.content.join(" ")));
+    current = null;
+  };
   for (const { raw, documentLine } of lines) {
     const line = raw.trim();
-    if (!line.startsWith("-")) {
+    if (line === "") {
+      previousBlank = true;
+      continue;
+    }
+    const canonicalEntry = pattern.exec(line);
+    if (current !== null && leadingSpaces(raw) >= current.continuationIndent && STRUCTURAL_ID.test(raw)) {
+      // A nested structural ID is never continuation content. Reject it before
+      // the continuation branch can absorb it into the current Requirement.
+      finishCurrent();
+      errors.push(Object.freeze(canonicalEntry === null
+        ? { kind: "entry-not-bulleted" as const, section, line: documentLine }
+        : { kind: "entry-not-canonical" as const, section, line: documentLine }));
+      previousBlank = false;
+      continue;
+    }
+    if (current !== null && leadingSpaces(raw) >= current.continuationIndent) {
+      // Indentation owned by the current item remains Requirement content,
+      // including nested list clauses after a blank.
+      current.content.push(line);
+      previousBlank = false;
+      continue;
+    }
+    if (!line.startsWith("-") && !startsMarkdownListItem(line)) {
       // A recognizable structural ID without a "- " bullet would otherwise
       // be silently dropped; fail closed. The JSDoc above owns the full
       // accepted prefix set.
       if (STRUCTURAL_ID.test(raw)) {
+        finishCurrent();
         errors.push(Object.freeze({ kind: "entry-not-bulleted", section, line: documentLine }));
+      } else if (current !== null) {
+        const lazyContinuation = !previousBlank && !startsMarkdownBlock(line);
+        if (lazyContinuation) {
+          // A lazy paragraph may continue directly on the next physical line.
+          current.content.push(line);
+        } else {
+          finishCurrent();
+        }
       }
+      previousBlank = false;
       continue;
     }
-    if (isThematicBreak(line)) continue;
-    const matched = pattern.exec(line);
-    if (matched === null) {
+    if (!line.startsWith("-") && STRUCTURAL_ID.test(raw)) {
+      finishCurrent();
+      errors.push(Object.freeze({ kind: "entry-not-bulleted", section, line: documentLine }));
+      previousBlank = false;
+      continue;
+    }
+    if (isThematicBreak(line)) {
+      finishCurrent();
+      previousBlank = false;
+      continue;
+    }
+    finishCurrent();
+    if (canonicalEntry === null) {
       errors.push(Object.freeze({ kind: "entry-not-canonical", section, line: documentLine }));
+      previousBlank = false;
       continue;
     }
-    entries.push(specEntry<F>(matched[1], matched[2]));
+    const marker = /^\s*-\s+/u.exec(raw);
+    current = {
+      id: canonicalEntry[1],
+      content: [canonicalEntry[2]],
+      continuationIndent: marker?.[0].length ?? 2,
+    };
+    previousBlank = false;
   }
+  finishCurrent();
   if (entries.length === 0) {
     errors.push(Object.freeze({ kind: "section-has-no-entries", section }));
     return null;
@@ -386,6 +496,18 @@ function parseEntries<F extends SpecFamily>(
   return Object.freeze([head, ...tail]);
 }
 
+type AcceptanceBlockState = Readonly<{ kind: "before" }>
+  | Readonly<{ kind: "inside"; headerLine: number; contentIndent: number | null }>
+  | Readonly<{ kind: "after" }>;
+
+function closeAcceptanceBlock(state: AcceptanceBlockState, errors: SpecParseError[]): AcceptanceBlockState {
+  if (state.kind !== "inside") return state;
+  if (state.contentIndent === null) {
+    errors.push(Object.freeze({ kind: "acceptance-block-has-no-bullets", headerLine: state.headerLine }));
+  }
+  return Object.freeze({ kind: "after" });
+}
+
 /**
  * Collects the scenario bullet lines of the User Scenarios section and fails
  * closed on every stray structural ID, in or out of an acceptance block.
@@ -395,43 +517,51 @@ function parseEntries<F extends SpecFamily>(
  */
 function acceptanceScenarioLines(lines: readonly SourceLine[], errors: SpecParseError[]): readonly SourceLine[] {
   const scenarios: SourceLine[] = [];
-  const closeBlock = (headerLine: number): void => {
-    errors.push(Object.freeze({ kind: "acceptance-block-has-no-bullets", headerLine }));
-  };
-  let state: Readonly<{ kind: "before" }>
-    | Readonly<{ kind: "inside"; headerLine: number; sawBullet: boolean }>
-    | Readonly<{ kind: "after" }> = Object.freeze({ kind: "before" });
+  let state: AcceptanceBlockState = Object.freeze({ kind: "before" });
   const isCollectedBullet = (raw: string): boolean => state.kind === "inside" && raw.trim().startsWith("-");
   const strayId = (documentLine: number): SpecParseError =>
     Object.freeze({ kind: "scenario-not-bulleted", line: documentLine, insideBlock: state.kind === "inside" });
   for (const { raw, documentLine } of lines) {
     const line = raw.trim();
+    if (state.kind === "inside" && state.contentIndent !== null && leadingSpaces(raw) >= state.contentIndent) {
+      // Owned headings, breaks and IDs must reach the same entry grammar as
+      // FR/OOS, not terminate or disappear in the acceptance-block collector.
+      scenarios.push(Object.freeze({ raw, documentLine }));
+      continue;
+    }
     if (ACCEPTANCE_HEADER.test(line)) {
-      if (state.kind === "inside" && !state.sawBullet) closeBlock(state.headerLine);
-      state = Object.freeze({ kind: "inside", headerLine: documentLine, sawBullet: false });
+      closeAcceptanceBlock(state, errors);
+      state = Object.freeze({ kind: "inside", headerLine: documentLine, contentIndent: null });
       continue;
     }
     const subHeading = /^###\s+/u.test(line);
     if (subHeading || isThematicBreak(line)) {
-      // A ###-prefixed structural ID is not a real heading (sections() splits
-      // only on ##, so the line never truncates the section body) — without
-      // this check it would be silently dropped here. Fail closed, never
-      // vanish; the terminator behavior is preserved either way.
+      // A ###-prefixed structural ID is a Markdown heading, but not a `##`
+      // section boundary recognized by sections(); without this check it
+      // would be silently dropped here. Fail closed, never vanish; the
+      // terminator behavior is preserved either way.
       if (subHeading && STRUCTURAL_ID.test(raw)) errors.push(strayId(documentLine));
-      if (state.kind === "inside") {
-        if (!state.sawBullet) closeBlock(state.headerLine);
-        state = Object.freeze({ kind: "after" });
-      }
+      state = closeAcceptanceBlock(state, errors);
       continue;
     }
     // A recognizable structural ID that is not a collected bullet — in or out
     // of an acceptance block — must fail closed, never vanish.
-    if (STRUCTURAL_ID.test(raw) && !isCollectedBullet(raw)) errors.push(strayId(documentLine));
-    if (state.kind !== "inside" || !line.startsWith("-")) continue;
-    scenarios.push(Object.freeze({ raw, documentLine }));
-    state = Object.freeze({ kind: "inside", headerLine: state.headerLine, sawBullet: true });
+    const strayStructuralId = STRUCTURAL_ID.test(raw) && !isCollectedBullet(raw);
+    if (strayStructuralId) errors.push(strayId(documentLine));
+    if (state.kind !== "inside") continue;
+    if (line.startsWith("-") && leadingSpaces(raw) < 4) {
+      scenarios.push(Object.freeze({ raw, documentLine }));
+      state = Object.freeze({
+        kind: "inside", headerLine: state.headerLine,
+        contentIndent: /^\s*-\s+/u.exec(raw)?.[0].length ?? 2,
+      });
+    } else if (state.contentIndent !== null && !strayStructuralId) {
+      // Preserve blanks as grammar input. parseEntries needs that state to
+      // distinguish a direct lazy continuation from a new unindented block.
+      scenarios.push(Object.freeze({ raw, documentLine }));
+    }
   }
-  if (state.kind === "inside" && !state.sawBullet) closeBlock(state.headerLine);
+  state = closeAcceptanceBlock(state, errors);
   if (state.kind === "before") errors.push(Object.freeze({ kind: "no-acceptance-block" }));
   return Object.freeze(scenarios);
 }
@@ -457,8 +587,8 @@ function parseGlossary(lines: readonly SourceLine[], errors: SpecParseError[]): 
       errors.push(Object.freeze({ kind: "glossary-column-count", line: documentLine }));
       continue;
     }
-    // Silently skip only the separator row (GFM accepts 1+ hyphens per cell)
-    // and the case-insensitive header shape; any reserved-term data row is
+    // Silently skip only Loom's 1+-hyphen separator row and the
+    // case-insensitive header shape; any reserved-term data row is
     // both dropped from entries and flagged as an error, never silently
     // dropped.
     if (cells.every((cell) => /^:?-{1,}:?$/u.test(cell))) continue;
