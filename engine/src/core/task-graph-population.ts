@@ -8,6 +8,7 @@ import {
 import type { FrozenVerificationManifest } from "./verification-manifest";
 import {
   recordedAnchorHashes,
+  specIndexObservationOf,
   specIndexPath,
   type SpecIndexAvailability,
 } from "./requirement-coverage";
@@ -192,6 +193,7 @@ export function populateTaskGraph(
     wave_reopening_history: _staleWaveReopeningHistory,
     orphaned_wave_gate_history: _staleOrphanedWaveGateHistory,
     spec_trace_wave_gate_retirements: _staleSpecTraceRetirements,
+    spec_index_observation: _staleSpecIndexObservation,
     ...existingWithoutWaveAuthority
   } = existing;
   const state: TaskGraph = Object.freeze({
@@ -200,6 +202,7 @@ export function populateTaskGraph(
     plan_title: command.planTitle,
     plan_file: command.validatedPlanFile,
     spec_file: lockedSpecFile,
+    spec_index_observation: specIndexObservationOf(command.specIndex),
     tasks: Object.freeze(command.tasks.map((task) => sanitizeTask(task, command.specIndex))),
     current_wave: 1,
     executing_tasks: Object.freeze([]),

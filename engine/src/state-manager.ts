@@ -71,7 +71,12 @@ import {
   parseTaskTestResult,
 } from "./core/proof-obligations";
 import { parseDeclaredArtifactBaseline } from "./core/artifact-baseline";
-import { parseSettledFloor } from "./core/requirement-coverage";
+import {
+  parseSettledFloor,
+  parseSpecIndexObservation,
+  specIndexObservationPath,
+  type SpecIndexObservation,
+} from "./core/requirement-coverage";
 import { parseStoredSpecCheck } from "./core/spec-check";
 import { reconcileWaveBlock, waveHasBlockCause, type WaveGate } from "./core/wave-gate-model";
 import { waveGateAuthorityDigest } from "./core/wave-review-authority";
@@ -510,13 +515,7 @@ function parseWaveSpecCheckSlotAuthority(
   return parseOk(Object.freeze({ slot_id: slotId.value, attempted: record.attempted }));
 }
 
-/** Parse the exact request-batch authority persisted beside an active Wave Gate. */
-function parseWaveNumber(value: unknown, label: string): { ok: true; value: number } | { ok: false; error: string } {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1
-    ? { ok: true, value }
-    : { ok: false, error: `${label} must be an integer >= 1 within the safe-integer range` };
-}
-
+/** Parse one inclusive safe-integer lower bound with its caller-owned diagnostic. */
 function parseIntegerBound(
   value: unknown,
   label: string,
@@ -543,7 +542,12 @@ function parseWaveReviewEpoch(raw: unknown): ParseResult<WaveReviewEpochAuthorit
   if (fieldsError !== null) return parseErr(fieldsError);
   const runId = parseOrchestrationRunId(record.runId);
   if (!runId.ok) return parseErr(`wave_review_epoch.runId: ${runId.error.message}`);
-  const wave = parseWaveNumber(record.wave, "wave_review_epoch.wave");
+  const wave = parseIntegerBound(
+    record.wave,
+    "wave_review_epoch.wave",
+    1,
+    "an integer >= 1 within the safe-integer range",
+  );
   if (!wave.ok) return parseErr(wave.error);
   const batchEpoch = parseArtifactDigest(record.batchEpoch);
   if (!batchEpoch.ok) return parseErr(`wave_review_epoch.batchEpoch: ${batchEpoch.error.message}`);
@@ -627,7 +631,12 @@ export function parseActiveWaveGateRegistration(raw: unknown): ParseResult<Activ
   if (!runId.ok) return parseErr(`active_wave_gate.runId: ${runId.error.message}`);
   const authorityDigest = parseArtifactDigest(record.authorityDigest);
   if (!authorityDigest.ok) return parseErr(`active_wave_gate.authorityDigest: ${authorityDigest.error.message}`);
-  const wave = parseWaveNumber(record.wave, "active_wave_gate.wave");
+  const wave = parseIntegerBound(
+    record.wave,
+    "active_wave_gate.wave",
+    1,
+    "an integer >= 1 within the safe-integer range",
+  );
   if (!wave.ok) return parseErr(wave.error);
   const revision = parseIntegerBound(record.revision, "active_wave_gate.revision", 0, "a non-negative safe integer");
   if (!revision.ok) return parseErr(revision.error);
@@ -702,7 +711,12 @@ function parseCompletedWaveGateCommon(record: Record<string, unknown>): ParseRes
   const authorityDigest = parseArtifactDigest(record.authorityDigest);
   if (!runId.ok) return parseErr(`wave_gate_history.runId: ${runId.error.message}`);
   if (!authorityDigest.ok) return parseErr(`wave_gate_history.authorityDigest: ${authorityDigest.error.message}`);
-  const wave = parseWaveNumber(record.wave, "wave_gate_history.wave");
+  const wave = parseIntegerBound(
+    record.wave,
+    "wave_gate_history.wave",
+    1,
+    "an integer >= 1 within the safe-integer range",
+  );
   if (!wave.ok) return parseErr(wave.error);
   const revision = parseIntegerBound(record.revision, "wave_gate_history.revision", 1, "a positive safe integer");
   if (!revision.ok) return parseErr(revision.error);
@@ -797,7 +811,12 @@ function parseOrphanedWaveGateRetirement(raw: unknown): ParseResult<OrphanedWave
   if (!replacementAuthorityDigest.ok) {
     return parseErr(`orphaned_wave_gate_history.replacementAuthorityDigest: ${replacementAuthorityDigest.error.message}`);
   }
-  const wave = parseWaveNumber(record.wave, "orphaned_wave_gate_history.wave");
+  const wave = parseIntegerBound(
+    record.wave,
+    "orphaned_wave_gate_history.wave",
+    1,
+    "an integer >= 1 within the safe-integer range",
+  );
   if (!wave.ok) return parseErr(wave.error);
   const revision = parseIntegerBound(record.revision, "orphaned_wave_gate_history.revision", 0, "a non-negative safe integer");
   if (!revision.ok) return parseErr(revision.error);
@@ -885,7 +904,12 @@ function parseSpecTraceWaveGateRetirement(raw: unknown): ParseResult<SpecTraceWa
   if (!authorityDigest.ok) {
     return parseErr(`spec_trace_wave_gate_retirements.authorityDigest: ${authorityDigest.error.message}`);
   }
-  const wave = parseWaveNumber(record.wave, "spec_trace_wave_gate_retirements.wave");
+  const wave = parseIntegerBound(
+    record.wave,
+    "spec_trace_wave_gate_retirements.wave",
+    1,
+    "an integer >= 1 within the safe-integer range",
+  );
   if (!wave.ok) return parseErr(wave.error);
   const revision = parseIntegerBound(record.revision, "spec_trace_wave_gate_retirements.revision", 0, "a non-negative safe integer");
   if (!revision.ok) return parseErr(revision.error);
@@ -2239,6 +2263,7 @@ type ParsedTaskGraphParts = Readonly<{
   executingTasks: readonly TaskId[] | undefined;
   waveGates: Readonly<Record<string, unknown>>;
   specCheck: SpecCheck | undefined;
+  specIndexObservation: SpecIndexObservation | undefined;
   authority: ParsedTaskGraphAuthorityFields;
   history: ParsedTaskGraphHistoryFields;
 }>;
@@ -2278,6 +2303,9 @@ function taskGraphFromParsedParts(obj: Record<string, unknown>, parts: ParsedTas
       : { executing_tasks: parts.executingTasks }),
     wave_gates: frozenWaveGates,
     ...(parts.specCheck === undefined ? {} : { spec_check: parts.specCheck }),
+    ...(parts.specIndexObservation === undefined
+      ? {}
+      : { spec_index_observation: parts.specIndexObservation }),
     ...(waveReviewEpoch === undefined ? {} : { wave_review_epoch: waveReviewEpoch }),
     ...(verificationManifest === undefined ? {} : { verification_manifest: verificationManifest }),
     ...(activeWaveCompletionSuite === undefined ? {} : { active_wave_completion_suite: activeWaveCompletionSuite }),
@@ -2287,6 +2315,26 @@ function taskGraphFromParsedParts(obj: Record<string, unknown>, parts: ParsedTas
     ...(orphanedHistory === undefined ? {} : { orphaned_wave_gate_history: orphanedHistory }),
     ...(specTraceRetirements === undefined ? {} : { spec_trace_wave_gate_retirements: specTraceRetirements }),
   } as unknown as ParsedTaskGraph;
+}
+
+function parseTaskGraphDocumentFields(
+  obj: Record<string, unknown>,
+): ParseResult<Pick<ParsedTaskGraphParts, "phaseArtifacts" | "skippedPhases" | "specIndexObservation">> {
+  const lifecycleErrors = taskGraphLifecycleErrors(obj);
+  if (lifecycleErrors[0] !== undefined) return parseErr(lifecycleErrors[0]);
+  const phaseArtifacts = Object.freeze({ ...(obj.phase_artifacts as Record<string, string>) });
+  const skippedPhases = Object.freeze([...(Array.isArray(obj.skipped_phases) ? obj.skipped_phases : [])] as Phase[]);
+  const scalarError = taskGraphScalarFieldError(obj);
+  if (scalarError !== null) return parseErr(scalarError);
+  const specIndexObservation = obj.spec_index_observation === undefined
+    ? parseOk<SpecIndexObservation | undefined>(undefined)
+    : parseSpecIndexObservation(obj.spec_index_observation);
+  if (!specIndexObservation.ok) return parseErr(specIndexObservation.error);
+  if (specIndexObservation.value !== undefined &&
+      specIndexObservationPath(specIndexObservation.value) !== (obj.spec_file ?? null)) {
+    return parseErr("spec_index_observation path must match protected spec_file authority");
+  }
+  return parseOk({ phaseArtifacts, skippedPhases, specIndexObservation: specIndexObservation.value });
 }
 
 /**
@@ -2304,12 +2352,8 @@ export function parseTaskGraph(raw: unknown): ParseResult<ParsedTaskGraph> {
     return parseErr("not an object");
   }
   const obj = raw as Record<string, unknown>;
-  const lifecycleErrors = taskGraphLifecycleErrors(obj);
-  if (lifecycleErrors[0] !== undefined) return parseErr(lifecycleErrors[0]);
-  const phaseArtifacts = Object.freeze({ ...(obj.phase_artifacts as Record<string, string>) });
-  const skippedPhases = Object.freeze([...(Array.isArray(obj.skipped_phases) ? obj.skipped_phases : [])] as Phase[]);
-  const scalarError = taskGraphScalarFieldError(obj);
-  if (scalarError !== null) return parseErr(scalarError);
+  const documents = parseTaskGraphDocumentFields(obj);
+  if (!documents.ok) return parseErr(documents.error);
   const executingTasks = parseExecutingTaskIds(obj.executing_tasks);
   if (!executingTasks.ok) return parseErr(executingTasks.error);
   const tasks = parseTaskGraphTasks(obj, executingTasks.value ?? []);
@@ -2345,8 +2389,7 @@ export function parseTaskGraph(raw: unknown): ParseResult<ParsedTaskGraph> {
   if (!history.ok) return parseErr(history.error);
 
   return parseOk(taskGraphFromParsedParts(obj, {
-    phaseArtifacts,
-    skippedPhases,
+    ...documents.value,
     tasks: tasks.value,
     executingTasks: executingTasks.value,
     waveGates: migratedWaveGates,
@@ -2438,7 +2481,12 @@ function parseLegacyWaveGateMigrationAuthority(raw: unknown): ParseResult<Parsed
   const digest = parseArtifactDigest(record.authorityDigest);
   if (!runId.ok) return parseErr(runId.error.message);
   if (!digest.ok) return parseErr(digest.error.message);
-  const wave = parseWaveNumber(record.wave, "Legacy Wave Gate migration wave");
+  const wave = parseIntegerBound(
+    record.wave,
+    "Legacy Wave Gate migration wave",
+    1,
+    "an integer >= 1 within the safe-integer range",
+  );
   if (!wave.ok) return parseErr(wave.error);
   const registration: ActiveWaveGateRegistration = Object.freeze({
     schemaVersion: 1,

@@ -474,6 +474,29 @@ describe("wave review context authority", () => {
     });
   });
 
+  it("rejects matching unsafe Task Run and Task review generations", () => {
+    const packetId = "c".repeat(64);
+    const unsafeGeneration = Number.MAX_SAFE_INTEGER + 1;
+    const packet = packetFor({
+      runId: RUN_ID,
+      wave: 1,
+      authorityDigest: DIGEST,
+      batchEpoch: "b".repeat(64),
+      subject: { role: "code-reviewer", taskId: "T1" },
+      taskRun: { taskId: "T1", generation: unsafeGeneration, packetId, headSha: "d".repeat(64) },
+      task: taskAuthority({ reviewGeneration: unsafeGeneration }),
+      specCheckScope: null,
+      packetId,
+      specFile: null,
+      planFile: null,
+    });
+
+    expect(handleWaveReviewContext([packet], packet.digest)).toMatchObject({
+      kind: "corrupt",
+      message: expect.stringContaining("taskRun fields are invalid"),
+    });
+  });
+
   it("accepts and preserves valid non-null proof and test evidence", () => {
     const packetId = "c".repeat(64);
     const proof = derivePendingTaskProof({ newTestsRequired: false, declaredArtifacts: [] });

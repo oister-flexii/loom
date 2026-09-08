@@ -932,6 +932,37 @@ describe("applyReviewPiResult", () => {
     });
   });
 
+  it("returns review application data from the locked updateAndReturn transition", async () => {
+    let current = parsedGraph(graph());
+    let updateAndReturnCalls = 0;
+    const store: TaskGraphStore = {
+      load: () => current,
+      update: async () => { throw new Error("legacy update must not be used"); },
+      updateAndReturn: async (mutate) => {
+        updateAndReturnCalls += 1;
+        const applied = mutate(current);
+        current = parsedGraph(applied.state);
+        return applied.value;
+      },
+    };
+
+    const applied = await applyReviewPiResult({
+      store,
+      agentType: "code-reviewer",
+      result: result({ messages: assistantText(machineSummary) }),
+      reservedSlot: { agentType: "code-reviewer", taskId: "T1" },
+      parentPrompt: "",
+    });
+
+    expect(updateAndReturnCalls).toBe(1);
+    expect(applied.processingErrors).toEqual([]);
+    expect(applied.log).toEqual([expect.stringContaining("Task T1 review: blocked")]);
+    expect(current.tasks[0]).toMatchObject({
+      review_status: "blocked",
+      critical_findings: ["a real blocker"],
+    });
+  });
+
   it("rejects reordered same-agent reserved reviews instead of applying findings to the wrong Tasks", async () => {
     const base = graph();
     const store = fakeStore(graph({

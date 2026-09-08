@@ -211,9 +211,10 @@ export function removeOnce(claims: readonly string[], toRemove: readonly string[
   return remaining;
 }
 
-/** Id-safe form of an agent name: the id is parsed back apart nowhere, but it
- *  is substituted into prompts and used as a JSON key-like token, so anything
- *  outside `[A-Za-z0-9_-]` is collapsed. */
+/** Id-safe form of an agent name. Normalization makes the trailing ordinal
+ *  suffix deterministic for `ordinalOf` and keeps the resulting Finding id safe
+ *  when substituted into prompts, JSON key-like tokens, and composite
+ *  `task-id:finding-id` panel identities. */
 function idSafeAgent(agent: string): string {
   const safe = agent.trim().replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
   return safe === "" ? "agent" : safe;
@@ -318,10 +319,10 @@ export function attributeFindings(
  * [{ "severity": "critical", "file": "src/x.ts", "line": 42, "claim": "..." }]
  * ```
  *
- * Optional by design. The `CRITICAL_COUNT` / `ADVISORY_COUNT` and
- * `CRITICAL:` / `ADVISORY:` lines remain the contract every reviewer must
- * satisfy; this block only ADDS
- * location and per-claim structure when the reviewer can produce it.
+ * Optional by design. `CRITICAL_COUNT` / `ADVISORY_COUNT` remain the reviewer's
+ * authoritative tallies. Marker claims and this preferred structured evidence
+ * are reconciled as a union: the block contributes file/line structure and may
+ * preserve block-only claims, while marker-only claims remain visible too.
  * Verification quality degrades without file/line — it does not break.
  */
 const FINDINGS_BLOCK = /^[ \t]*```[ \t]*findings[ \t]*\r?\n([\s\S]*?)^[ \t]*```[ \t]*$/gm;
@@ -707,46 +708,48 @@ export function findingsLockstepError(
   return null;
 }
 
-/** Load-boundary check for `Task.refuted_findings`. */
-export function refutationsUnionError(raw: unknown, label: string): string | null {
+function retiredFindingsUnionError<T extends Readonly<{ finding: Finding }>>(
+  raw: unknown,
+  label: string,
+  parse: (entry: unknown) => T | null,
+  recordKind: "refutation" | "resolution",
+  findingKind: "refuted" | "resolved",
+): string | null {
   if (raw === undefined) return null;
   if (!Array.isArray(raw)) return `${label} must be an array when present`;
-  const parsed = raw.map(parseStoredRefutation);
+  const parsed = raw.map(parse);
   const index = parsed.findIndex((entry) => entry === null);
-  if (index >= 0) {
-    return `${label}[${index}] is not a well-formed refutation record (${REPAIR_HINT})`;
-  }
-  // Within `refuted_findings`, for the reason `findingsUnionError` proves it
-  // within `findings`: two records under one id attach two different verdicts
-  // to the same claim, and the audit trail can no longer say which was applied.
+  if (index >= 0) return `${label}[${index}] is not a well-formed ${recordKind} record (${REPAIR_HINT})`;
   const ids = parsed.flatMap((entry) => entry === null ? [] : [entry.finding.id]);
   const duplicate = ids.findIndex((id, at) => ids.indexOf(id) !== at);
   return duplicate < 0
     ? null
-    : `${label}[${duplicate}] repeats refuted finding id '${ids[duplicate]}' (${REPAIR_HINT})`;
+    : `${label}[${duplicate}] repeats ${findingKind} finding id '${ids[duplicate]}' (${REPAIR_HINT})`;
+}
+
+/** Load-boundary check for `Task.refuted_findings`. */
+export function refutationsUnionError(raw: unknown, label: string): string | null {
+  // Two records under one id attach different verdicts to the same claim, so
+  // the audit trail can no longer say which verdict was applied.
+  return retiredFindingsUnionError(raw, label, parseStoredRefutation, "refutation", "refuted");
 }
 
 /** Load-boundary check for findings retired because a later implementation fixed them. */
 export function resolutionsUnionError(raw: unknown, label: string): string | null {
-  if (raw === undefined) return null;
-  if (!Array.isArray(raw)) return `${label} must be an array when present`;
-  const parsed = raw.map(parseStoredResolution);
-  const index = parsed.findIndex((entry) => entry === null);
-  if (index >= 0) return `${label}[${index}] is not a well-formed resolution record (${REPAIR_HINT})`;
-  const ids = parsed.flatMap((entry) => entry === null ? [] : [entry.finding.id]);
-  const duplicate = ids.findIndex((id, at) => ids.indexOf(id) !== at);
-  return duplicate < 0
-    ? null
-    : `${label}[${duplicate}] repeats resolved finding id '${ids[duplicate]}' (${REPAIR_HINT})`;
+  return retiredFindingsUnionError(raw, label, parseStoredResolution, "resolution", "resolved");
 }
 
 function parseStoredDraft(raw: unknown): DraftFinding | null {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
   const record = raw as Record<string, unknown>;
   const severity = parseFindingSeverity(record.severity);
-  return severity === null || typeof record.claim !== "string"
-    ? null
-    : makeDraftFinding({ severity, claim: record.claim, file: record.file, line: record.line });
+  if (severity === null || typeof record.claim !== "string") return null;
+  const draft = makeDraftFinding({ severity, claim: record.claim, file: record.file, line: record.line });
+  if (draft !== null && (
+    ("file" in record && record.file !== draft.file) ||
+    ("line" in record && record.line !== draft.line)
+  )) return null;
+  return draft;
 }
 
 /** Prove the packet-bound in-progress review run before the Task cast. */

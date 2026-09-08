@@ -176,6 +176,62 @@ describe("parseSpec", () => {
     }
   });
 
+  it.each([
+    ["adjacent", "\n"],
+    ["blank-separated", "\n\n"],
+  ] as const)("keeps %s ordinary nested clauses at the exact two-space continuation boundary", (_label, gap) => {
+    const nested = validSpec
+      .replace(
+        "- FR-001: System MUST parse canonical requirement IDs",
+        `- FR-001: System MUST parse canonical requirement IDs${gap}  - ordinary requirement detail`,
+      )
+      .replace(
+        "- AS-001: Given a canonical spec, When it is parsed, Then structural entries are returned",
+        `- AS-001: Given a canonical spec, When it is parsed, Then structural entries are returned${gap}  - ordinary outcome detail`,
+      )
+      .replace(
+        "- OOS-001: Symbol-level source indexing",
+        `- OOS-001: Symbol-level source indexing${gap}  1. ordinary exclusion detail`,
+      );
+    const parsed = parseSpec(nested);
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.frs[0].content).toContain("- ordinary requirement detail");
+    expect(parsed.value.scenarios[0].content).toContain("- ordinary outcome detail");
+    expect(parsed.value.oos[0].content).toContain("1. ordinary exclusion detail");
+  });
+
+  it.each([
+    ["FR", "- FR-001: System MUST parse canonical requirement IDs", "FR-009", "Functional Requirements"],
+    ["AS", "- AS-001: Given a canonical spec, When it is parsed, Then structural entries are returned", "AS-009", "Acceptance Scenarios"],
+    ["OOS", "- OOS-001: Symbol-level source indexing", "OOS-009", "Out of Scope"],
+  ].flatMap(([family, original, nestedId, section]) =>
+    ([2, 4] as const).flatMap((indentation) =>
+      (["adjacent", "blank-separated"] as const).map((separation) =>
+        [family, indentation, separation, original, nestedId, section] as const,
+      ),
+    ),
+  ))(
+    "rejects %s structural IDs nested at %i spaces when %s",
+    (family, indentation, separation, original, nestedId, section) => {
+      const gap = separation === "adjacent" ? "\n" : "\n\n";
+      const parsed = parseSpec(validSpec.replace(
+        original,
+        `${original}${gap}${" ".repeat(indentation)}- ${nestedId}: must not become continuation content`,
+      ));
+
+      expect(parsed.ok, `${family} nested ID must fail closed`).toBe(false);
+      if (!parsed.ok) {
+        expect(parsed.errors).toContainEqual({
+          kind: "entry-not-canonical",
+          section,
+          line: expect.any(Number),
+        });
+      }
+    },
+  );
+
   it.each(["* adjacent item", "+ adjacent item", "1. adjacent item"])(
     "rejects adjacent noncanonical list item %s instead of absorbing it as lazy Requirement text",
     (item) => {
@@ -771,18 +827,21 @@ describe("parseSpec", () => {
     }
   });
 
-  it("collects a lazy-continuation bullet indented four spaces after a non-blank line", () => {
+  it("rejects a structural-ID bullet at four-space lazy-continuation indentation", () => {
     const lazy = validSpec.replace(
       "- FR-002: System MUST hash requirement content deterministically",
       "    - FR-002: System MUST hash requirement content deterministically",
     );
     const parsed = parseSpec(lazy);
-    // CommonMark: an indented code block cannot interrupt a paragraph — a
-    // 4+-space-indented line directly after a non-blank line is a lazy
-    // continuation, i.e. real content. Blanking it as furniture drops FR-002
-    // with ok:true.
-    expect(parsed).toMatchObject({ ok: true });
-    if (parsed.ok) expect(parsed.value.frs.map(({ id }) => id)).toEqual(["FR-001", "FR-002"]);
+    // CommonMark keeps this as list-owned content, so it must reach the entry
+    // grammar and fail closed as a nested structural ID rather than vanish.
+    expect(parsed).toMatchObject({ ok: false });
+    if (!parsed.ok) {
+      expect(parsed.errors).toContainEqual(expect.objectContaining({
+        kind: "entry-not-canonical",
+        section: "Functional Requirements",
+      }));
+    }
   });
 
   it("fails closed for an empty Acceptance Scenarios block terminated by a following header", () => {
@@ -822,28 +881,24 @@ describe("parseSpec", () => {
     if (parsed.ok) expect(parsed.value.frs.map(({ id }) => id)).toEqual(["FR-001", "FR-002"]);
   });
 
-  it("treats a tab-indented structural bullet after a blank line as indented code furniture", () => {
-    const furniture = validSpec.replace(
+  it("rejects a tab-indented structural bullet owned by an open Requirement", () => {
+    const nested = validSpec.replace(
       "- FR-002: System MUST hash requirement content deterministically",
       "\n\t- FR-002: System MUST hash requirement content deterministically",
     );
-    const parsed = parseSpec(furniture);
-    // CommonMark expands each tab to the next 4-column tab stop: a
-    // tab-indented line after a blank line is an indented code block — literal
-    // code, never spec text. Minting FR-002 returns ok:true with a phantom
-    // entry; the 4-space twin is pinned inert above.
-    expect(parsed).toMatchObject({ ok: true });
-    if (parsed.ok) expect(parsed.value.frs.map(({ id }) => id)).toEqual(["FR-001"]);
+    const parsed = parseSpec(nested);
+    // The tab expands to four columns, but the open FR-001 item owns that
+    // indentation. The line survives fence stripping and fails as nested ID.
+    expect(parsed).toMatchObject({ ok: false });
   });
 
-  it("treats a tab-indented scenario bullet after a blank line as indented code furniture", () => {
-    const furniture = validSpec.replace(
+  it("rejects a tab-indented scenario bullet owned by an open scenario", () => {
+    const nested = validSpec.replace(
       "- AS-002: Given duplicate IDs, When it is parsed, Then parsing fails closed",
       "\n\t- AS-002: Given duplicate IDs, When it is parsed, Then parsing fails closed",
     );
-    const parsed = parseSpec(furniture);
-    expect(parsed).toMatchObject({ ok: true });
-    if (parsed.ok) expect(parsed.value.scenarios.map(({ id }) => id)).toEqual(["AS-001"]);
+    const parsed = parseSpec(nested);
+    expect(parsed).toMatchObject({ ok: false });
   });
 
   it("treats a tab-indented glossary row after a blank line as indented code furniture", () => {
@@ -871,16 +926,14 @@ describe("parseSpec", () => {
     if (parsed.ok) expect(parsed.value.frs.map(({ id }) => id)).toEqual(["FR-001", "FR-002"]);
   });
 
-  it("treats a mixed space-plus-tab leading-indentation twin as indented code furniture", () => {
-    const furniture = validSpec.replace(
+  it("rejects a mixed space-plus-tab structural bullet owned by an open Requirement", () => {
+    const nested = validSpec.replace(
       "- FR-002: System MUST hash requirement content deterministically",
       "\n \t- FR-002: System MUST hash requirement content deterministically",
     );
-    const parsed = parseSpec(furniture);
-    // Two spaces then a tab expands to column 4 — the mixed twin of the pure
-    // leading-tab twin pinned above; blanking it is the 4-space behavior.
-    expect(parsed).toMatchObject({ ok: true });
-    if (parsed.ok) expect(parsed.value.frs.map(({ id }) => id)).toEqual(["FR-001"]);
+    const parsed = parseSpec(nested);
+    // A space then a tab expands to column 4, still owned by FR-001.
+    expect(parsed).toMatchObject({ ok: false });
   });
 
   it("canonicalizes formatting whitespace but changes the hash when content changes", () => {
@@ -1065,6 +1118,119 @@ describe("parseSpec", () => {
       expect(messagesOf(parsed.errors)).toContain("unterminated code fence");
     }
   });
+});
+
+const ownedGrammarMatrix = ([
+  { family: "FR", collection: "frs", section: "Functional Requirements" },
+  { family: "AS", collection: "scenarios", section: "Acceptance Scenarios" },
+  { family: "OOS", collection: "oos", section: "Out of Scope" },
+] as const).flatMap((family) => ([
+  { indentation: "two spaces", indent: "  " },
+  { indentation: "four spaces", indent: "    " },
+  { indentation: "tab", indent: "\t" },
+  { indentation: "mixed", indent: " \t" },
+] as const).flatMap((indentation) => ([
+  { separation: "adjacent", gap: "\n" },
+  { separation: "blank-separated", gap: "\n\n" },
+] as const).map((separation) => ({ ...family, ...indentation, ...separation }))));
+
+/** The entire finite ownership matrix crosses the public parser, not its lexer. */
+describe.each(ownedGrammarMatrix)(
+  "owned grammar: $family / $indentation / $separation",
+  ({ family, collection, section, indent, gap }) => {
+    const appendBody = (body: string): string => validSpec.replace(
+      new RegExp(`(- ${family}-001:[^\\n]*)`, "u"),
+      `$1${gap}${body}`,
+    );
+    const baseline = parseSpec(validSpec);
+    if (!baseline.ok) throw new Error("canonical matrix fixture must parse");
+
+    it.each([
+      "ordinary detail",
+      "- ordinary nested clause",
+      "+ ordinary nested clause",
+      "1. ordinary nested clause",
+      "FR-009 and AS-009 are related",
+      "F R-009: deliberate prose",
+      "### Nested detail",
+      "---",
+      "**Acceptance Scenarios:**",
+      "```text\nliteral detail\n```",
+      "~~~text\nliteral detail\n~~~",
+    ])("preserves owned body and hash: %s", (body) => {
+      const rawBody = body.split("\n").map((line) => `${indent}${line}`).join("\n");
+      const parsed = parseSpec(appendBody(`${rawBody}${gap}${indent}tail clause`));
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) throw new Error(messagesOf(parsed.errors));
+      const expected = `${baseline.value[collection][0].content} ${body.replace(/\s+/gu, " ")} tail clause`;
+      expect(parsed.value[collection][0]).toEqual({
+        id: `${family}-001`, content: expected, contentHash: specContentHash(expected),
+      });
+      expect(parsed.value[collection].slice(1)).toEqual(baseline.value[collection].slice(1));
+    });
+
+    it.each((["FR", "AS", "OOS"] as const).flatMap((nestedFamily) =>
+      ["", "- ", "+ ", "1. ", "> > ", "### ", "- - "].map((prefix) =>
+        `${prefix}${nestedFamily}-009: unsupported nested ID`),
+    ))("refuses every owned colon-full ID: %s", (body) => {
+      const markdown = appendBody(`${indent}${body}`);
+      const parsed = parseSpec(markdown);
+      expect(parsed.ok).toBe(false);
+      if (parsed.ok) throw new Error("nested structural ID unexpectedly indexed");
+      expect(parsed.errors).toContainEqual({
+        kind: body.startsWith(`- ${family}-009:`) ? "entry-not-canonical" : "entry-not-bulleted",
+        section,
+        line: lineIn(markdown, `${indent}${body}`),
+      });
+    });
+
+    it.each(["```", "~~~"])("ignores genuine top-level %s examples without changing entries", (fence) => {
+      const markdown = appendBody(`${indent}owned clause${gap}` + [
+        `${fence}markdown`,
+        `${indent}- ${family}-009: literal example`,
+        "## Functional Requirements",
+        fence,
+      ].join("\n"));
+      const parsed = parseSpec(markdown);
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) throw new Error(messagesOf(parsed.errors));
+      const expected = `${baseline.value[collection][0].content} owned clause`;
+      expect(parsed.value[collection][0]).toEqual({
+        id: `${family}-001`, content: expected, contentHash: specContentHash(expected),
+      });
+      expect(parsed.value[collection].slice(1)).toEqual(baseline.value[collection].slice(1));
+    });
+
+    it.each(["```", "~~~"])("never hides nested IDs inside owned %s markers", (fence) => {
+      const nested = `${indent}- ${family}-009: unsupported nested ID`;
+      const markdown = appendBody(`${indent}${fence}${gap}${nested}${gap}${indent}${fence}`);
+      const parsed = parseSpec(markdown);
+      expect(parsed.ok).toBe(false);
+      if (parsed.ok) throw new Error("owned fence hid a structural ID");
+      expect(parsed.errors).toContainEqual({
+        kind: "entry-not-canonical", section, line: lineIn(markdown, nested),
+      });
+    });
+
+    it("retains parent ownership after a nested list dedents", () => {
+      const parsed = parseSpec(appendBody(`${indent}- nested clause\n\n  parent paragraph\n\n    final clause`));
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) throw new Error(messagesOf(parsed.errors));
+      const expected = `${baseline.value[collection][0].content} - nested clause parent paragraph final clause`;
+      expect(parsed.value[collection][0].content).toBe(expected);
+      expect(parsed.value[collection][0].contentHash).toBe(specContentHash(expected));
+    });
+  },
+);
+
+// Once a genuine top-level fence ends the list, a later indented example is
+// furniture, not a continuation of the earlier Requirement.
+it("ends list ownership at a genuine top-level fence", () => {
+  const markdown = validSpec.replace(
+    "- FR-001: System MUST parse canonical requirement IDs",
+    "- FR-001: System MUST parse canonical requirement IDs\n\n```text\nexample\n```\n\n    FR-009: indented code",
+  );
+  expect(parseSpec(markdown)).toEqual(parseSpec(validSpec));
 });
 
 describe("parseSpecContentHash", () => {

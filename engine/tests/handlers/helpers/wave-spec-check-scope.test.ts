@@ -34,6 +34,12 @@ import {
 import { buildContextPacket, encodeByteSection } from "../../../src/core/context-packets";
 import { capturedSpecCheck } from "../../../src/core/spec-check";
 
+const DIGEST = (fill: string): ArtifactDigest => {
+  const parsed = parseArtifactDigest(fill.repeat(64));
+  if (!parsed.ok) throw new Error(parsed.error.message);
+  return parsed.value;
+};
+
 const decodeRequestId = (raw: string) => {
   const parsed = parseRequestId(raw);
   if (!parsed.ok) throw new Error(parsed.error.message);
@@ -516,7 +522,11 @@ describe("Requirement Coverage Projection in the spec-check packet", () => {
 | Spec Index | A deterministic projection of specification entries |
 `;
 
-  const coverageSectionOf = (specFile: string | null, tasks: TaskGraph["tasks"]): string => {
+  const coverageSectionOf = (
+    specFile: string | null,
+    tasks: TaskGraph["tasks"],
+    graphOverrides: Partial<TaskGraph> = {},
+  ): string => {
     const runsRoot = mkdtempSync(join(tmpdir(), "loom-wave-coverage-"));
     cleanup.push(runsRoot);
     const created = createRunDirectory(runsRoot, "run.coverage");
@@ -531,6 +541,7 @@ describe("Requirement Coverage Projection in the spec-check packet", () => {
       plan_file: null,
       wave_gates: {},
       tasks,
+      ...graphOverrides,
     });
     if (!parsedGraph.ok) throw new Error("graph fixture must parse");
     const batch = waveRequests(created.value, {
@@ -626,6 +637,29 @@ describe("Requirement Coverage Projection in the spec-check packet", () => {
     expect(rendered).toContain("have been altered");
     expect(rendered).not.toContain("no hash was recorded");
     expect(rendered).toMatch(/CRITICAL: Task "T1" claim "FR-001" .*have been altered/u);
+  });
+
+  it("uses the durable population reason when the Wave Gate explains a missing Requirement hash", () => {
+    const specFile = specFileIn(spec);
+    const rendered = coverageSectionOf(specFile, [taskFixture({
+      id: "T1", description: "claims FR-001", agent: "code-implementer-agent", wave: 1,
+      status: "pending", depends_on: [], spec_anchors: ["FR-001", "FR-002", "AS-001"], spec_contributions: [],
+      file_list: ["src/a.ts"], files_modified: ["src/a.ts"],
+    })], {
+      spec_index_observation: {
+        kind: "unavailable",
+        reason: {
+          kind: "unparsed",
+          path: specFile,
+          contentDigest: DIGEST("d"),
+          errors: [{ kind: "missing-section", section: "Functional Requirements" }],
+        },
+      },
+    });
+
+    expect(rendered).toContain("drift is unverifiable because no hash was recorded");
+    expect(rendered).toContain("population Spec Index was unavailable");
+    expect(rendered).toContain("missing required section ## Functional Requirements");
   });
 
   it("reports drift when the specification changed after the hashes were recorded", () => {
@@ -826,11 +860,6 @@ describe("wave-review-authority spec-check scope decoding", () => {
 });
 
 describe("an installed epoch is replayed only when it is the same epoch", () => {
-  const DIGEST = (fill: string): ArtifactDigest => {
-    const parsed = parseArtifactDigest(fill.repeat(64));
-    if (!parsed.ok) throw new Error(parsed.error.message);
-    return parsed.value;
-  };
   const RUN_ID = ((): OrchestrationRunId => {
     const parsed = parseOrchestrationRunId("run.replay");
     if (!parsed.ok) throw new Error(parsed.error.message);

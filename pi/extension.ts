@@ -731,48 +731,75 @@ export interface PiCleanupAction {
 }
 
 export type PiStartupSweep = Readonly<{ name: string; run: () => void }>;
+export type PiStartupSweepSource = () => readonly PiStartupSweep[];
 export type PiStartupSweepPorts = Readonly<{
-  writeDiagnostic: (diagnostic: string) => void;
-  notifyWarning: (message: string) => void;
+  /** Return false only when the channel is unavailable and wrote nothing. */
+  writeDiagnostic: (diagnostic: string) => boolean;
+  /** Return false when this session has no UI. */
+  notifyWarning: (message: string) => boolean;
+  /** Process-level fallback, kept explicit so its failure is observable. */
+  writeStderr: (diagnostic: string) => boolean;
 }>;
 
-/** Run every startup hygiene sweep; neither sweep nor reporting-port failure suppresses a later sweep. */
+type UnreportedStartupSweepFailure = Readonly<{
+  error: Error;
+  message: string;
+  reportingFailures: readonly string[];
+}>;
+
+const startupError = (error: unknown): Error =>
+  error instanceof Error ? error : new Error(String(error));
+
+/** Run every startup hygiene sweep and reporting route before surfacing wholly unreported failures. */
 export function runPiStartupSweeps(
   sweeps: readonly PiStartupSweep[],
   ports: PiStartupSweepPorts,
 ): void {
+  const unreported: UnreportedStartupSweepFailure[] = [];
   for (const sweep of sweeps) {
     try {
       sweep.run();
     } catch (error) {
-      const cause = error instanceof Error ? error.message : String(error);
-      const message = `session_start sweep failed: ${sweep.name}: ${cause}; ` +
+      const sweepError = startupError(error);
+      const message = `session_start sweep failed: ${sweep.name}: ${sweepError.message}; ` +
         "startup continues because authority is checked at consumption";
-      const diagnostic = error instanceof Error ? (error.stack ?? error.message) : String(error);
+      const diagnostic = sweepError.stack ?? sweepError.message;
       const reportingFailures: string[] = [];
-      try {
-        ports.writeDiagnostic(`loom(pi): ${message}\n${diagnostic}\n`);
-      } catch (reportError) {
-        reportingFailures.push(
-          `diagnostic writer failed: ${reportError instanceof Error ? reportError.message : String(reportError)}`,
-        );
-      }
-      try {
-        ports.notifyWarning(`Loom ${message}${cleanupFailureSuffix(reportingFailures)}`);
-      } catch (reportError) {
-        reportingFailures.push(
-          `warning notifier failed: ${reportError instanceof Error ? reportError.message : String(reportError)}`,
-        );
-      }
-      if (reportingFailures.length > 0) {
+      let reported = false;
+      const attemptReport = (label: string, report: () => boolean): void => {
         try {
-          process.stderr.write(`loom(pi): ${message}${cleanupFailureSuffix(reportingFailures)}\n`);
-        } catch {
-          // Both injected reporting capabilities and the final process fallback
-          // are best-effort hygiene only; the next sweep remains mandatory.
+          if (report()) reported = true;
+          else reportingFailures.push(`${label} unavailable`);
+        } catch (reportError) {
+          reportingFailures.push(
+            `${label} failed: ${reportError instanceof Error ? reportError.message : String(reportError)}`,
+          );
         }
+      };
+
+      attemptReport("diagnostic writer", () =>
+        ports.writeDiagnostic(`loom(pi): ${message}\n${diagnostic}\n`));
+      attemptReport("warning notifier", () =>
+        ports.notifyWarning(`Loom ${message}${cleanupFailureSuffix(reportingFailures)}`));
+      attemptReport("stderr fallback", () =>
+        ports.writeStderr(`loom(pi): ${message}${cleanupFailureSuffix(reportingFailures)}\n`));
+
+      if (!reported) {
+        unreported.push(Object.freeze({
+          error: sweepError,
+          message,
+          reportingFailures: Object.freeze([...reportingFailures]),
+        }));
       }
     }
+  }
+  if (unreported.length > 0) {
+    const details = unreported.map(({ message, reportingFailures }) =>
+      `${message}${cleanupFailureSuffix(reportingFailures)}`).join(" | ");
+    throw new AggregateError(
+      unreported.map(({ error }) => error),
+      `Loom session_start sweep failure(s) reached no reporting channel: ${details}`,
+    );
   }
 }
 
@@ -790,6 +817,14 @@ export async function runPiCleanupActions(
   }
   return errors;
 }
+
+const productionPiStartupSweeps: PiStartupSweepSource = () => Object.freeze([
+  Object.freeze({
+    name: "sweepStaleSessions",
+    run: (): void => { sweepStaleSessions(subagentDir(), Date.now() - STALE_SUBAGENT_TTL_MS); },
+  }),
+  Object.freeze({ name: "sweepExpiredPiWriteGrants", run: (): void => sweepExpiredPiWriteGrants() }),
+]);
 
 const cleanupFailureSuffix = (errors: readonly string[]): string =>
   errors.length === 0 ? "" : ` Cleanup failures: ${errors.join("; ")}`;
@@ -1127,7 +1162,10 @@ async function verifyTrustedStandaloneReview(input: Readonly<{ cwd: string; sess
   return outcome.receipt;
 }
 
-export default function (pi: ExtensionAPI) {
+export default function (
+  pi: ExtensionAPI,
+  startupSweepSource: PiStartupSweepSource = productionPiStartupSweeps,
+) {
   assertAnchoredFilesystemPlatformSupported();
   registerInteractiveSubagentTool(pi, PACKAGE_ROOT, PI_AGENT_DIR);
   (globalThis as unknown as Record<PropertyKey, unknown>)[LOOM_REVIEW_AUTHORITY_SYMBOL] = Object.freeze({
@@ -1686,20 +1724,18 @@ export default function (pi: ExtensionAPI) {
     // fresh `.machine` anchor.
     //
     // Each sweep is guarded on its own: a crash in one must not prevent the
-    // other, and neither must escape the `session_start` handler as an
-    // unhandled rejection. Hygiene, not authority — expired or invalid
-    // grants are independently refused by `consumePiWriteGrant` at the
-    // actual authority boundary, so a missed sweep costs one session's
-    // cleanup, never a write.
-    runPiStartupSweeps([
-      {
-        name: "sweepStaleSessions",
-        run: (): void => { sweepStaleSessions(subagentDir(), Date.now() - STALE_SUBAGENT_TTL_MS); },
+    // other. Hygiene is not authority — expired or invalid grants are still
+    // refused at consumption — but a failure that reaches no diagnostic, UI,
+    // or stderr route escapes as one post-batch aggregate so the harness can
+    // surface it instead of silently losing the only operator signal.
+    runPiStartupSweeps(startupSweepSource(), {
+      writeDiagnostic: (diagnostic) => { process.stderr.write(diagnostic); return true; },
+      notifyWarning: (message) => {
+        if (!ctx.hasUI) return false;
+        ctx.ui.notify(message, "warning");
+        return true;
       },
-      { name: "sweepExpiredPiWriteGrants", run: (): void => sweepExpiredPiWriteGrants() },
-    ], {
-      writeDiagnostic: (diagnostic) => { process.stderr.write(diagnostic); },
-      notifyWarning: (message) => { if (ctx.hasUI) ctx.ui.notify(message, "warning"); },
+      writeStderr: (diagnostic) => { process.stderr.write(diagnostic); return true; },
     });
   });
 

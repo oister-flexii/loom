@@ -1549,34 +1549,30 @@ async function applyLockedReviewEvidence(args: Readonly<{
   reviewAuthority: PiReviewAttemptAuthority | null | undefined;
   resolutionFor(task: LoomTask): ReviewResolution;
 }>): Promise<PiResultOutcome> {
-  const result: { application: LockedReviewEvidenceApplication } = {
-    application: { kind: "missing" },
-  };
-  await args.store.update((state) => {
+  const application = await args.store.updateAndReturn<LockedReviewEvidenceApplication>((state) => {
     const task = state.tasks.find((candidate) => candidate.id === args.taskId);
-    if (task === undefined) return state;
+    if (task === undefined) return { state, value: { kind: "missing" } };
     const authorityProblem = piReviewAuthorityProblem(task, args.agentType, args.reviewAuthority);
     if (authorityProblem !== null) {
-      result.application = { kind: "authority-rejected", problem: authorityProblem };
-      return state;
+      return { state, value: { kind: "authority-rejected", problem: authorityProblem } };
     }
     const resolution = args.resolutionFor(task);
     const appliedTask = applyReviewResolution(task, resolution);
-    result.application = {
-      kind: "applied",
-      resolution,
-      task: appliedTask,
-      changed: appliedTask !== task,
+    return {
+      state: appliedTask === task
+        ? state
+        : {
+            ...state,
+            tasks: state.tasks.map((candidate) => candidate.id === args.taskId ? appliedTask : candidate),
+          },
+      value: {
+        kind: "applied",
+        resolution,
+        task: appliedTask,
+        changed: appliedTask !== task,
+      },
     };
-    return appliedTask === task
-      ? state
-      : {
-          ...state,
-          tasks: state.tasks.map((candidate) => candidate.id === args.taskId ? appliedTask : candidate),
-        };
   });
-
-  const application = result.application;
   if (application.kind === "missing") {
     const message = `WARNING: ${args.agentType} review task ${args.taskId} disappeared before evidence application — findings NOT stored`;
     return processingFailure(message);

@@ -17,6 +17,8 @@ import {
   parseTaskGraph,
   StateManager,
 } from "../src/state-manager";
+import { recordReviewRunEvidence } from "../src/core/findings";
+import type { AcceptedReviewAuthority } from "../src/types";
 import {
   authorizeWaveCompletionSuite,
   defaultVerificationManifest,
@@ -364,6 +366,54 @@ describe("stored Finding location authority", () => {
       tasks: [{ ...validTask, [field]: [envelope({ ...finding, file: 42 })] }],
     }))).toContain("not a well-formed");
   });
+
+  const stagedReviewTask = (newFinding: unknown) => reviewedTask({
+    review_run: {
+      ...reviewedTask().review_run,
+      evidence: [{
+        agent: "code-reviewer",
+        prior_assessments: [],
+        new_findings: [newFinding],
+      }],
+    },
+  });
+
+  it.each([
+    ["numeric file", { severity: "critical", file: 42, line: null, claim: "staged blocker" }],
+    ["padded file", { severity: "critical", file: " src/x.ts ", line: null, claim: "staged blocker" }],
+    ["numeric-string line", { severity: "critical", file: null, line: "7", claim: "staged blocker" }],
+    ["zero line", { severity: "critical", file: null, line: 0, claim: "staged blocker" }],
+  ])("rejects a Review Run draft with an explicitly noncanonical %s", (_label, malformed) => {
+    expect(errorOf(graph({ tasks: [stagedReviewTask(malformed)] })))
+      .toContain("review_run.evidence[0].new_findings must be well-formed draft findings");
+  });
+
+  it("loads canonical staged locations and preserves them through Review Run finalization", () => {
+    const parsed = parseTaskGraph(graph({
+      tasks: [stagedReviewTask({
+        severity: "critical",
+        file: "src/x.ts",
+        line: 7,
+        claim: "staged blocker",
+      })],
+    }));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+
+    const transition = recordReviewRunEvidence(parsed.value.tasks[0]!, PACKET, 1, {
+      agent: "silent-failure-hunter",
+      prior_assessments: [],
+      new_findings: [],
+    });
+    expect(transition).toMatchObject({ ok: true, completed: true });
+    if (!transition.ok) return;
+    expect(transition.task.findings).toContainEqual(expect.objectContaining({
+      agent: "code-reviewer",
+      file: "src/x.ts",
+      line: 7,
+      claim: "staged blocker",
+    }));
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -391,6 +441,108 @@ describe("parseTaskGraph spec_anchor_hashes load boundary", () => {
     expect(errorOf(graph({
       tasks: [{ ...validTask, spec_anchor_hashes: value }],
     }))).toContain("spec_anchor_hashes must be a record of strings");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Durable decompose-time Spec Index observation
+// ---------------------------------------------------------------------------
+
+describe("parseTaskGraph spec_index_observation load boundary", () => {
+  it("preserves legacy graphs where the observation is absent", () => {
+    const parsed = parseTaskGraph(graph());
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.spec_index_observation).toBeUndefined();
+  });
+
+  it.each([
+    {
+      label: "indexed identity",
+      specFile: "spec.md",
+      observation: { kind: "indexed", path: "spec.md", contentDigest: DIGEST("a") },
+    },
+    {
+      label: "no spec file",
+      specFile: null,
+      observation: { kind: "unavailable", reason: { kind: "no-spec-file" } },
+    },
+    {
+      label: "unreadable spec",
+      specFile: "spec.md",
+      observation: { kind: "unavailable", reason: { kind: "unreadable", path: "spec.md", reason: "EACCES" } },
+    },
+    {
+      label: "invalid encoding",
+      specFile: "spec.md",
+      observation: {
+        kind: "unavailable",
+        reason: { kind: "invalid-encoding", path: "spec.md", contentDigest: DIGEST("b"), reason: "invalid UTF-8" },
+      },
+    },
+    {
+      label: "unparsed spec",
+      specFile: "spec.md",
+      observation: {
+        kind: "unavailable",
+        reason: {
+          kind: "unparsed",
+          path: "spec.md",
+          contentDigest: DIGEST("c"),
+          errors: [{ kind: "entry-not-canonical", section: "Functional Requirements", line: 12 }],
+        },
+      },
+    },
+  ])("parses and deeply freezes $label", ({ specFile, observation }) => {
+    const parsed = parseTaskGraph(graph({ spec_file: specFile, spec_index_observation: observation }));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const stored = parsed.value.spec_index_observation;
+    expect(stored).toEqual(observation);
+    expect(Object.isFrozen(stored)).toBe(true);
+    if (stored?.kind === "unavailable") {
+      expect(Object.isFrozen(stored.reason)).toBe(true);
+      if (stored.reason.kind === "unparsed") {
+        expect(Object.isFrozen(stored.reason.errors)).toBe(true);
+        expect(Object.isFrozen(stored.reason.errors[0])).toBe(true);
+      }
+    }
+  });
+
+  it.each([
+    ["non-object", []],
+    ["unknown tag", { kind: "maybe" }],
+    ["indexed digest", { kind: "indexed", path: "spec.md", contentDigest: "bad" }],
+    ["persisted ParsedSpec", { kind: "indexed", path: "spec.md", contentDigest: DIGEST("a"), index: {} }],
+    ["unavailable surplus field", { kind: "unavailable", reason: { kind: "no-spec-file" }, extra: true }],
+    ["unreadable missing reason", { kind: "unavailable", reason: { kind: "unreadable", path: "spec.md" } }],
+    ["invalid encoding digest", {
+      kind: "unavailable",
+      reason: { kind: "invalid-encoding", path: "spec.md", contentDigest: "bad", reason: "invalid" },
+    }],
+    ["unparsed empty errors", {
+      kind: "unavailable",
+      reason: { kind: "unparsed", path: "spec.md", contentDigest: DIGEST("a"), errors: [] },
+    }],
+    ["unparsed malformed error", {
+      kind: "unavailable",
+      reason: {
+        kind: "unparsed",
+        path: "spec.md",
+        contentDigest: DIGEST("a"),
+        errors: [{ kind: "entry-not-canonical", section: "not-a-section", line: 0 }],
+      },
+    }],
+  ])("fails closed for malformed stored shape: %s", (_label, observation) => {
+    expect(errorOf(graph({ spec_file: "spec.md", spec_index_observation: observation })))
+      .toContain("spec_index_observation");
+  });
+
+  it("refuses an observation that contradicts protected spec_file authority", () => {
+    expect(errorOf(graph({
+      spec_file: "spec.md",
+      spec_index_observation: { kind: "indexed", path: "other.md", contentDigest: DIGEST("a") },
+    }))).toContain("path must match protected spec_file");
   });
 });
 
@@ -967,6 +1119,12 @@ describe("parseTaskGraph safe generation and Wave boundaries", () => {
     expect(errorOf(graph(fields))).toMatch(/safe|wave_review_epoch/u);
   });
 
+  it("preserves the exact safe Wave diagnostic through the shared integer-bound parser", () => {
+    expect(errorOf(graph({ wave_review_epoch: waveReviewEpoch({ wave: 0 }) }))).toBe(
+      "wave_review_epoch.wave must be an integer >= 1 within the safe-integer range",
+    );
+  });
+
   it("rejects unsafe Task and accepted-authority review generations", () => {
     expect(errorOf(graph({ tasks: [{ ...validTask, review_generation: unsafe }] }))).toContain("safe integer");
     expect(errorOf(graph({ tasks: [{
@@ -980,18 +1138,60 @@ describe("parseTaskGraph safe generation and Wave boundaries", () => {
     }] }))).toContain("accepted_review_authority");
   });
 
-  it("rejects every partial Review Run workspace-authority combination", () => {
-    for (const partial of [
-      { workspace_head_sha: HEAD },
-      { wave_gate_run_id: "run.wave" },
-      { wave_gate_authority_digest: DIGEST("a") },
-      { workspace_scope: ["src/x.ts"], workspace_head_sha: HEAD },
-    ]) {
+  it("models Accepted Review Run authority as all-or-none and preserves both persisted variants", () => {
+    const legacy: AcceptedReviewAuthority = {
+      generation: 1,
+      packet_id: PACKET,
+      head_sha: HEAD,
+      scope: ["src/x.ts"],
+    };
+    const runBound: AcceptedReviewAuthority = {
+      ...legacy,
+      run_id: "run.wave",
+      authority_digest: DIGEST("a"),
+    };
+    // @ts-expect-error run_id cannot exist without authority_digest.
+    const partialRun: AcceptedReviewAuthority = { ...legacy, run_id: "run.wave" };
+    // @ts-expect-error authority_digest cannot exist without run_id.
+    const partialDigest: AcceptedReviewAuthority = { ...legacy, authority_digest: DIGEST("a") };
+
+    expect(parseTaskGraph(graph({ tasks: [{ ...validTask, accepted_review_authority: legacy }] })).ok).toBe(true);
+    expect(parseTaskGraph(graph({ tasks: [{ ...validTask, accepted_review_authority: runBound }] })).ok).toBe(true);
+    expect(errorOf(graph({ tasks: [{ ...validTask, accepted_review_authority: partialRun }] })))
+      .toContain("run authority must be complete and valid when present");
+    expect(errorOf(graph({ tasks: [{ ...validTask, accepted_review_authority: partialDigest }] })))
+      .toContain("run authority must be complete and valid when present");
+  });
+
+  it.each([
+    ["workspace_scope", {
+      workspace_head_sha: DIGEST("b"),
+      wave_gate_run_id: "run.wave",
+      wave_gate_authority_digest: DIGEST("a"),
+    }],
+    ["workspace_head_sha", {
+      workspace_scope: ["src/x.ts"],
+      wave_gate_run_id: "run.wave",
+      wave_gate_authority_digest: DIGEST("a"),
+    }],
+    ["wave_gate_run_id", {
+      workspace_scope: ["src/x.ts"],
+      workspace_head_sha: DIGEST("b"),
+      wave_gate_authority_digest: DIGEST("a"),
+    }],
+    ["wave_gate_authority_digest", {
+      workspace_scope: ["src/x.ts"],
+      workspace_head_sha: DIGEST("b"),
+      wave_gate_run_id: "run.wave",
+    }],
+  ] as const)(
+    "rejects complete Review Run workspace authority minus %s",
+    (_omitted, partial) => {
       expect(errorOf(graph({
         tasks: [reviewedTask({ review_run: { ...reviewedTask().review_run, ...partial } })],
       }))).toContain("workspace");
-    }
-  });
+    },
+  );
 });
 
 describe("parseTaskGraph wave_gates load boundary", () => {

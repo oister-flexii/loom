@@ -174,6 +174,14 @@ describe("attributeFindings — derived, never agent-chosen identity", () => {
     expect(() => nextOrdinal([exhausted], [], "code-reviewer")).toThrow(/ordinal space exhausted/u);
   });
 
+  it("rejects end-ordinal overflow when multiple drafts start at the maximum safe ordinal", () => {
+    expect(() => attributeFindings(
+      [draft(), draft({ claim: "overflows the suffix" })],
+      "code-reviewer",
+      Number.MAX_SAFE_INTEGER,
+    )).toThrow(/positive safe ordinals/u);
+  });
+
   it("counts ordinals per agent, not per task", () => {
     const existing: readonly Finding[] = [
       ...attributeFindings([draft()], "code-reviewer"),
@@ -539,6 +547,42 @@ describe("the load boundary proves what the Task type asserts", () => {
         }],
       },
     }], "resolved")).toContain("not a well-formed resolution");
+  });
+
+  it("preserves exact retired-container malformed and duplicate diagnostics", () => {
+    const refuted = {
+      finding: wellFormed,
+      refutations: [{ lens: "intent", reason: "deliberate" }],
+    };
+    const resolved = {
+      finding: wellFormed,
+      resolution: {
+        kind: "resolved_by_remediation",
+        generation: 1,
+        packet_id: "a".repeat(64),
+        head_sha: "b".repeat(40),
+        expected_agents: ["code-reviewer"],
+        assessments: [{
+          finding_id: wellFormed.id,
+          verdict: "resolved_by_remediation",
+          reason: "fixed",
+          agent: "code-reviewer",
+        }],
+      },
+    };
+
+    expect(refutationsUnionError([{}], "refuted")).toBe(
+      "refuted[0] is not a well-formed refutation record (repair and install atomically with: helper repair-task-graph)",
+    );
+    expect(refutationsUnionError([refuted, refuted], "refuted")).toBe(
+      "refuted[1] repeats refuted finding id 'code-reviewer-1' (repair and install atomically with: helper repair-task-graph)",
+    );
+    expect(resolutionsUnionError([{}], "resolved")).toBe(
+      "resolved[0] is not a well-formed resolution record (repair and install atomically with: helper repair-task-graph)",
+    );
+    expect(resolutionsUnionError([resolved, resolved], "resolved")).toBe(
+      "resolved[1] repeats resolved finding id 'code-reviewer-1' (repair and install atomically with: helper repair-task-graph)",
+    );
   });
 
   it("points at the repair command rather than leaving the operator stuck", () => {

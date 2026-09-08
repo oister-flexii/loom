@@ -79,11 +79,10 @@ export const DEFAULT_BOUNDARIES: readonly BoundaryRule[] = [
       // filesystem. Listed individually rather than opening `machine/`, which
       // would also admit the ledger and report-discovery shells.
       "engine/src/machine/extract-evidence",
-      // Dependency-free string helpers. Each imports NOTHING (verified: zero
-      // import statements), so naming them individually cannot open a path
-      // back into the shell. `engine/src/utils/` as a whole stays denied by
-      // omission because utils also holds modules that import core, and a
-      // blanket entry would legitimise a core→utils→core cycle.
+      // Narrow pure helpers: extract-task-id uses core/task-id for canonical
+      // Task identity; the other two have no imports. These explicit entries
+      // admit no shell/I/O dependency. The rest of utils stays denied rather
+      // than granting access to its filesystem and locking helpers.
       "engine/src/utils/extract-task-id",
       "engine/src/utils/no-finding-sentinel",
       "engine/src/utils/strip-namespace",

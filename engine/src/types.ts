@@ -25,7 +25,7 @@ import type {
 } from "./core/completion-suite";
 import type { FrozenVerificationManifest } from "./core/verification-manifest";
 import type { Phase } from "./core/phases";
-import type { SettledFloor } from "./core/requirement-coverage";
+import type { SettledFloor, SpecIndexObservation } from "./core/requirement-coverage";
 export type { IssuedReviewPacketRegistration } from "./core/review-packet";
 export { PHASES, type Phase } from "./core/phases";
 import type {
@@ -268,17 +268,22 @@ type ReviewRunWorkspaceAuthority =
 /** Workspace authority is either wholly absent on an unbound/legacy run or complete. */
 export type ReviewRun = Readonly<ReviewRunBase & ReviewRunWorkspaceAuthority>;
 
+type AcceptedReviewAuthorityBase = Readonly<{
+  generation: number;
+  packet_id: string;
+  head_sha: string;
+  scope: readonly string[];
+}>;
+
+type AcceptedReviewRunAuthority =
+  | Readonly<{ run_id?: never; authority_digest?: never }>
+  | Readonly<{ run_id: string; authority_digest: string }>;
+
 /** Review authority retained after a roster closes. It is the immutable source
  * for completion integrity and completed-Wave reopening; graph summaries are
- * never substituted for it. */
-export interface AcceptedReviewAuthority {
-  readonly generation: number;
-  readonly packet_id: string;
-  readonly head_sha: string;
-  readonly scope: readonly string[];
-  readonly run_id?: string;
-  readonly authority_digest?: string;
-}
+ * never substituted for it. Run authority is either wholly absent for legacy
+ * evidence or complete, so a partially bound accepted run is unrepresentable. */
+export type AcceptedReviewAuthority = Readonly<AcceptedReviewAuthorityBase & AcceptedReviewRunAuthority>;
 
 export interface FindingResolutionAssessment extends PriorFindingAssessment {
   readonly agent: string;
@@ -1139,6 +1144,10 @@ export interface TaskGraph {
   readonly skipped_phases: readonly Phase[];
   readonly spec_dir?: string | null;
   readonly spec_file: string | null;
+  /** Compact identity/reason from the exact Spec Index observation used when
+   * Tasks and Requirement Content Hashes were populated. Absent on legacy
+   * graphs; never contains the derived ParsedSpec itself. */
+  readonly spec_index_observation?: SpecIndexObservation;
   readonly plan_file: string | null;
   readonly plan_title?: string;
   /** `readonly` for the same reason `Task.findings` is: every producer already

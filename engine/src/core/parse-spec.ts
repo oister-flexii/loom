@@ -246,6 +246,27 @@ function expandLeadingTabs(line: string): string {
   return expanded + line.slice(head.length);
 }
 
+/** Classify a non-marker line after the outer list-ownership check. */
+function nonFenceLine(
+  line: string,
+  context: Readonly<{ insideFence: boolean; contentIndent: number | null; previousBlank: boolean }>,
+): Readonly<{ text: string; contentIndent: number | null; previousBlank: boolean }> {
+  const indentation = leadingSpaces(line);
+  // Owned content has already returned; only fence content and top-level code remain.
+  if (context.insideFence || (context.previousBlank && indentation >= 4)) {
+    return Object.freeze({ text: "", contentIndent: context.contentIndent, previousBlank: true });
+  }
+  let contentIndent = context.contentIndent;
+  const listMarker = /^ {0,3}(?:[-+*]|\d+[.)]) +/u.exec(line);
+  if (listMarker !== null) {
+    contentIndent = listMarker[0].length;
+  } else if (line.trim() !== "" && contentIndent !== null && indentation < contentIndent &&
+      (context.previousBlank || startsMarkdownBlock(line.trim()))) {
+    contentIndent = null;
+  }
+  return Object.freeze({ text: line, contentIndent, previousBlank: line.trim().length === 0 });
+}
+
 /**
  * Blank fenced examples and indented-code furniture while preserving headings
  * and line numbers outside them, aligned with CommonMark in both directions:
@@ -266,40 +287,27 @@ function withoutFences(markdown: string): Readonly<{ text: string; unterminated:
   let previousBlank = true;
   const out: string[] = [];
   for (const rawLine of markdown.replace(/\r\n?/gu, "\n").split("\n")) {
-    // CommonMark expands each tab to the next 4-column tab stop: a
-    // tab-indented line after a blank line is indented code, never spec text,
-    // and a tab-indented fence marker at 4+ columns is code furniture, not a
-    // fence boundary. Tabs inside content are untouched.
+    // CommonMark expands each tab to the next 4-column tab stop: at top level,
+    // a tab-indented line after a blank is code rather than spec text. An open
+    // list may own that indentation, while a tab-indented fence marker at 4+
+    // columns is never a fence boundary. Tabs inside content are untouched.
     const line = expandLeadingTabs(rawLine);
-    const fence = /^ {0,3}(`{3,}|~{3,})(.*)$/u.exec(line);
-    if (fence === null) {
-      if (marker !== null) {
-        out.push("");
-        previousBlank = true;
-        continue;
-      }
-      // Four columns after a blank are top-level code furniture only when no
-      // open list item owns them. Inside a list item the marker's content
-      // indentation is the boundary: a four-space paragraph is legitimate
-      // item content and must survive into the Requirement hash.
-      const indentation = leadingSpaces(line);
-      const indentedStructuralId = indentation >= 4 && STRUCTURAL_ID.test(line);
-      if (previousBlank && indentation >= 4 &&
-          (activeListContentIndent === null || indentation < activeListContentIndent || indentedStructuralId)) {
-        out.push("");
-        previousBlank = true;
-        continue;
-      }
-      const listMarker = /^ {0,3}(?:[-+*]|\d+[.)]) +/u.exec(line);
-      if (listMarker !== null) {
-        activeListContentIndent = listMarker[0].length;
-      } else if (line.trim() !== "" && activeListContentIndent !== null &&
-          indentation < activeListContentIndent &&
-          (previousBlank || startsMarkdownBlock(line.trim()))) {
-        activeListContentIndent = null;
-      }
+    const indentation = leadingSpaces(line);
+    if (marker === null && activeListContentIndent !== null && indentation >= activeListContentIndent) {
+      // The outer list owns its complete body, including nested markers and
+      // fence-shaped text. Do not strip it or replace the parent's indentation
+      // with a nested list's: parseEntries owns content and nested-ID refusal.
       out.push(line);
       previousBlank = line.trim().length === 0;
+      continue;
+    }
+    const fence = /^ {0,3}(`{3,}|~{3,})(.*)$/u.exec(line);
+    if (fence === null) {
+      const classified = nonFenceLine(line, {
+        insideFence: marker !== null, contentIndent: activeListContentIndent, previousBlank,
+      });
+      out.push(classified.text);
+      ({ contentIndent: activeListContentIndent, previousBlank } = classified);
       continue;
     }
     const rawMarker = fence[1];
@@ -315,6 +323,7 @@ function withoutFences(markdown: string): Readonly<{ text: string; unterminated:
       continue;
     }
     if (marker === null) {
+      activeListContentIndent = null;
       marker = Object.freeze({ char: rawMarker[0], length: rawMarker.length });
     } else if (marker.char === rawMarker[0] && rawMarker.length >= marker.length && info.trim().length === 0) {
       marker = null;
@@ -414,9 +423,17 @@ function parseEntries<F extends SpecFamily>(
       continue;
     }
     const canonicalEntry = pattern.exec(line);
-    const directlyAdjacentCanonicalEntry = !previousBlank && canonicalEntry !== null;
-    if (current !== null && leadingSpaces(raw) >= current.continuationIndent &&
-        !directlyAdjacentCanonicalEntry) {
+    if (current !== null && leadingSpaces(raw) >= current.continuationIndent && STRUCTURAL_ID.test(raw)) {
+      // A nested structural ID is never continuation content. Reject it before
+      // the continuation branch can absorb it into the current Requirement.
+      finishCurrent();
+      errors.push(Object.freeze(canonicalEntry === null
+        ? { kind: "entry-not-bulleted" as const, section, line: documentLine }
+        : { kind: "entry-not-canonical" as const, section, line: documentLine }));
+      previousBlank = false;
+      continue;
+    }
+    if (current !== null && leadingSpaces(raw) >= current.continuationIndent) {
       // Indentation owned by the current item remains Requirement content,
       // including nested list clauses after a blank.
       current.content.push(line);
@@ -479,6 +496,18 @@ function parseEntries<F extends SpecFamily>(
   return Object.freeze([head, ...tail]);
 }
 
+type AcceptanceBlockState = Readonly<{ kind: "before" }>
+  | Readonly<{ kind: "inside"; headerLine: number; contentIndent: number | null }>
+  | Readonly<{ kind: "after" }>;
+
+function closeAcceptanceBlock(state: AcceptanceBlockState, errors: SpecParseError[]): AcceptanceBlockState {
+  if (state.kind !== "inside") return state;
+  if (state.contentIndent === null) {
+    errors.push(Object.freeze({ kind: "acceptance-block-has-no-bullets", headerLine: state.headerLine }));
+  }
+  return Object.freeze({ kind: "after" });
+}
+
 /**
  * Collects the scenario bullet lines of the User Scenarios section and fails
  * closed on every stray structural ID, in or out of an acceptance block.
@@ -488,20 +517,21 @@ function parseEntries<F extends SpecFamily>(
  */
 function acceptanceScenarioLines(lines: readonly SourceLine[], errors: SpecParseError[]): readonly SourceLine[] {
   const scenarios: SourceLine[] = [];
-  const closeBlock = (headerLine: number): void => {
-    errors.push(Object.freeze({ kind: "acceptance-block-has-no-bullets", headerLine }));
-  };
-  let state: Readonly<{ kind: "before" }>
-    | Readonly<{ kind: "inside"; headerLine: number; sawBullet: boolean }>
-    | Readonly<{ kind: "after" }> = Object.freeze({ kind: "before" });
+  let state: AcceptanceBlockState = Object.freeze({ kind: "before" });
   const isCollectedBullet = (raw: string): boolean => state.kind === "inside" && raw.trim().startsWith("-");
   const strayId = (documentLine: number): SpecParseError =>
     Object.freeze({ kind: "scenario-not-bulleted", line: documentLine, insideBlock: state.kind === "inside" });
   for (const { raw, documentLine } of lines) {
     const line = raw.trim();
+    if (state.kind === "inside" && state.contentIndent !== null && leadingSpaces(raw) >= state.contentIndent) {
+      // Owned headings, breaks and IDs must reach the same entry grammar as
+      // FR/OOS, not terminate or disappear in the acceptance-block collector.
+      scenarios.push(Object.freeze({ raw, documentLine }));
+      continue;
+    }
     if (ACCEPTANCE_HEADER.test(line)) {
-      if (state.kind === "inside" && !state.sawBullet) closeBlock(state.headerLine);
-      state = Object.freeze({ kind: "inside", headerLine: documentLine, sawBullet: false });
+      closeAcceptanceBlock(state, errors);
+      state = Object.freeze({ kind: "inside", headerLine: documentLine, contentIndent: null });
       continue;
     }
     const subHeading = /^###\s+/u.test(line);
@@ -511,10 +541,7 @@ function acceptanceScenarioLines(lines: readonly SourceLine[], errors: SpecParse
       // would be silently dropped here. Fail closed, never vanish; the
       // terminator behavior is preserved either way.
       if (subHeading && STRUCTURAL_ID.test(raw)) errors.push(strayId(documentLine));
-      if (state.kind === "inside") {
-        if (!state.sawBullet) closeBlock(state.headerLine);
-        state = Object.freeze({ kind: "after" });
-      }
+      state = closeAcceptanceBlock(state, errors);
       continue;
     }
     // A recognizable structural ID that is not a collected bullet — in or out
@@ -524,14 +551,17 @@ function acceptanceScenarioLines(lines: readonly SourceLine[], errors: SpecParse
     if (state.kind !== "inside") continue;
     if (line.startsWith("-") && leadingSpaces(raw) < 4) {
       scenarios.push(Object.freeze({ raw, documentLine }));
-      state = Object.freeze({ kind: "inside", headerLine: state.headerLine, sawBullet: true });
-    } else if (state.sawBullet && !strayStructuralId) {
+      state = Object.freeze({
+        kind: "inside", headerLine: state.headerLine,
+        contentIndent: /^\s*-\s+/u.exec(raw)?.[0].length ?? 2,
+      });
+    } else if (state.contentIndent !== null && !strayStructuralId) {
       // Preserve blanks as grammar input. parseEntries needs that state to
       // distinguish a direct lazy continuation from a new unindented block.
       scenarios.push(Object.freeze({ raw, documentLine }));
     }
   }
-  if (state.kind === "inside" && !state.sawBullet) closeBlock(state.headerLine);
+  state = closeAcceptanceBlock(state, errors);
   if (state.kind === "before") errors.push(Object.freeze({ kind: "no-acceptance-block" }));
   return Object.freeze(scenarios);
 }

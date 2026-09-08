@@ -35,7 +35,7 @@ import type {
   SpecParseError,
 } from "./parse-spec";
 import { specParseErrorMessage } from "./parse-spec";
-import type { ArtifactDigest } from "./orchestration-contract";
+import { parseArtifactDigest, type ArtifactDigest } from "./orchestration-contract";
 
 /**
  * The families a Task may legitimately claim to have completed. `OOS` is
@@ -63,7 +63,7 @@ export type RecordedHash =
  * verdict rather than collapsing into it.
  */
 export type DriftFact =
-  | Readonly<{ kind: "unverifiable" }>
+  | Readonly<{ kind: "unverifiable"; populationObservation?: SpecIndexObservation }>
   | Readonly<{ kind: "unreadable-record"; stored: string }>
   | Readonly<{ kind: "stable" }>
   | Readonly<{ kind: "drifted"; recorded: SpecContentHash; current: SpecContentHash }>;
@@ -96,7 +96,7 @@ export type CoverageRow = Readonly<{
  * Gate's own observation refuses outright instead, because gate evidence must
  * name exact bytes.
  */
-export type SpecIndexUnavailable =
+export type SpecIndexUnavailableReason =
   | Readonly<{ kind: "no-spec-file" }>
   | Readonly<{ kind: "unreadable"; path: string; reason: string }>
   | Readonly<{
@@ -114,6 +114,18 @@ export type SpecIndexUnavailable =
       errors: NonEmpty<SpecParseError>;
     }>;
 
+/** Compatibility name retained for existing projection callers. */
+export type SpecIndexUnavailable = SpecIndexUnavailableReason;
+
+/**
+ * Compact durable identity of the Spec Index observation made while Tasks were
+ * populated. The indexed arm deliberately omits ParsedSpec: requirement text
+ * remains derived from the canonical Spec, never copied into the TaskGraph.
+ */
+export type SpecIndexObservation =
+  | Readonly<{ kind: "indexed"; path: string; contentDigest: ArtifactDigest }>
+  | Readonly<{ kind: "unavailable"; reason: SpecIndexUnavailableReason }>;
+
 /**
  * A Spec Index observation. Every bytes-backed outcome carries the digest of
  * the exact bytes observed; only the `indexed` arm proves they parsed.
@@ -123,7 +135,7 @@ export type SpecIndexUnavailable =
  */
 export type SpecIndexAvailability =
   | Readonly<{ kind: "indexed"; path: string; contentDigest: ArtifactDigest; index: ParsedSpec }>
-  | Readonly<{ kind: "unavailable"; reason: SpecIndexUnavailable }>;
+  | Readonly<{ kind: "unavailable"; reason: SpecIndexUnavailableReason }>;
 
 /**
  * One Task's join input. `inCurrentWave` rides on the Task rather than arriving
@@ -205,9 +217,15 @@ function driftOf(
   anchorHashes: ReadonlyMap<string, RecordedHash>,
   claim: string,
   entry: CompletableEntry,
+  populationObservation: SpecIndexObservation | undefined,
 ): DriftFact {
   const recorded = anchorHashes.get(claim);
-  if (recorded === undefined) return Object.freeze({ kind: "unverifiable" });
+  if (recorded === undefined) {
+    return Object.freeze({
+      kind: "unverifiable",
+      ...(populationObservation === undefined ? {} : { populationObservation }),
+    });
+  }
   if (recorded.kind === "unreadable") {
     return Object.freeze({ kind: "unreadable-record", stored: recorded.stored });
   }
@@ -226,6 +244,7 @@ function classify(
   task: CoverageTask,
   claim: string,
   byId: ReadonlyMap<string, IndexedEntry>,
+  populationObservation: SpecIndexObservation | undefined,
 ): ClaimVerdict {
   const indexed = byId.get(claim);
   if (indexed === undefined) return Object.freeze({ kind: "unknown-requirement" });
@@ -235,7 +254,11 @@ function classify(
   const entry = indexed.entry;
   if (task.declaredFiles.length === 0) return Object.freeze({ kind: "not-declared", entry });
   if (task.modifiedFiles.length === 0) return Object.freeze({ kind: "not-implemented", entry });
-  return Object.freeze({ kind: "candidate-pass", entry, drift: driftOf(task.anchorHashes, claim, entry) });
+  return Object.freeze({
+    kind: "candidate-pass",
+    entry,
+    drift: driftOf(task.anchorHashes, claim, entry, populationObservation),
+  });
 }
 
 /**
@@ -248,6 +271,7 @@ function classify(
 export function projectRequirementCoverage(
   specIndex: SpecIndexAvailability,
   tasks: readonly CoverageTask[],
+  populationObservation?: SpecIndexObservation,
 ): RequirementCoverage {
   if (specIndex.kind === "unavailable") {
     return Object.freeze({ kind: "unavailable", reason: specIndex.reason });
@@ -259,7 +283,11 @@ export function projectRequirementCoverage(
     for (const claim of task.completionAnchors) {
       claimedAnywhere.add(claim);
       if (!task.inCurrentWave) continue;
-      rows.push(Object.freeze({ taskId: task.id, claim, verdict: classify(task, claim, byId) }));
+      rows.push(Object.freeze({
+        taskId: task.id,
+        claim,
+        verdict: classify(task, claim, byId, populationObservation),
+      }));
     }
   }
   const unclaimedOf = <F extends "FR" | "AS">(entries: readonly SpecEntry<F>[]): readonly SpecEntryId<F>[] =>
@@ -443,6 +471,230 @@ const hasExactFields = (record: Record<string, unknown>, fields: readonly string
   return actual.length === expected.length && actual.every((field, index) => field === expected[index]);
 };
 
+type SpecIndexObservationParseResult =
+  | Readonly<{ ok: true; value: SpecIndexObservation }>
+  | Readonly<{ ok: false; error: string }>;
+
+const observationParseError = (error: string): SpecIndexObservationParseResult =>
+  Object.freeze({ ok: false, error });
+
+const SPEC_PARSE_ERROR_FIELDS: Readonly<Record<SpecParseError["kind"], readonly string[]>> = Object.freeze({
+  "unterminated-fence": Object.freeze(["kind"]),
+  "missing-section": Object.freeze(["kind", "section"]),
+  "repeated-section": Object.freeze(["kind", "section"]),
+  "entry-not-bulleted": Object.freeze(["kind", "section", "line"]),
+  "entry-not-canonical": Object.freeze(["kind", "section", "line"]),
+  "section-has-no-entries": Object.freeze(["kind", "section"]),
+  "duplicate-entry-id": Object.freeze(["kind", "section", "id"]),
+  "scenario-not-bulleted": Object.freeze(["kind", "line", "insideBlock"]),
+  "acceptance-block-has-no-bullets": Object.freeze(["kind", "headerLine"]),
+  "no-acceptance-block": Object.freeze(["kind"]),
+  "glossary-row-expected": Object.freeze(["kind", "line"]),
+  "glossary-column-count": Object.freeze(["kind", "line"]),
+  "glossary-reserved-header-term": Object.freeze(["kind", "line", "term"]),
+  "glossary-cell-empty": Object.freeze(["kind", "line"]),
+  "glossary-has-no-terms": Object.freeze(["kind"]),
+  "duplicate-glossary-term": Object.freeze(["kind", "term"]),
+  "id-outside-section": Object.freeze(["kind", "line"]),
+});
+
+const REQUIRED_SPEC_SECTIONS = Object.freeze([
+  "User Scenarios",
+  "Functional Requirements",
+  "Out of Scope",
+  "Appendix: Glossary",
+]);
+const ENTRY_SPEC_SECTIONS = Object.freeze([
+  "Functional Requirements",
+  "Acceptance Scenarios",
+  "Out of Scope",
+]);
+const LINE_SPEC_ERRORS = new Set<SpecParseError["kind"]>([
+  "entry-not-bulleted",
+  "entry-not-canonical",
+  "scenario-not-bulleted",
+  "glossary-row-expected",
+  "glossary-column-count",
+  "glossary-reserved-header-term",
+  "glossary-cell-empty",
+  "id-outside-section",
+]);
+
+function parseStoredSpecParseError(raw: unknown, label: string): Readonly<{ ok: true; value: SpecParseError }> |
+Readonly<{ ok: false; error: string }> {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    return Object.freeze({ ok: false, error: `${label} must be an object` });
+  }
+  const record = raw as Record<string, unknown>;
+  if (typeof record.kind !== "string" || !Object.hasOwn(SPEC_PARSE_ERROR_FIELDS, record.kind)) {
+    return Object.freeze({ ok: false, error: `${label} is not a canonical Spec Parse Error` });
+  }
+  const kind = record.kind as SpecParseError["kind"];
+  const expected = SPEC_PARSE_ERROR_FIELDS[kind];
+  if (expected === undefined || !hasExactFields(record, expected)) {
+    return Object.freeze({ ok: false, error: `${label} is not a canonical Spec Parse Error` });
+  }
+  if (LINE_SPEC_ERRORS.has(kind) &&
+      (typeof record.line !== "number" || !Number.isSafeInteger(record.line) || record.line < 1)) {
+    return Object.freeze({ ok: false, error: `${label}.line must be a positive safe integer` });
+  }
+  if (kind === "acceptance-block-has-no-bullets" &&
+      (typeof record.headerLine !== "number" || !Number.isSafeInteger(record.headerLine) || record.headerLine < 1)) {
+    return Object.freeze({ ok: false, error: `${label}.headerLine must be a positive safe integer` });
+  }
+  if ((kind === "missing-section" || kind === "repeated-section") &&
+      (typeof record.section !== "string" || !REQUIRED_SPEC_SECTIONS.includes(record.section))) {
+    return Object.freeze({ ok: false, error: `${label}.section is not a canonical required section` });
+  }
+  if ((kind === "entry-not-bulleted" || kind === "entry-not-canonical" ||
+      kind === "section-has-no-entries" || kind === "duplicate-entry-id") &&
+      (typeof record.section !== "string" || !ENTRY_SPEC_SECTIONS.includes(record.section))) {
+    return Object.freeze({ ok: false, error: `${label}.section is not a canonical entry section` });
+  }
+  if (kind === "duplicate-entry-id") {
+    const family = record.section === "Functional Requirements" ? "FR"
+      : record.section === "Acceptance Scenarios" ? "AS" : "OOS";
+    if (typeof record.id !== "string" || !new RegExp(`^${family}-\\d{3}$`, "u").test(record.id)) {
+      return Object.freeze({ ok: false, error: `${label}.id is not canonical for ${String(record.section)}` });
+    }
+  }
+  if (kind === "scenario-not-bulleted" && typeof record.insideBlock !== "boolean") {
+    return Object.freeze({ ok: false, error: `${label}.insideBlock must be boolean` });
+  }
+  if ((kind === "glossary-reserved-header-term" || kind === "duplicate-glossary-term") &&
+      (typeof record.term !== "string" || record.term.trim() === "")) {
+    return Object.freeze({ ok: false, error: `${label}.term must be a non-empty string` });
+  }
+  return Object.freeze({
+    ok: true,
+    value: Object.freeze({ ...record }) as SpecParseError,
+  });
+}
+
+function parseStoredUnavailableReason(raw: unknown): Readonly<{ ok: true; value: SpecIndexUnavailableReason }> |
+Readonly<{ ok: false; error: string }> {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    return Object.freeze({ ok: false, error: "spec_index_observation.reason must be an object" });
+  }
+  const record = raw as Record<string, unknown>;
+  if (record.kind === "no-spec-file") {
+    return hasExactFields(record, ["kind"])
+      ? Object.freeze({ ok: true, value: Object.freeze({ kind: "no-spec-file" }) })
+      : Object.freeze({ ok: false, error: "spec_index_observation.reason no-spec-file shape is malformed" });
+  }
+  if (record.kind === "unreadable") {
+    if (!hasExactFields(record, ["kind", "path", "reason"]) || typeof record.path !== "string" ||
+        typeof record.reason !== "string" || record.reason.trim() === "") {
+      return Object.freeze({ ok: false, error: "spec_index_observation.reason unreadable shape is malformed" });
+    }
+    return Object.freeze({
+      ok: true,
+      value: Object.freeze({ kind: "unreadable", path: record.path, reason: record.reason }),
+    });
+  }
+  if (record.kind === "invalid-encoding") {
+    if (!hasExactFields(record, ["kind", "path", "contentDigest", "reason"]) ||
+        typeof record.path !== "string" || typeof record.reason !== "string" || record.reason.trim() === "") {
+      return Object.freeze({ ok: false, error: "spec_index_observation.reason invalid-encoding shape is malformed" });
+    }
+    const digest = parseArtifactDigest(record.contentDigest);
+    return digest.ok
+      ? Object.freeze({
+          ok: true,
+          value: Object.freeze({
+            kind: "invalid-encoding",
+            path: record.path,
+            contentDigest: digest.value,
+            reason: record.reason,
+          }),
+        })
+      : Object.freeze({ ok: false, error: `spec_index_observation.reason.contentDigest: ${digest.error.message}` });
+  }
+  if (record.kind === "unparsed") {
+    if (!hasExactFields(record, ["kind", "path", "contentDigest", "errors"]) ||
+        typeof record.path !== "string" || !Array.isArray(record.errors) || record.errors.length === 0) {
+      return Object.freeze({ ok: false, error: "spec_index_observation.reason unparsed shape is malformed" });
+    }
+    const digest = parseArtifactDigest(record.contentDigest);
+    if (!digest.ok) {
+      return Object.freeze({ ok: false, error: `spec_index_observation.reason.contentDigest: ${digest.error.message}` });
+    }
+    const errors: SpecParseError[] = [];
+    for (const [index, error] of record.errors.entries()) {
+      const parsed = parseStoredSpecParseError(error, `spec_index_observation.reason.errors[${index}]`);
+      if (!parsed.ok) return parsed;
+      errors.push(parsed.value);
+    }
+    const [head, ...tail] = errors;
+    return Object.freeze({
+      ok: true,
+      value: Object.freeze({
+        kind: "unparsed",
+        path: record.path,
+        contentDigest: digest.value,
+        errors: Object.freeze([head, ...tail]) as NonEmpty<SpecParseError>,
+      }),
+    });
+  }
+  return Object.freeze({ ok: false, error: "spec_index_observation.reason kind is not recognized" });
+}
+
+/** Parse the compact durable observation at the StateManager load boundary. */
+export function parseSpecIndexObservation(raw: unknown): SpecIndexObservationParseResult {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    return observationParseError("spec_index_observation must be an object");
+  }
+  const record = raw as Record<string, unknown>;
+  if (record.kind === "indexed") {
+    if (!hasExactFields(record, ["kind", "path", "contentDigest"]) || typeof record.path !== "string") {
+      return observationParseError("spec_index_observation indexed shape is malformed");
+    }
+    const digest = parseArtifactDigest(record.contentDigest);
+    return digest.ok
+      ? Object.freeze({
+          ok: true,
+          value: Object.freeze({ kind: "indexed", path: record.path, contentDigest: digest.value }),
+        })
+      : observationParseError(`spec_index_observation.contentDigest: ${digest.error.message}`);
+  }
+  if (record.kind !== "unavailable" || !hasExactFields(record, ["kind", "reason"])) {
+    return observationParseError("spec_index_observation kind or unavailable shape is malformed");
+  }
+  const reason = parseStoredUnavailableReason(record.reason);
+  return reason.ok
+    ? Object.freeze({ ok: true, value: Object.freeze({ kind: "unavailable", reason: reason.value }) })
+    : reason;
+}
+
+/** Compact and defensively freeze the single prepared decompose observation. */
+export function specIndexObservationOf(availability: SpecIndexAvailability): SpecIndexObservation {
+  return match<SpecIndexAvailability, SpecIndexObservation>(availability)
+    .with({ kind: "indexed" }, ({ path, contentDigest }) =>
+      Object.freeze({ kind: "indexed", path, contentDigest }))
+    .with({ kind: "unavailable", reason: { kind: "no-spec-file" } }, () =>
+      Object.freeze({ kind: "unavailable", reason: Object.freeze({ kind: "no-spec-file" }) }))
+    .with({ kind: "unavailable", reason: { kind: "unreadable" } }, ({ reason }) =>
+      Object.freeze({ kind: "unavailable", reason: Object.freeze({ ...reason }) }))
+    .with({ kind: "unavailable", reason: { kind: "invalid-encoding" } }, ({ reason }) =>
+      Object.freeze({ kind: "unavailable", reason: Object.freeze({ ...reason }) }))
+    .with({ kind: "unavailable", reason: { kind: "unparsed" } }, ({ reason }) =>
+      Object.freeze({
+        kind: "unavailable",
+        reason: Object.freeze({
+          ...reason,
+          errors: Object.freeze(reason.errors.map((error) => Object.freeze({ ...error }))) as NonEmpty<SpecParseError>,
+        }),
+      }))
+    .exhaustive();
+}
+
+/** The protected spec_file identity carried by a durable observation. */
+export function specIndexObservationPath(observation: SpecIndexObservation): string | null {
+  return observation.kind === "indexed"
+    ? observation.path
+    : specIndexPath(Object.freeze({ kind: "unavailable", reason: observation.reason }));
+}
+
 /** Parse persisted current and historical settled-floor authority. */
 const FLOOR_VARIANTS: Readonly<Record<SettledFloor["kind"], (record: Record<string, unknown>) => SettledFloor | null>> =
   Object.freeze({
@@ -475,7 +727,7 @@ const FLOOR_VARIANTS: Readonly<Record<SettledFloor["kind"], (record: Record<stri
 export function parseSettledFloor(raw: unknown): SettledFloor | null {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
   const record = raw as Record<string, unknown>;
-  const variant = typeof record.kind === "string"
+  const variant = typeof record.kind === "string" && Object.hasOwn(FLOOR_VARIANTS, record.kind)
     ? FLOOR_VARIANTS[record.kind as SettledFloor["kind"]]
     : undefined;
   return variant === undefined ? null : variant(record);
@@ -496,8 +748,14 @@ export function claimVerdictMessage(verdict: ClaimVerdict): string {
     .with({ kind: "not-implemented" }, ({ entry }) =>
       `claims ${entry.id} but the Task modified no files`)
     .with({ kind: "candidate-pass" }, ({ entry, drift }) => match<DriftFact, string>(drift)
-      .with({ kind: "unverifiable" }, () =>
-        `${entry.id} is structurally covered; drift is unverifiable because no hash was recorded when the claim was made`)
+      .with({ kind: "unverifiable" }, ({ populationObservation }) => {
+        const base = `${entry.id} is structurally covered; drift is unverifiable because no hash was recorded when the claim was made`;
+        if (populationObservation === undefined) return base;
+        return populationObservation.kind === "unavailable"
+          ? `${base}; population Spec Index was unavailable: ${specIndexUnavailableMessage(populationObservation.reason)}`
+          : `${base}; population observed Spec Index ${populationObservation.path} at ` +
+              `${populationObservation.contentDigest.slice(0, 12)}, so this claim named no indexed entry at population time`;
+      })
       .with({ kind: "unreadable-record" }, ({ stored }) =>
         `${entry.id} is structurally covered but its recorded hash is not a value this engine could have written (stored ${JSON.stringify(stored.slice(0, 32))}) — the TaskGraph's Requirement hashes have been altered`)
       .with({ kind: "stable" }, () => `${entry.id} is structurally covered and its text is unchanged since the claim`)

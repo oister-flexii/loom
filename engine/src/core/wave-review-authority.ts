@@ -631,6 +631,7 @@ export function prepareWaveReviewBatch(
   const requirementCoverage = projectRequirementCoverage(
     specCheckObservation.specIndex,
     coverageTasks(graph, registration.input.wave),
+    graph.spec_index_observation,
   );
   const batchEpoch = parseArtifactDigest(sha256Hex(JSON.stringify({
     runId,

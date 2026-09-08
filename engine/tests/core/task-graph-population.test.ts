@@ -116,6 +116,13 @@ describe("populateTaskGraph aggregate command", () => {
       github_repo: "peterstorm/loom",
     });
     expect(result.value.state.active_wave_completion_suite).toBeUndefined();
+    expect(result.value.state.spec_index_observation).toEqual({
+      kind: "indexed",
+      path: "spec.md",
+      contentDigest: parsedDigest.value,
+    });
+    expect(result.value.state.spec_index_observation).not.toHaveProperty("index");
+    expect(Object.isFrozen(result.value.state.spec_index_observation)).toBe(true);
     expect(result.value.state.tasks).toEqual([
       expect.objectContaining({
         id: "T1",
@@ -164,6 +171,97 @@ describe("populateTaskGraph aggregate command", () => {
       error: { kind: "non-pending-tasks", message: expect.stringContaining("--force") },
     });
     expect(existing.tasks[0]?.status).toBe("completed");
+  });
+
+  it.each([
+    {
+      label: "no spec file",
+      specFile: null,
+      availability: Object.freeze({
+        kind: "unavailable" as const,
+        reason: Object.freeze({ kind: "no-spec-file" as const }),
+      }),
+    },
+    {
+      label: "unreadable spec",
+      specFile: "spec.md",
+      availability: Object.freeze({
+        kind: "unavailable" as const,
+        reason: Object.freeze({ kind: "unreadable" as const, path: "spec.md", reason: "EACCES" }),
+      }),
+    },
+    {
+      label: "invalid encoding",
+      specFile: "spec.md",
+      availability: Object.freeze({
+        kind: "unavailable" as const,
+        reason: Object.freeze({
+          kind: "invalid-encoding" as const,
+          path: "spec.md",
+          contentDigest: parsedDigest.value,
+          reason: "invalid UTF-8",
+        }),
+      }),
+    },
+    {
+      label: "unparsed spec",
+      specFile: "spec.md",
+      availability: Object.freeze({
+        kind: "unavailable" as const,
+        reason: Object.freeze({
+          kind: "unparsed" as const,
+          path: "spec.md",
+          contentDigest: parsedDigest.value,
+          errors: Object.freeze([Object.freeze({
+            kind: "missing-section" as const,
+            section: "Functional Requirements" as const,
+          })] as const),
+        }),
+      }),
+    },
+  ])("persists and deeply freezes the prepared $label observation", ({ specFile, availability }) => {
+    const result = populateTaskGraph(
+      graph({ spec_file: specFile }),
+      command({
+        authoredSpecFile: undefined,
+        specIndex: availability,
+        observedSpecFile: specFile,
+      }),
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const observation = result.value.state.spec_index_observation;
+    expect(observation).toEqual(availability);
+    expect(Object.isFrozen(observation)).toBe(true);
+    if (observation?.kind === "unavailable") {
+      expect(Object.isFrozen(observation.reason)).toBe(true);
+      if (observation.reason.kind === "unparsed") {
+        expect(Object.isFrozen(observation.reason.errors)).toBe(true);
+        expect(Object.isFrozen(observation.reason.errors[0])).toBe(true);
+      }
+    }
+  });
+
+  it("replaces a stale population observation whenever it replaces Tasks", () => {
+    const stale = Object.freeze({
+      kind: "indexed" as const,
+      path: "spec.md",
+      contentDigest: parsedDigest.value,
+    });
+    const unavailable = Object.freeze({
+      kind: "unavailable" as const,
+      reason: Object.freeze({ kind: "unreadable" as const, path: "spec.md", reason: "EIO" }),
+    });
+    const result = populateTaskGraph(
+      graph({ spec_index_observation: stale }),
+      command({ specIndex: unavailable, force: true }),
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.state.spec_index_observation).toEqual(unavailable);
+    expect(result.value.state.spec_index_observation).not.toEqual(stale);
   });
 
   it("removes every Wave authority tied to Tasks replaced by population", () => {
