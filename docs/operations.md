@@ -31,6 +31,7 @@ Both renderers project one `LoomStatus` value. Status reports:
 - exhaustive Task counts;
 - failed proof obligations;
 - test readiness;
+- Wave completion-suite outcome and independent `projectVerificationCoverage`;
 - Review Run roster gaps and evidence failures;
 - active/advisory/resolved/refuted Finding counts;
 - whether a Refutation Panel is needed;
@@ -38,6 +39,8 @@ Both renderers project one `LoomStatus` value. Status reports:
 - exactly one next action and all reasons.
 
 Unreadable or malformed authority is represented as `unavailable` and leads to `blocked`; status never fabricates empty/ready values. Status probes the conventional Wave Gate runs root by default; pass `--runs-root` when the active run was started under a different root. A missing active directory is reported as orphaned, never as a healthy suspended run.
+
+Modern completion-suite readiness (`required`, `accepted`, `rejected`, or `stale`) includes `projectVerificationCoverage`. `configured` carries non-empty sorted `checkIds`, not a pass. `not-configured` distinguishes `engine-default` (source absent at population), `empty-operator-manifest` (explicit zero project checks), and `historical-unknown` (archived reserved-only receipt without source provenance). Reserved-only suites remain eligible to advance when the existing gates pass; report “Reserved checks accepted; Project verification NOT CONFIGURED,” not “project verification passed.” Completed schema-v2 coverage comes from the archived receipt roster, never today's manifest. `legacy-unavailable` remains unavailable without invented coverage. These are read-model facts, not new persisted authority or waivers.
 
 Raw state inspection remains useful for diagnosis, but it is not gate logic:
 
@@ -317,28 +320,54 @@ Without `LOOM_RUN_MODEL_CALIBRATION=1`, the script exits without running models.
 
 ## Development validation
 
-From `engine/`:
+### Locked bootstrap and mandatory full gate
+
+The development/CI baseline is non-root Linux, Node **22.23.2**, Bun **1.3.13**, npm, Git, jq, Bash **4+**, and GNU `timeout` on PATH. Runtime support for macOS 13+ is not a claim that this verification change was tested there; macOS would also need the development tools, including GNU coreutils and a suitable Bash.
+
+From the Loom repository root:
 
 ```bash
-bun run typecheck
-bun run test:unit
-bun run test:smoke
-# complete project validation:
-bun test
+bun install --frozen-lockfile
+(cd engine && bun install --frozen-lockfile)
+npm run verify
 ```
 
-`bun test` runs unit/property/integration tests and smoke scripts. Smoke coverage includes architecture panel, refutation panel, standalone review, registered orchestration façades, and Pi resource rendering.
+Both locks are required: root dependencies supply Pi/runtime resources; engine dependencies supply the compiler and Vitest. `preverify` checks required tools, executable local Vitest/Pi, and that Pi resolves to the root-local locked CLI through npm's PATH. No global/latest Pi or network-fetching compiler fallback is accepted. Local preflight checks availability, not exact runtime versions; CI explicitly checks the pinned Node/Bun versions.
 
-Useful focused checks:
+The same **root `npm run verify`** runs locally, in `.github/workflows/ci.yml` for PRs/branch pushes/tags, and through this repository's runtime Verification Manifest. CI installs both frozen graphs, preserves failures through `pipefail`, and attempts log artifact upload even after failure. It has a 30-minute job budget; the manifest separately bounds its command to 30 minutes. Neither is proof of a successful hosted CI run.
+
+Root `verify` delegates to engine `verify`: prerequisites → typecheck → existing `test`. That test script runs the entire existing Vitest suite (including property/integration tests) followed by all six unchanged smoke commands, once each on success:
+
+1. `scripts/smoke-panel-mode.sh`
+2. `scripts/smoke-review-panel.sh`
+3. `scripts/smoke-standalone-review.sh`
+4. `scripts/smoke-orchestration-facades.ts`
+5. `scripts/smoke-pi-resources.sh`
+6. `artifacts/tests/test-validate-task-graph.sh`
+
+Failure stops later stages. The existing test scripts normalize `PI_CODING_AGENT` for their subprocesses; do not replace them with Bun's built-in test runner. The mandatory full gate has **no file/test selectors or omitted smoke tier**. Existing platform-dependent skips must be reported (for example the Darwin-only filesystem case on Linux), not hidden behind a universal zero-skips claim. Live-model calibration remains opt-in and outside this gate.
+
+### Compiler boundary
+
+`engine/scripts/typecheck.ts` uses the explicitly installed TypeScript API with `noEmit`, `noUnusedLocals`, and `noUnusedParameters`. `engine/tsconfig.json` owns all `src`, `tests`, `../pi`, and `scripts/typecheck.ts` roots. Standalone repository-root scripts are not all explicit compiler roots; imported portions may be checked transitively.
+
+Only TS6133/TS6192/TS6196 unused diagnostics on compiler-proven external raw TypeScript, excluding declaration files and explicit roots, are non-fatal. Each original file/position/code/message remains visible. Owned diagnostics, ordinary external dependency errors, config/input failures, and compiler infrastructure failures remain fatal. This intentionally replaces the old fail-open path grep; `skipLibCheck` cannot suppress raw-source unused diagnostics. `typecheck:unused` is an alias of the same complete gate, not a weaker path.
+
+### Focused iteration (not full-gate evidence)
 
 ```bash
-cd engine
-bunx vitest run tests/runbook-contract.test.ts tests/panel-config.test.ts
-bunx vitest run tests/handlers/helpers/orchestration.test.ts
-bunx vitest run tests/pi-extension-review-events.test.ts
+npm --prefix engine run typecheck
+npm --prefix engine run test:unit -- tests/runbook-contract.test.ts tests/panel-config.test.ts
+npm --prefix engine run test:unit -- tests/handlers/helpers/orchestration.test.ts
+npm --prefix engine run test:unit -- tests/pi-extension-review-events.test.ts
+npm --prefix engine run test:smoke
+# entire test script without the compiler gate:
+npm --prefix engine run test
+# equivalent package-script invocation from engine/:
+# bun run test
 ```
 
-Do not claim full validation when concurrent work in the repository prevents a clean complete run; report exactly which checks were executed.
+**Bare `bun test` is Bun's built-in runner, not `npm run test` / `bun run test`.** Report the exact command, exit status, test counts/skips, smoke completion or not-run stages, and environment. Focused green checks or separately green tiers are not a green canonical run. Do not claim full validation when concurrent work prevents a complete run on the final tree.
 
 ## Repository map for operators
 

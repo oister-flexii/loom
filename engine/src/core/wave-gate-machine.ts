@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { match } from "ts-pattern";
 import { reviewedWorkspaceDrift, type ReviewedWorkspaceObservation } from "./reviewed-workspace";
 import type {
   ActiveWaveGateRegistration,
@@ -46,6 +47,8 @@ import { compareStrings } from "./ordering";
 import {
   authorizeWaveCompletionSuite,
   defaultVerificationManifest,
+  deriveProjectVerificationCoverage,
+  renderProjectVerificationCoverage,
 } from "./verification-manifest";
 import { WAVE_REVIEW_AGENTS } from "./model-profiles";
 import { deriveImplementationRetryDisposition } from "./implementation-retry";
@@ -815,7 +818,7 @@ function completionEvaluationFailureDetail(
   return `persisted completion result is invalid for current authority: ${kinds.join(", ")}`;
 }
 
-type RequiredWaveCompletionSuite = Extract<WaveCompletionSuiteReadiness, { kind: "required" }>;
+type RequiredWaveCompletionSuite = Omit<Extract<WaveCompletionSuiteReadiness, { kind: "required" }>, "projectVerificationCoverage">;
 
 function requiredWaveCompletionSuite(
   reason: RequiredWaveCompletionSuite["reason"],
@@ -861,14 +864,12 @@ function parseWorkspaceObservation(
     : canonicalRecord({ ok: true, value: currentWorkspace });
 }
 
-/** Pure canonical status for active or terminal Wave completion-suite evidence. */
-export function deriveWaveCompletionSuiteReadiness(
+function deriveCompletionSuiteOutcome(
   graph: TaskGraph,
-  wave: number | null,
+  source: CompletionSuiteReadinessSource,
   currentWorkspace: WaveWorkspaceObservation | undefined,
-  currentResult: WaveCompletionResultObservation | undefined = undefined,
-): WaveCompletionSuiteReadiness {
-  const source = completionSuiteReadinessSource(graph, wave);
+  currentResult: WaveCompletionResultObservation | undefined,
+) {
   const manifest = graph.verification_manifest;
   const manifestDigest = manifest?.manifestDigest ?? null;
   if (source.receipt === undefined) {
@@ -1004,6 +1005,22 @@ export function deriveWaveCompletionSuiteReadiness(
   });
 }
 
+/** Configuration coverage and suite outcome are independent projections of protected authority. */
+export function deriveWaveCompletionSuiteReadiness(
+  graph: TaskGraph,
+  wave: number | null,
+  currentWorkspace: WaveWorkspaceObservation | undefined,
+  currentResult: WaveCompletionResultObservation | undefined = undefined,
+): WaveCompletionSuiteReadiness {
+  const source = completionSuiteReadinessSource(graph, wave);
+  const outcome = deriveCompletionSuiteOutcome(graph, source, currentWorkspace, currentResult);
+  if (outcome.kind === "legacy-unavailable") return outcome;
+  const authority = source.terminal && source.receipt !== undefined
+    ? source.receipt
+    : graph.verification_manifest ?? defaultVerificationManifest();
+  return canonicalRecord({ ...outcome, projectVerificationCoverage: deriveProjectVerificationCoverage(authority) });
+}
+
 export function checkWaveCompletionSuite(
   state: TaskGraph,
   wave: number,
@@ -1011,27 +1028,29 @@ export function checkWaveCompletionSuite(
   currentResult: WaveCompletionResultObservation | undefined = undefined,
 ): GateCheck {
   const readiness = deriveWaveCompletionSuiteReadiness(state, wave, currentWorkspace, currentResult);
-  switch (readiness.kind) {
-    case "legacy-unavailable":
-      return pass("4. Wave completion suite: legacy-unavailable (verification_manifest and active receipt absent).");
-    case "required":
-      return fail(`FAILED: Wave completion suite required (${readiness.reason}): ${readiness.detail}.`);
-    case "rejected":
-      return fail(
-        `FAILED: Wave completion suite rejected (${readiness.failureKinds.join(", ")}): ` +
-        `${readiness.checkIds.join(", ")}.`,
-      );
-    case "stale":
-      return fail(
-        "FAILED: accepted Wave completion suite is stale: " +
-        `accepted workspace ${readiness.acceptedWorkspaceDigest}, current workspace ${readiness.currentWorkspaceDigest}.`,
-      );
-    case "accepted":
-      return pass(
-        `4. Wave completion suite accepted (${readiness.checkCount} checks; ` +
-        `result ${readiness.resultDigest}; workspace ${readiness.workspaceDigest}).`,
-      );
-  }
+  return match(readiness)
+    .with({ kind: "legacy-unavailable" }, () =>
+      pass("4. Wave completion suite: legacy-unavailable (verification_manifest and active receipt absent)."))
+    .with({ kind: "required" }, (value) => fail(
+      `FAILED: Wave completion suite required (${value.reason}): ${value.detail}. ` +
+      renderProjectVerificationCoverage(value.projectVerificationCoverage),
+    ))
+    .with({ kind: "rejected" }, (value) => fail(
+      `FAILED: Wave completion suite rejected (${value.failureKinds.join(", ")}): ${value.checkIds.join(", ")}. ` +
+      renderProjectVerificationCoverage(value.projectVerificationCoverage),
+    ))
+    .with({ kind: "stale" }, (value) => fail(
+      "FAILED: accepted Wave completion suite is stale: " +
+      `accepted workspace ${value.acceptedWorkspaceDigest}, current workspace ${value.currentWorkspaceDigest}. ` +
+      renderProjectVerificationCoverage(value.projectVerificationCoverage),
+    ))
+    .with({ kind: "accepted" }, (value) => pass(
+      `4. Wave completion suite accepted (${value.checkCount} checks; ` +
+      `result ${value.resultDigest}; workspace ${value.workspaceDigest}). ` +
+      (value.projectVerificationCoverage.kind === "not-configured" ? "Reserved checks accepted; " : "") +
+      renderProjectVerificationCoverage(value.projectVerificationCoverage),
+    ))
+    .exhaustive();
 }
 
 export function checkReviewedWorkspace(tasks: readonly Task[], deps: GateDeps): GateCheck {
@@ -2883,6 +2902,12 @@ export function renderLoomStatusJson(status: LoomStatus): string {
   return JSON.stringify(status, null, 2);
 }
 
+function projectCoverageDiagnostic(status: LoomStatus): readonly string[] {
+  const fact = status.facts.waveCompletionSuiteReadiness;
+  if (fact.kind === "unavailable" || fact.value.kind === "legacy-unavailable") return [];
+  return [`- ${renderProjectVerificationCoverage(fact.value.projectVerificationCoverage)}`];
+}
+
 /** Versioned human renderer over the same value used by the JSON renderer. */
 export function renderLoomStatusHuman(status: LoomStatus): string {
   const fact = (name: keyof CanonicalStatusFacts): string => {
@@ -2905,6 +2930,7 @@ export function renderLoomStatusHuman(status: LoomStatus): string {
   return [
     `Loom Status v${status.schemaVersion}`,
     ...categories.map(fact),
+    ...projectCoverageDiagnostic(status),
     `- nextAction: ${status.next.action.kind}`,
     `- nextActionPayload: ${JSON.stringify(status.next.action)}`,
     "- reasons:",

@@ -4,6 +4,9 @@
   "description": "Loom orchestration system - multi-phase task decomposition with wave-based parallel execution",
   "keywords": ["pi-package"],
   "type": "module",
+  "scripts": {
+    "verify": "npm --prefix engine run verify"
+  },
   "author": { "name": "peterstorm" },
   "pi": {
     "extensions": ["./pi/extension.ts"],

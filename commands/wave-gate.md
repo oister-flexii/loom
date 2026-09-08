@@ -25,7 +25,7 @@ Resolve the active Loom package once:
 
 ```bash
 LOOM_DIR="${CLAUDE_PLUGIN_ROOT}"
-test -f "$LOOM_DIR/engine/src/cli.ts" || exit 1
+test -f "$LOOM_DIR/engine/src/cli.ts" || { echo "FATAL: active Loom package is incomplete: $LOOM_DIR. Repair or reinstall that package, then retry /wave-gate." >&2; exit 1; }
 ```
 
 Name one fresh Run Directory, then start the registered program. The engine
@@ -51,7 +51,7 @@ Execute only the one typed action returned by `start`, `resume`, or `decide`:
 - `await-user`: present the advisory disposition request exactly as supplied;
   send the resulting JSON object through `decide`.
 - `blocked`: stop and report the diagnostic. Do not bypass or reconstruct it.
-- `done`: report the completion receipt and newly protected Wave state.
+- `done`: report the completion receipt and newly protected Wave state, alongside the canonical Project Verification Coverage described below. The receipt alone does not claim every project verification category passed.
 
 After a harness batch finishes, resume the same run:
 
@@ -76,6 +76,26 @@ Resume is idempotent. Pi and Claude persist exact native-id/request bindings and
 raw final bytes directly into engine-declared slots. Never write transcripts,
 build manifests, select models, tally findings, mutate the protected State File,
 or stage deterministic operation output in the parent.
+
+## Completion suite and Project Verification Coverage
+
+The registered program executes the frozen quiescent Wave completion suite after implementation proof/test readiness and before review publication. It owns command execution, immutable results, protected acceptance, and replay; do not run a substitute command or create a receipt manually. Loom's own `.loom/verification-manifest.json` configures `project:verify`: root `npm run verify`, Wave scope, cwd `.`, 30-minute timeout, report not required. Local development and Linux CI (including tags) use that same root command: prerequisites → engine typecheck → the entire existing Vitest suite → all six smokes. Install both frozen dependency graphs first; do not add selectors, drop a smoke, use bare `bun test`, or make `verify` recurse into manifest/Wave Gate execution. See `docs/operations.md` for tools, compiler policy, and platform-skip reporting.
+
+Read coverage through the existing read-only status seam, including after `done`:
+
+```bash
+bun ${LOOM_DIR}/engine/src/cli.ts helper orchestration status --json \
+  --runs-root ".claude/reviews/wave-gate-runs"
+```
+
+Relay `waveCompletionSuiteReadiness` and its independent `projectVerificationCoverage`; do not reconstruct coverage from a check count or today's source file:
+
+- `configured` has non-empty sorted `checkIds`. Configuration is not a pass; only accepted suite evidence establishes those commands' acceptance.
+- `not-configured` with `engine-default` means source absent at population; `empty-operator-manifest` means explicit zero project checks. Both preserve legitimate engine-only advancement. Report **Reserved checks accepted; Project verification NOT CONFIGURED**, not “project verification passed.”
+- Completed schema-v2 Waves use the archived receipt roster. Reserved-only history has reason `historical-unknown`, because the receipt cannot distinguish absent from empty source.
+- `legacy-unavailable` remains unavailable without invented coverage. Required/rejected/stale outcomes do not become passing because checks are configured.
+
+Coverage adds no persisted authority, receipt fields, waiver, strict all-projects requirement, or claim that unconfigured test/build/typecheck categories ran. Source installation must precede population via `write-verification-manifest`; subsequent edits do not replace frozen commands.
 
 ## Retiring a Wave Gate blocked by legacy Requirement scope
 

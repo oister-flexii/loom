@@ -17,7 +17,7 @@ Orchestrates the COMPLETE feature lifecycle: brainstorm → specify → clarify 
 
 **BEFORE starting any phase**, run this check:
 ```bash
-command -v bun || echo "FATAL: bun not found. Run: nix develop ./.claude"
+command -v bun || { echo "FATAL: bun not found. Run: nix develop ./.claude" >&2; exit 1; }
 ```
 If `bun` is missing, **STOP and tell the user**. Loom hooks require bun for TypeScript transcript parsing. Dev shell: `nix develop ./.claude`
 
@@ -502,7 +502,9 @@ JSON
 bun ${LOOM_DIR}/engine/src/cli.ts helper write-verification-manifest < /tmp/loom-verification-manifest.json
 ```
 
-Replace the empty `checks` array with the operator-approved fixed executable/argument arrays. Never copy a model-authored shell string into the manifest. Direct Bash/Edit/Write access to `.loom/verification-manifest.json` is intentionally blocked after the State File activates; the helper is the sole installation seam, validates before writing, refuses symlinks and conflicting replacement, and becomes immutable once Tasks are populated. If no file exists, population freezes the engine default containing only reserved checks.
+The empty `checks` example explicitly configures **no project verification**; it is not a passing test/build/typecheck setup. Preserve an existing operator source rather than replacing it with this example. For Loom's own repository, use its existing `project:verify` check: executable `npm`, args `["run", "verify"]`, cwd `.`, scope `wave`, timeout `1800000`, report `{"kind":"not-required"}`. This runs the same root `npm run verify` as local/CI/tag validation, with both frozen dependency installs required (see `docs/operations.md`). Never wire that script back into manifest execution or a Wave Gate.
+
+Replace the empty `checks` array with the operator-approved fixed executable/argument arrays. Never copy a model-authored shell string into the manifest. Direct Bash/Edit/Write access to `.loom/verification-manifest.json` is intentionally blocked after the State File activates; the helper is the sole installation seam, validates before writing, refuses symlinks and conflicting replacement, and becomes immutable once Tasks are populated. If no file exists, population freezes the engine default containing only reserved checks. The helper needs the canonical empty TaskGraph already created by official `init-state`; it is not a standalone arbitrary-path writer. An operator-only metadata bootstrap must use that initializer and sanctioned `cleanup-state` afterward, not manufactured Tasks/Waves or hand-written state (see `docs/workflows.md`).
 
 **A. GitHub Issue:**
 ```bash
@@ -521,6 +523,7 @@ This helper:
 - Requires and persists `spec_trace_version: 2`, sanitizing both Task trace arrays
 - Reads existing state (phase tracking fields)
 - Reads, exactly parses, and freezes `.loom/verification-manifest.json` directly from the repository; decompose output cannot provide command authority
+- Reports Project Verification Coverage immediately: `configured` with non-empty check IDs, or `not-configured` with `engine-default` / `empty-operator-manifest`; later source edits cannot re-freeze this TaskGraph
 - Merges with validated decompose output (tasks, waves)
 - Adds `github_issue`, `spec_file`, `plan_file`, `current_wave: 1`
 - Initializes `wave_gates`, `executing_tasks`
@@ -782,7 +785,9 @@ bun ${LOOM_DIR}/engine/src/cli.ts helper orchestration status --json   # machine
 
 It reports active Phase and Wave, an exhaustive five-way Task partition,
 failed proof obligations, test readiness, Review Run roster gaps and evidence
-failures, the four Finding counts, Refutation Panel need, quiescent Wave completion-suite readiness/result failures, Wave Gate completion eligibility, exactly one typed next action, and every contributing reason. Status reads persisted result authority but never executes verification commands.
+failures, the four Finding counts, Refutation Panel need, quiescent Wave completion-suite readiness/result failures and independent `projectVerificationCoverage`, Wave Gate completion eligibility, exactly one typed next action, and every contributing reason. Status reads persisted result authority but never executes verification commands.
+
+Relay coverage alongside outcome: `configured` carries non-empty sorted `checkIds` but is not a pass; `not-configured` distinguishes absent source (`engine-default`), explicit zero checks (`empty-operator-manifest`), and archived reserved-only evidence with unavailable source provenance (`historical-unknown`). Engine-only suites may still advance, but report reserved-check acceptance and **Project verification NOT CONFIGURED**, never “project verification passed.” Completed schema-v2 coverage comes from the archived receipt roster, not the live manifest. `legacy-unavailable` supplies no fabricated coverage. This projection is not a new persisted field, waiver, or strict all-projects requirement. Report configured command results only from accepted suite evidence; never create that receipt yourself.
 
 The `jq` recipes below read raw fields directly. They remain useful for
 inspecting a specific stored value, but they do NOT reproduce the engine's

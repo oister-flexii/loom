@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "kind": "loom-verification-manifest",
+  "checks": [
+    {
+      "id": "project:verify",
+      "scope": "wave",
+      "executable": "npm",
+      "args": [
+        "run",
+        "verify"
+      ],
+      "cwd": ".",
+      "timeoutMs": 1800000,
+      "report": {
+        "kind": "not-required"
+      }
+    }
+  ]
+}

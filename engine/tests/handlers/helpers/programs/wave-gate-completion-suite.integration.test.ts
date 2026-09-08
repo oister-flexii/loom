@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 import { canonicalTempDir } from "../../../fixtures/canonical-temp-dir";
 import { afterEach, describe, expect, it } from "vitest";
 import { evaluateTaskProof } from "../../../../src/core/proof-obligations";
-import { freezeVerificationManifest } from "../../../../src/core/verification-manifest";
+import { defaultVerificationManifest, freezeVerificationManifest, type FrozenVerificationManifest } from "../../../../src/core/verification-manifest";
 import { parseNewTestEvidence, type TaskGraph } from "../../../../src/types";
 
 const ENGINE = fileURLToPath(new URL("../../../../", import.meta.url));
@@ -45,11 +45,11 @@ const proof = (() => {
   return evaluated;
 })();
 
-function operatorManifest() {
+function operatorManifest(roster: "empty" | "sentinel" = "sentinel") {
   const parsed = freezeVerificationManifest(new TextEncoder().encode(JSON.stringify({
     schemaVersion: 1,
     kind: "loom-verification-manifest",
-    checks: [{
+    checks: roster === "empty" ? [] : [{
       id: "project:sentinel",
       scope: "wave",
       executable: "node",
@@ -65,6 +65,7 @@ function operatorManifest() {
 
 function repository(options: Readonly<{
   modern: boolean;
+  manifest?: FrozenVerificationManifest;
   executing?: boolean;
   suiteOutcome?: "accepted" | "nonzero" | "missing-report";
 }> = { modern: true }): string {
@@ -124,7 +125,7 @@ if (outcome === "nonzero") process.exit(7);
     }],
     ...(options.executing ? { executing_tasks: ["T1"] } : {}),
     wave_gates: {},
-    ...(options.modern ? { verification_manifest: operatorManifest() } : {}),
+    ...(options.modern ? { verification_manifest: options.manifest ?? operatorManifest() } : {}),
   };
   const statePath = join(root, ".claude/state/active_task_graph.json");
   write(root, ".claude/state/active_task_graph.json", JSON.stringify(graph, null, 2));
@@ -133,7 +134,7 @@ if (outcome === "nonzero") process.exit(7);
   return root;
 }
 
-function cli(
+function invokeCli(
   root: string,
   args: readonly string[],
   stdin = "",
@@ -153,7 +154,11 @@ function cli(
     encoding: "utf8",
   });
   if (result.status !== 0) throw new Error(`${result.stderr}\n${result.stdout}`);
-  return JSON.parse(result.stdout) as Record<string, unknown>;
+  return result.stdout;
+}
+
+function cli(...args: Parameters<typeof invokeCli>) {
+  return JSON.parse(invokeCli(...args)) as Record<string, unknown>;
 }
 
 function start(
@@ -211,6 +216,45 @@ afterEach(() => {
 });
 
 describe("Wave Gate façade completion-suite integration", () => {
+  it.each([
+    [defaultVerificationManifest(), { kind: "not-configured", reason: "engine-default" }, 0],
+    [operatorManifest("empty"), { kind: "not-configured", reason: "empty-operator-manifest" }, 0],
+    [operatorManifest(), { kind: "configured", checkIds: ["project:sentinel"] }, 1],
+  ] as const)("registered façade reports coverage, not inferred project success: %j", (manifest, coverage, expectedCount) => {
+    const root = repository({ modern: true, manifest });
+    const outside = canonicalTempDir("loom-coverage-status-outside-");
+    roots.push(outside);
+    const runId = "run.coverage";
+    const diagnostic = coverage.kind === "configured" ? "checks configured: project:sentinel" : "NOT CONFIGURED";
+    const unstartedStatus = cli(root, ["status", "--json"], "", outside);
+    expect(start(root, runId, outside)).toMatchObject({ kind: "spawn-batch" });
+    const acceptedState = readFileSync(join(root, ".claude/state/active_task_graph.json"), "utf8");
+    expect(cli(root, ["status", "--json"], "", outside)).toMatchObject({
+      facts: { waveCompletionSuiteReadiness: { value: { kind: "accepted", projectVerificationCoverage: coverage } } },
+    });
+    expect(invokeCli(root, ["status"], "", outside)).toContain(diagnostic);
+    expect(unstartedStatus).toMatchObject({
+      facts: { waveCompletionSuiteReadiness: { value: { kind: "required", projectVerificationCoverage: coverage } } },
+    });
+    expect(readFileSync(join(root, ".claude/state/active_task_graph.json"), "utf8")).toBe(acceptedState);
+    expect(sentinelCount(root)).toBe(expectedCount);
+    expect(resume(root, runId, outside)).toMatchObject({ kind: "spawn-batch" });
+    expect(sentinelCount(root)).toBe(expectedCount);
+
+    // Source bytes are workspace evidence, never a new command roster after population.
+    write(root, ".loom/verification-manifest.json", JSON.stringify({
+      schemaVersion: 1, kind: "loom-verification-manifest", checks: [],
+    }));
+    const beforeStatus = readFileSync(join(root, ".claude/state/active_task_graph.json"), "utf8");
+    expect(cli(root, ["status", "--json"], "", outside)).toMatchObject({
+      facts: { waveCompletionSuiteReadiness: { value: { kind: "stale", projectVerificationCoverage: coverage } } },
+    });
+    expect(invokeCli(root, ["status"], "", outside)).toContain(diagnostic);
+    expect(graph(root).verification_manifest).toEqual(manifest);
+    expect(readFileSync(join(root, ".claude/state/active_task_graph.json"), "utf8")).toBe(beforeStatus);
+    expect(sentinelCount(root)).toBe(expectedCount);
+  });
+
   it("treats only an absent Wave Gate sentinel as zero", () => {
     const root = canonicalTempDir("loom-wave-facade-counter-");
     roots.push(root);
@@ -287,12 +331,14 @@ describe("Wave Gate façade completion-suite integration", () => {
           kind: "known",
           value: {
             kind: "rejected",
+            projectVerificationCoverage: { kind: "configured", checkIds: ["project:sentinel"] },
             failureKinds: [failureKind],
             checkIds: ["project:sentinel"],
           },
         },
       },
     });
+    expect(invokeCli(root, ["status"])).toContain("checks configured: project:sentinel (configuration is not a pass)");
     expect(sentinelCount(root)).toBe(expectedCount);
   });
 

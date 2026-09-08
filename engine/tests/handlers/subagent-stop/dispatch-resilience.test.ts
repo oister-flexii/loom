@@ -7,7 +7,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
  *   not whatever file is on disk when it runs
  */
 
-import { describe, it, expect, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { join } from "node:path";
 import { canonicalTempDir } from "../../fixtures/canonical-temp-dir";
 import dispatch, { runDispatch } from "../../../src/handlers/subagent-stop/dispatch";
@@ -20,6 +20,7 @@ import { agentRequestAuthority } from "../../fixtures/agent-request-authority";
 import { openRunDirectory } from "../../../src/orchestration/run-directory-handle";
 import { buildContextPacket, encodeByteSection } from "../../../src/core/context-packets";
 import { reportSummary } from "../../machine/report-summary";
+import { resolveTaskGraph } from "../../../src/state-manager";
 
 const run = `dispatch-resilience-${process.pid}-${Date.now()}`;
 const sid = (name: string) => `${run}-${name}`;
@@ -33,13 +34,26 @@ function tempDir(): string {
   return dir;
 }
 
+const originalCwd = process.cwd();
+
+beforeEach(() => {
+  const cwd = tempDir();
+  process.chdir(cwd);
+  vi.stubEnv("LOOM_STATE_PATH", join(cwd, "active_task_graph.json"));
+  vi.stubEnv("CLAUDE_PROJECT_DIR", cwd);
+  vi.stubEnv("CLAUDE_CONFIG_DIR", join(cwd, "claude-config"));
+  vi.stubEnv("LOOM_ORCHESTRATION_RUNS_ROOT", undefined);
+  vi.stubEnv("LOOM_ORCHESTRATION_RUN_DIR", undefined);
+  expect(resolveTaskGraph()).toBeNull();
+});
+
 afterEach(() => {
+  process.chdir(originalCwd);
+  vi.unstubAllEnvs();
   for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
   dirs = [];
   for (const f of sessionFiles) {
-    try {
-      rmSync(f, { recursive: true, force: true });
-    } catch {}
+    rmSync(f, { recursive: true, force: true });
   }
   sessionFiles = [];
   vi.restoreAllMocks();
@@ -271,7 +285,12 @@ describe("request-bound capture gates legacy dispatch", () => {
     }
   });
 
-  it("terminates a captured graphless standalone review without consulting faulting agent metadata", async () => {
+  it.each([false, true])("terminates a captured standalone review without consulting faulting metadata (presentGraph=%s)", async (presentGraph) => {
+    const session = sid("standalone");
+    const statePath = join(process.cwd(), "active_task_graph.json");
+    if (presentGraph) pointSessionAt(session, writeState(process.cwd()));
+    expect(resolveTaskGraph()).toBe(presentGraph ? statePath : null);
+    const graphBefore = presentGraph ? readFileSync(statePath, "utf8") : null;
     const dir = tempDir();
     const runsRoot = join(dir, "runs");
     const runDir = join(runsRoot, "run.graphless-standalone-capture");
@@ -327,7 +346,7 @@ describe("request-bound capture gates legacy dispatch", () => {
     process.env.CLAUDE_PROJECT_DIR = project;
     try {
       const result = await runDispatch(JSON.stringify({
-        session_id: sid("graphless-standalone"),
+        session_id: session,
         agent_id: "agent-graphless-standalone",
         agent_transcript_path: transcriptPath,
       }), [], cleanup);
@@ -337,6 +356,8 @@ describe("request-bound capture gates legacy dispatch", () => {
       const captured = opened.value.readTranscriptBytes(request);
       expect(captured.ok).toBe(true);
       if (captured.ok) expect(Buffer.from(captured.value).toString("utf8")).toBe(capturedBytes);
+      if (presentGraph) expect(readFileSync(statePath, "utf8")).toBe(graphBefore);
+      else expect(resolveTaskGraph()).toBeNull();
     } finally {
       if (previousRoot === undefined) delete process.env.LOOM_ORCHESTRATION_RUNS_ROOT;
       else process.env.LOOM_ORCHESTRATION_RUNS_ROOT = previousRoot;
@@ -420,12 +441,29 @@ describe("malformed hook input is caught instead of escaping cleanup", () => {
     expect(cleanup).not.toHaveBeenCalled();
   });
 
-  it("mark-subagent-active: malformed stdin → passthrough + loud stderr", async () => {
+  it("mark-subagent-active: malformed stdin without a TaskGraph → passthrough + loud stderr", async () => {
     const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const result = await markActive("{not json", []);
     expect(result.kind).toBe("passthrough");
     const text = stderrSpy.mock.calls.map((c) => String(c[0])).join("");
     expect(text).toContain("agent not tracked");
+    expect(text).toContain("no TaskGraph exists");
+    expect(resolveTaskGraph()).toBeNull();
+  });
+
+  it("mark-subagent-active: malformed stdin with a real TaskGraph blocks without changing it", async () => {
+    const statePath = writeState(process.cwd());
+    const graphBefore = readFileSync(statePath, "utf8");
+    expect(resolveTaskGraph()).toBe(statePath);
+
+    const result = await markActive("{not json", []);
+
+    expect(result).toMatchObject({
+      kind: "block",
+      message: expect.stringContaining(`TaskGraph ${statePath} is active`),
+    });
+    if (result.kind === "block") expect(result.message).toContain("refusing spawn");
+    expect(readFileSync(statePath, "utf8")).toBe(graphBefore);
   });
 });
 
@@ -448,8 +486,8 @@ describe("dispatch names what it discarded (audit diagnostics)", () => {
   };
 
   it("says the whole record was skipped when no task graph resolves", async () => {
-    // Session bound to nothing: StateManager.fromSession returns null, so
-    // status, evidence and findings are ALL skipped.
+    // No session pointer and no local graph: resolution refuses authority,
+    // so status, evidence and findings are ALL skipped.
     const text = await stderrOf({
       session_id: sid("no-graph-at-all"),
       agent_id: "agent-no-graph",
@@ -467,6 +505,26 @@ describe("dispatch names what it discarded (audit diagnostics)", () => {
     });
     expect(text).toContain("no task graph resolvable");
     expect(text).toContain("recorded NOTHING");
+  });
+
+  it.each([
+    ["code-implementer-agent", "error"],
+    ["some-users-own-agent", "passthrough"],
+  ] as const)("does not substitute a present local TaskGraph for an unbound %s session", async (agentType, expectedKind) => {
+    const statePath = writeState(process.cwd());
+    const graphBefore = readFileSync(statePath, "utf8");
+    expect(resolveTaskGraph()).toBe(statePath);
+
+    const text = await stderrOf({
+      session_id: sid("unbound-with-local-graph"),
+      agent_id: "agent-unbound",
+      agent_type: agentType,
+    }, expectedKind);
+
+    expect(text).toContain("no task graph resolvable");
+    expect(text).toContain("recorded NOTHING");
+    expect(text).toContain("refusing local task-graph fallback");
+    expect(readFileSync(statePath, "utf8")).toBe(graphBefore);
   });
 
   it("preserves recorded-NOTHING and cleanup diagnostics when graph resolution and cleanup both fail", async () => {

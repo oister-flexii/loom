@@ -310,16 +310,21 @@ Interactive phase interviews use the dedicated RPC transport; non-interactive re
 
 ## Development
 
+Use Node **22.23.2**, Bun **1.3.13**, npm, Git, jq, Bash **4+**, and GNU `timeout`. Install both existing lockfiles from the repository root; the Pi smoke requires the root-local locked Pi CLI, not a global/latest installation.
+
 ```bash
-cd engine
-bun run typecheck
-bun run test:unit
-bun run test:smoke
-# unit + smoke
-bun test
+bun install --frozen-lockfile
+(cd engine && bun install --frozen-lockfile)
+npm run verify
 ```
 
-The suite includes unit, property, fault-injection, integration, cross-harness, runbook-contract, and smoke coverage.
+`npm run verify` is the mandatory full gate for local development, Linux CI (PRs, branch pushes, and tags), and this repository's configured runtime Wave check. It delegates to `engine` prerequisites, then typecheck, then the entire existing Vitest suite and all six smoke commands, stopping on failure. Do not substitute selectors or focused tests for this gate.
+
+The compiler checks all configured `engine/src`, `engine/tests`, `pi`, and `engine/scripts/typecheck.ts` roots. Only external raw-TypeScript unused diagnostics TS6133/6192/6196 may be excluded, and each exclusion is printed; ordinary dependency errors remain fatal. This does not claim every standalone root script as a compiler root.
+
+For tests without the compiler gate, use `npm --prefix engine run test` (or `cd engine && bun run test`). **Bare `bun test` invokes Bun's built-in runner, not the package's Vitest + smoke script.** The suite includes unit, property, fault-injection, integration, cross-harness, runbook-contract, and smoke coverage. Report platform-dependent skips and not-run stages explicitly; Linux validation is not evidence of macOS validation.
+
+The operator source `.loom/verification-manifest.json` selects `project:verify` (`npm run verify`, root cwd, Wave scope, 30-minute timeout, no required report). Population freezes it; configuration is not a passing result. See [Verification manifest](docs/workflows.md#verification-manifest) for installation and coverage semantics.
 
 Useful package operations:
 
