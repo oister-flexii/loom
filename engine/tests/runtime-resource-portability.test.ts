@@ -5,8 +5,10 @@ import { dirname, extname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { execFileSync, spawnSync } from "node:child_process";
 import { renderMarkdownForPi } from "../src/core/harness-resources";
+import { resolveInitialState } from "../src/phase-init";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const CONFIG_URL = pathToFileURL(join(REPO_ROOT, "engine/src/config.ts")).href;
 const RUNTIME_TREES = ["agents", "commands", "skills", "references"] as const;
 const BUN = execFileSync("which", ["bun"], { encoding: "utf8" }).trim();
 
@@ -27,22 +29,47 @@ const FILES = RUNTIME_TREES.flatMap((tree) => markdownFiles(join(REPO_ROOT, tree
 const MARKDOWN_CASES = FILES.map((file) => [relative(REPO_ROOT, file), file] as const);
 const LEGACY_LOOM_CACHE = /\.claude\/plugins\/cache[^\n`]*loom|plugins\/cache\/plugins\/loom|LOOM_DIR=.*plugins\/cache/;
 
-describe("Pi harness detection", () => {
-  it("uses the Pi process marker when no agent-directory override is set", () => {
-    const env: NodeJS.ProcessEnv = { ...process.env, PI_CODING_AGENT: "true" };
-    delete env.PI_CODING_AGENT_DIR;
-    delete env.LOOM_STATE_PATH;
-    const run = spawnSync("bun", ["-e", [
-      'import { HARNESS, TASK_GRAPH_PATH, PROJECT_RULES_DIR } from "./engine/src/config.ts";',
-      "console.log(JSON.stringify({ HARNESS, TASK_GRAPH_PATH, PROJECT_RULES_DIR }));",
-    ].join(" ")], { cwd: REPO_ROOT, env, encoding: "utf-8" });
+// Discovery tests intentionally leave LOOM_STATE_PATH unset: only their
+// disposable cwd and explicit harness marker may decide native/legacy fallback.
+function discoveryEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  delete env.PI_CODING_AGENT;
+  delete env.PI_CODING_AGENT_DIR;
+  delete env.LOOM_STATE_PATH;
+  return env;
+}
 
-    expect(run.status, run.stderr).toBe(0);
-    expect(JSON.parse(run.stdout)).toEqual({
-      HARNESS: "pi",
-      TASK_GRAPH_PATH: ".pi/state/active_task_graph.json",
-      PROJECT_RULES_DIR: ".pi/linter/rules",
-    });
+describe("Pi harness detection", () => {
+  it.each([
+    ["absent", null, ".pi/state/active_task_graph.json"],
+    ["legacy", ".claude/state/active_task_graph.json", ".claude/state/active_task_graph.json"],
+    ["native", ".pi/state/active_task_graph.json", ".pi/state/active_task_graph.json"],
+  ] as const)("uses the Pi process marker with %s state and no agent-directory override", (_label, presentGraph, expectedPath) => {
+    const root = realpathSync.native(mkdtempSync(join(tmpdir(), "loom-pi-marker-")));
+    try {
+      execFileSync("git", ["init", "--quiet"], { cwd: root });
+      if (presentGraph !== null) {
+        mkdirSync(dirname(join(root, presentGraph)), { recursive: true });
+        writeFileSync(join(root, presentGraph), JSON.stringify(resolveInitialState({}, root)));
+      }
+      const run = spawnSync(BUN, ["-e", [
+        `import { HARNESS, TASK_GRAPH_PATH, PROJECT_RULES_DIR } from ${JSON.stringify(CONFIG_URL)};`,
+        "console.log(JSON.stringify({ HARNESS, TASK_GRAPH_PATH, PROJECT_RULES_DIR }));",
+      ].join(" ")], {
+        cwd: root,
+        env: { ...discoveryEnv(), PI_CODING_AGENT: "true" },
+        encoding: "utf-8",
+      });
+
+      expect(run.status, run.stderr).toBe(0);
+      expect(JSON.parse(run.stdout)).toEqual({
+        HARNESS: "pi",
+        TASK_GRAPH_PATH: expectedPath,
+        PROJECT_RULES_DIR: ".pi/linter/rules",
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("resumes legacy Claude state when Pi-native state is absent", () => {
@@ -51,15 +78,12 @@ describe("Pi harness detection", () => {
       execFileSync("git", ["init", "--quiet"], { cwd: root });
       const legacy = ".claude/state/active_task_graph.json";
       mkdirSync(join(root, ".claude", "state"), { recursive: true });
-      writeFileSync(join(root, legacy), "{}\n");
-      const configUrl = pathToFileURL(join(REPO_ROOT, "engine/src/config.ts")).href;
+      writeFileSync(join(root, legacy), JSON.stringify(resolveInitialState({}, root)));
       const script = [
-        `import { TASK_GRAPH_PATH, guardedDirs } from ${JSON.stringify(configUrl)};`,
+        `import { TASK_GRAPH_PATH, guardedDirs } from ${JSON.stringify(CONFIG_URL)};`,
         "console.log(JSON.stringify({ taskGraphPath: TASK_GRAPH_PATH, guardedDirs: guardedDirs() }));",
       ].join(" ");
-      const env: NodeJS.ProcessEnv = { ...process.env, PI_CODING_AGENT: "true" };
-      delete env.PI_CODING_AGENT_DIR;
-      delete env.LOOM_STATE_PATH;
+      const env: NodeJS.ProcessEnv = { ...discoveryEnv(), PI_CODING_AGENT: "true" };
       delete env.LOOM_SUBAGENT_DIR;
       delete env.LOOM_MACHINES_DIR;
 
@@ -77,7 +101,7 @@ describe("Pi harness detection", () => {
       expect(JSON.parse(walkUpRun.stdout).taskGraphPath).toBe(join(root, legacy));
 
       mkdirSync(join(root, ".pi", "state"), { recursive: true });
-      writeFileSync(join(root, ".pi", "state", "active_task_graph.json"), "{}\n");
+      writeFileSync(join(root, ".pi", "state", "active_task_graph.json"), JSON.stringify(resolveInitialState({}, root)));
       const nativeRun = spawnSync("bun", ["-e", script], { cwd: root, env, encoding: "utf-8" });
       expect(nativeRun.status, nativeRun.stderr).toBe(0);
       expect(JSON.parse(nativeRun.stdout).taskGraphPath).toBe(".pi/state/active_task_graph.json");
@@ -96,7 +120,7 @@ describe("Pi harness detection", () => {
 });
 
 describe("TaskGraph repository-root discovery", () => {
-  const configScript = `import { TASK_GRAPH_PATH } from ${JSON.stringify(pathToFileURL(join(REPO_ROOT, "engine/src/config.ts")).href)}; console.log(TASK_GRAPH_PATH);`;
+  const configScript = `import { TASK_GRAPH_PATH } from ${JSON.stringify(CONFIG_URL)}; console.log(TASK_GRAPH_PATH);`;
 
   function fakeGit(root: string, stderr: string, status: number): string {
     const bin = join(root, "bin");
@@ -119,7 +143,7 @@ describe("TaskGraph repository-root discovery", () => {
 
       const run = spawnSync(BUN, ["-e", configScript], {
         cwd: nested,
-        env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}` },
+        env: { ...discoveryEnv(), PATH: `${bin}:${process.env.PATH ?? ""}` },
         encoding: "utf8",
       });
 
@@ -142,7 +166,7 @@ describe("TaskGraph repository-root discovery", () => {
 
       const run = spawnSync(BUN, ["-e", configScript], {
         cwd: nested,
-        env: process.env,
+        env: discoveryEnv(),
         encoding: "utf8",
       });
 
@@ -164,7 +188,7 @@ describe("TaskGraph repository-root discovery", () => {
 
       const run = spawnSync(BUN, ["-e", configScript], {
         cwd: nested,
-        env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}` },
+        env: { ...discoveryEnv(), PATH: `${bin}:${process.env.PATH ?? ""}` },
         encoding: "utf8",
       });
 
@@ -182,7 +206,7 @@ describe("TaskGraph repository-root discovery", () => {
       mkdirSync(emptyPath);
       const run = spawnSync(BUN, ["-e", configScript], {
         cwd: root,
-        env: { ...process.env, PATH: emptyPath },
+        env: { ...discoveryEnv(), PATH: emptyPath },
         encoding: "utf8",
       });
 
@@ -200,7 +224,7 @@ describe("TaskGraph repository-root discovery", () => {
       const bin = fakeGit(root, "", 0);
       const run = spawnSync(BUN, ["-e", configScript], {
         cwd: root,
-        env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}` },
+        env: { ...discoveryEnv(), PATH: `${bin}:${process.env.PATH ?? ""}` },
         encoding: "utf8",
       });
 
@@ -217,7 +241,7 @@ describe("TaskGraph repository-root discovery", () => {
       const bin = fakeGit(root, "fatal: not a git repository (or any of the parent directories): .git", 128);
       const run = spawnSync(BUN, ["-e", configScript], {
         cwd: root,
-        env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}` },
+        env: { ...discoveryEnv(), PATH: `${bin}:${process.env.PATH ?? ""}` },
         encoding: "utf8",
       });
 

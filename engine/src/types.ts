@@ -23,7 +23,7 @@ import type {
   CompletionSemanticFailure,
   WaveCompletionSuiteResult,
 } from "./core/completion-suite";
-import type { FrozenVerificationManifest } from "./core/verification-manifest";
+import type { FrozenVerificationManifest, ProjectVerificationCoverage } from "./core/verification-manifest";
 import type { Phase } from "./core/phases";
 import type { SettledFloor, SpecIndexObservation } from "./core/requirement-coverage";
 export type { IssuedReviewPacketRegistration } from "./core/review-packet";
@@ -921,6 +921,7 @@ export type WaveCompletionSuiteReadiness =
     }>
   | Readonly<{
       kind: "required";
+      projectVerificationCoverage: ProjectVerificationCoverage;
       reason: WaveCompletionSuiteRequiredReason;
       detail: string;
       verificationManifestDigest: ArtifactDigest | null;
@@ -928,6 +929,7 @@ export type WaveCompletionSuiteReadiness =
     }>
   | Readonly<{
       kind: "accepted";
+      projectVerificationCoverage: ProjectVerificationCoverage;
       verificationManifestDigest: ArtifactDigest | null;
       suiteDigest: ArtifactDigest;
       resultDigest: ArtifactDigest;
@@ -936,6 +938,7 @@ export type WaveCompletionSuiteReadiness =
     }>
   | Readonly<{
       kind: "rejected";
+      projectVerificationCoverage: ProjectVerificationCoverage;
       verificationManifestDigest: ArtifactDigest;
       suiteDigest: ArtifactDigest;
       workspaceDigest: ArtifactDigest;
@@ -944,6 +947,7 @@ export type WaveCompletionSuiteReadiness =
     }>
   | Readonly<{
       kind: "stale";
+      projectVerificationCoverage: ProjectVerificationCoverage;
       verificationManifestDigest: ArtifactDigest | null;
       suiteDigest: ArtifactDigest;
       resultDigest: ArtifactDigest;

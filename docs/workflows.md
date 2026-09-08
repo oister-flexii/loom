@@ -117,7 +117,9 @@ Project-wide Wave checks are declared before Task population. Write the JSON to 
 bun ${LOOM_DIR}/engine/src/cli.ts helper write-verification-manifest < /tmp/loom-verification-manifest.json
 ```
 
-The helper validates before writing, refuses symlinked paths and conflicting replacement, and refuses all changes after Tasks are populated.
+The helper requires an existing, loadable empty TaskGraph at the canonical `.claude/state/active_task_graph.json` or `.pi/state/active_task_graph.json` path. It validates before writing, refuses symlinked paths and conflicting replacement, and refuses all changes after Tasks are populated. In normal `/loom` use, Phase 0 initialization already supplied that graph. For operator-approved source installation without a live orchestration, use official `init-state` to create an empty bootstrap, install with `write-verification-manifest`, then use `helper cleanup-state` on that same graph. Prepare real metadata/spec directories as required by initialization; never hand-author state JSON, session pointers, Tasks, Waves, or completion receipts. Do not tear down an unrelated active graph. This metadata bootstrap installs source configuration only; it creates no Task/Wave verification authority.
+
+Loom's own repository uses this exact check; other projects choose their own operator-approved commands:
 
 ```json
 {
@@ -125,17 +127,19 @@ The helper validates before writing, refuses symlinked paths and conflicting rep
   "kind": "loom-verification-manifest",
   "checks": [
     {
-      "id": "project:typecheck",
+      "id": "project:verify",
       "scope": "wave",
       "executable": "npm",
-      "args": ["run", "typecheck"],
+      "args": ["run", "verify"],
       "cwd": ".",
-      "timeoutMs": 600000,
+      "timeoutMs": 1800000,
       "report": { "kind": "not-required" }
     }
   ]
 }
 ```
+
+For Loom, this is the same root `npm run verify` used locally and by Linux CI, including tag pushes: engine prerequisites, then typecheck, then the entire existing Vitest + six-smoke test script. Install both root and engine frozen dependencies first and use a full-history checkout: deterministic calibration tests resolve committed historical revisions from remote refs, so CI uses `actions/checkout` with `fetch-depth: 0`. See [Development validation](operations.md#development-validation). The manifest is an operator source, not an executable script: `verify` must not call the manifest runner or a Wave Gate, which would recurse. A local/CI process success does not mint a Wave receipt. Only the registered runtime suite observes the frozen command and installs its own evidence; never create a receipt manually. `report: {"kind":"not-required"}` is the existing report policy, not a test waiver.
 
 Commands always execute with `shell: false` under an explicit executable/subcommand policy:
 
@@ -145,6 +149,19 @@ Commands always execute with `shell: false` under an explicit executable/subcomm
 - runtimes accept bounded file/test/check/build modes. Inline modes are rejected, including Node `-e`/`-p`/`--eval`/`--print`, Bun `eval`/`-e`/`x`, Deno `eval`, Python `-c`, and Perl/Ruby `-e`/`-E`.
 
 Shells and generic dispatchers are not allowlisted. Traversal, duplicate/reserved ids, and surplus fields are also rejected. Required reports must live beneath `.loom/completion-reports/`; those report bytes are excluded from workspace authority, while tracked and non-ignored untracked implementation bytes remain bound by the Wave workspace digest. Once the TaskGraph is populated, changing the source file does not change the frozen command authority.
+
+### Project Verification Coverage
+
+Population reports coverage immediately. Canonical status and Wave Gate summaries expose the same independent `projectVerificationCoverage` projection:
+
+| Value | Meaning |
+|---|---|
+| `not-configured`, reason `engine-default` | Source was absent at population; only reserved checks were frozen. |
+| `not-configured`, reason `empty-operator-manifest` | Operator source explicitly contained zero project checks. |
+| `not-configured`, reason `historical-unknown` | Archived accepted receipt has only reserved checks; absent-versus-empty source provenance is unavailable. |
+| `configured`, non-empty sorted `checkIds` | Those project commands are configured; this alone says nothing about their outcome. |
+
+Missing and empty manifests retain the existing engine-only advancing policy. An accepted reserved-only suite is **not** a project verification pass, nor a new waiver. Nonempty configuration must still earn accepted, current suite evidence; neither a count nor “configured” means passed. Coverage appears on `required`, `accepted`, `rejected`, and `stale` readiness. Completed schema-v2 Waves derive it from their archived accepted receipt roster, not today's source or frozen manifest. Legacy-unavailable readiness stays unavailable without invented coverage. No coverage field is persisted, no new strict requirement for all projects is introduced, and unconfigured test/build/typecheck categories are not implied to have run.
 
 ### Phase 5: execute
 

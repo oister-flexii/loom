@@ -20,6 +20,8 @@ import {
   VERIFICATION_MANIFEST_SOURCE_PATH,
   defaultVerificationManifest,
   freezeVerificationManifest,
+  deriveProjectVerificationCoverage,
+  renderProjectVerificationCoverage,
   type FrozenVerificationManifest,
 } from "../../core/verification-manifest";
 import { readRunBytesNoFollow } from "../../orchestration/no-follow-fs";
@@ -407,7 +409,12 @@ const handler: HookHandler = async (stdin, args) => {
   const taskCount = decompose.tasks.length;
   process.stderr.write(`Task graph populated: ${taskCount} tasks, waves: ${applied.value.waves.join(", ")}\n`);
 
-  return { kind: "passthrough" };
+  return {
+    kind: "passthrough",
+    systemMessage: renderProjectVerificationCoverage(deriveProjectVerificationCoverage(preparedManifest.value)) +
+      ` Install ${VERIFICATION_MANIFEST_SOURCE_PATH} before population to configure project checks; ` +
+      "later source edits do not change this TaskGraph's frozen authority.",
+  };
 };
 
 export default handler;

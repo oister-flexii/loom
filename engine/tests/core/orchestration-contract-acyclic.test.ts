@@ -16,6 +16,7 @@
  * This asserts the PROPERTY (acyclic) rather than a hand-maintained ordering,
  * so adding a volume requires no change here — only not reintroducing a cycle.
  */
+import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
@@ -30,7 +31,9 @@ function siblingImports(source: string): readonly string[] {
     .map((match) => match[1]!);
 }
 
-function volumeGraph(): ReadonlyMap<string, readonly string[]> {
+type Graph = ReadonlyMap<string, readonly string[]>;
+
+function volumeGraph(): Graph {
   const graph = new Map<string, readonly string[]>();
   for (const entry of readdirSync(KERNEL_DIR)) {
     if (!entry.endsWith(".ts") || entry === "index.ts") continue;
@@ -43,7 +46,7 @@ function volumeGraph(): ReadonlyMap<string, readonly string[]> {
 /** Every cycle reachable from `start`, as the path that closes it. */
 function cyclesFrom(
   start: string,
-  graph: ReadonlyMap<string, readonly string[]>,
+  graph: Graph,
 ): readonly string[][] {
   const found: string[][] = [];
   const walk = (node: string, path: readonly string[]): void => {
@@ -60,6 +63,70 @@ function cyclesFrom(
   return found;
 }
 
+type CycleScan = Readonly<{
+  members: readonly string[];
+  edgeVisits: number;
+}>;
+
+function scanCyclicMembers(graph: Graph): CycleScan {
+  let edgeVisits = 0;
+  const reachesSelf = (start: string): boolean => {
+    const visited = new Set([start]);
+    const pending = [start];
+    while (pending.length > 0) {
+      const current = pending.pop();
+      if (current === undefined) continue;
+      for (const next of graph.get(current) ?? []) {
+        edgeVisits += 1;
+        if (next === start) return true;
+        if (visited.has(next)) continue;
+        visited.add(next);
+        pending.push(next);
+      }
+    }
+    return false;
+  };
+
+  return Object.freeze({
+    members: Object.freeze([...graph.keys()].filter(reachesSelf).sort()),
+    edgeVisits,
+  });
+}
+
+function bruteForceCyclicMembers(graph: Graph): readonly string[] {
+  const reachesSelf = (start: string, current: string, path: ReadonlySet<string>): boolean =>
+    (graph.get(current) ?? []).some((next) =>
+      next === start || (!path.has(next) && reachesSelf(start, next, new Set([...path, next]))));
+
+  return [...graph.keys()]
+    .filter((node) => reachesSelf(node, node, new Set([node])))
+    .sort();
+}
+
+function graphFromBits(size: number, edges: readonly boolean[]): Graph {
+  const nodes = Array.from({ length: size }, (_, index) => `n${index}`);
+  return new Map(nodes.map((node, from): readonly [string, readonly string[]] => [
+    node,
+    Object.freeze(nodes.filter((_, to) => edges[from * size + to] === true)),
+  ]));
+}
+
+function layeredDiamond(levels: number): Graph {
+  const graph = new Map<string, readonly string[]>();
+  let entry = "root";
+  for (let level = 0; level < levels; level += 1) {
+    const left = `left-${level}`;
+    const right = `right-${level}`;
+    const merge = `merge-${level}`;
+    graph.set(entry, Object.freeze([left, right]));
+    graph.set(left, Object.freeze([merge]));
+    graph.set(right, Object.freeze([merge]));
+    entry = merge;
+  }
+  graph.set(entry, Object.freeze([]));
+  return graph;
+}
+
 describe("orchestration-contract volume graph", () => {
   it("has no cycles between sub-domain volumes", () => {
     const graph = volumeGraph();
@@ -70,6 +137,47 @@ describe("orchestration-contract volume graph", () => {
       .map((cycle) => cycle.join(" -> "));
 
     expect([...new Set(cycles)]).toEqual([]);
+  });
+
+  it("reports self-cycles and multiple cycles without including dependent DAG nodes", () => {
+    const graph: Graph = new Map([
+      ["self", ["self"]],
+      ["cycle-a", ["cycle-b"]],
+      ["cycle-b", ["cycle-a", "downstream"]],
+      ["cycle-c", ["cycle-d"]],
+      ["cycle-d", ["cycle-c"]],
+      ["downstream", ["leaf"]],
+      ["leaf", []],
+      ["dependent", ["cycle-a"]],
+    ]);
+
+    expect(scanCyclicMembers(graph).members).toEqual([
+      "cycle-a",
+      "cycle-b",
+      "cycle-c",
+      "cycle-d",
+      "self",
+    ]);
+  });
+
+  it("agrees with brute-force simple-path enumeration on bounded finite graphs", () => {
+    fc.assert(fc.property(
+      fc.integer({ min: 1, max: 5 }).chain((size) =>
+        fc.array(fc.boolean(), { minLength: size * size, maxLength: size * size })
+          .map((edges) => graphFromBits(size, edges))),
+      (graph) => {
+        expect(scanCyclicMembers(graph).members).toEqual(bruteForceCyclicMembers(graph));
+      },
+    ), { numRuns: 200 });
+  });
+
+  it("scans a layered diamond within the per-root graph bound", () => {
+    const graph = layeredDiamond(20);
+    const edgeCount = [...graph.values()].reduce((count, edges) => count + edges.length, 0);
+    const scan = scanCyclicMembers(graph);
+
+    expect(scan.members).toEqual([]);
+    expect(scan.edgeVisits).toBeLessThanOrEqual(graph.size * edgeCount);
   });
 
   it("keeps historical compatibility imports one-way", () => {
@@ -121,10 +229,7 @@ describe("orchestration-contract volume graph", () => {
       });
       return [modulePath(path), Object.freeze([...new Set(dependencies)])];
     }));
-    const reachesSelf = (start: string, current: string, seen: ReadonlySet<string>): boolean =>
-      (graph.get(current) ?? []).some((next) =>
-        next === start || (!seen.has(next) && reachesSelf(start, next, new Set([...seen, next]))));
-    const cyclicModules = [...graph.keys()].filter((module) => reachesSelf(module, module, new Set([module]))).sort();
+    const cyclicModules = scanCyclicMembers(graph).members;
 
     // The Guarded Skill Machine's three-volume legacy cycle predates the
     // orchestration kernel and is explicitly outside ADR-0007. No shared-kernel

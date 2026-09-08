@@ -16,5 +16,5 @@
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": false
   },
-  "include": ["src", "tests"]
+  "include": ["src", "tests", "../pi", "scripts/typecheck.ts"]
 }

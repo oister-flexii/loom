@@ -1,11 +1,13 @@
 /** Pure parsing and authority construction for the operator verification manifest. */
 
+import { match } from "ts-pattern";
 import { compareStrings } from "./ordering";
 import {
   COMPLETION_REPORT_ROOT,
   FULL_TIER_LINT_CHECK_ID_TEXT,
   createAuthorizedWaveCompletionSuite,
   parseAuthorizedWaveCompletionCheck,
+  type AcceptedWaveCompletionReceipt,
   type AuthorizedWaveCompletionCheck,
   type AuthorizedWaveCompletionSuite,
   type CompletionCheckId,
@@ -59,6 +61,50 @@ export type FrozenVerificationManifest = Readonly<{
   manifestDigest: ArtifactDigest;
   projectChecks: readonly ProjectWaveCompletionCheck[];
 }>;
+
+export type ProjectVerificationCoverage =
+  | Readonly<{
+      kind: "not-configured";
+      reason: "engine-default" | "empty-operator-manifest" | "historical-unknown";
+    }>
+  | Readonly<{ kind: "configured"; checkIds: NonEmpty<CompletionCheckId> }>;
+
+/** Coverage is configuration, not acceptance. History retains the roster but not source provenance. */
+export function deriveProjectVerificationCoverage(
+  authority: FrozenVerificationManifest | AcceptedWaveCompletionReceipt,
+): ProjectVerificationCoverage {
+  const { checkIds, emptyReason } = match(authority)
+    .with({ kind: "frozen-verification-manifest" }, (manifest) => ({
+      checkIds: manifest.projectChecks.map((check) => check.checkId),
+      emptyReason: match(manifest.source)
+        .with({ kind: "engine-default" }, () => "engine-default" as const)
+        .with({ kind: "operator-file" }, () => "empty-operator-manifest" as const)
+        .exhaustive(),
+    }))
+    .with({ kind: "accepted-wave-completion-suite" }, (receipt) => ({
+      checkIds: receipt.checks
+        .filter((check) => check.checkId !== FULL_TIER_LINT_CHECK_ID_TEXT)
+        .map((check) => check.checkId),
+      emptyReason: "historical-unknown" as const,
+    }))
+    .exhaustive();
+  const [head, ...tail] = checkIds.toSorted(compareStrings);
+  return head === undefined
+    ? freeze({ kind: "not-configured", reason: emptyReason })
+    : freeze({ kind: "configured", checkIds: Object.freeze([head, ...tail] as const) });
+}
+
+export function renderProjectVerificationCoverage(coverage: ProjectVerificationCoverage): string {
+  return match(coverage)
+    .with({ kind: "configured" }, ({ checkIds }) =>
+      `Project verification checks configured: ${checkIds.join(", ")} (configuration is not a pass).`)
+    .with({ kind: "not-configured" }, ({ reason }) => match(reason)
+      .with("engine-default", () => "Project verification NOT CONFIGURED (engine-default: source absent at population; reserved checks only).")
+      .with("empty-operator-manifest", () => "Project verification NOT CONFIGURED (empty-operator-manifest: operator configured zero project checks; reserved checks only).")
+      .with("historical-unknown", () => "Project verification NOT CONFIGURED (historical-unknown: archived reserved checks only; source provenance unavailable).")
+      .exhaustive())
+    .exhaustive();
+}
 
 export type VerificationManifestError = Readonly<{
   kind: "invalid-verification-manifest";

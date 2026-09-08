@@ -196,6 +196,10 @@ _Avoid_: Test flag, new-tests flag, test exemption
 The operator-owned `.loom/verification-manifest.json` source of fixed Wave completion commands. TaskGraph population parses and freezes its executable/argv/cwd/timeout/report authority before implementation; decompose and implementation Agents cannot supply runtime command authority. An absent source freezes the engine default containing only reserved checks.
 _Avoid_: Test script, model command, shell command, CI config
 
+**Project Verification Coverage**:
+A pure read-model projection of the configured project-check roster, independent of Completion Suite acceptance. `projectVerificationCoverage` is either `configured` with immutable, sorted, non-empty `checkIds`, or `not-configured` with reason `engine-default` (source absent at population), `empty-operator-manifest` (operator configured zero project checks), or `historical-unknown` (archived reserved-only receipt lacks source provenance). Current coverage comes from the frozen Verification Manifest; completed schema-v2 Wave coverage comes from its archived accepted receipt, never the live source file. Legacy-unavailable readiness supplies no invented coverage. It adds no persisted authority, waiver, or requirement that every project configure checks: reserved-only suites may still advance, but cannot claim project verification passed. Configuration itself is not a pass.
+_Avoid_: Test coverage, project-check pass, verification waiver, persisted coverage flag
+
 **Completion Check Result**:
 One engine-observed deterministic check outcome carrying independent exit-code, timeout, signal, and report-production facts under an exact check identity and Task-or-Wave scope. Spawn failure is a separate arm, never disguised as a failed test.
 _Avoid_: Test evidence, command output, exit status
@@ -325,6 +329,7 @@ _Avoid_: Constraint (too generic), rule (alone), enforced guideline (advisory ru
 - Slice 3 classifies retry-required/escalation-required without dispatch; Slice 4 freezes retry context, authorizes semantic attempt 2 dispatch, and publishes terminal escalation for operator handling
 - A Task's **Verification Policy** independently determines its regression and new-test **Proof Obligations**
 - A **Verification Manifest** is frozen by the engine before implementation and cannot be authored through decompose output
+- **Project Verification Coverage** describes configured commands independently of **Completion Suite Result** acceptance; it never grants completion authority or asserts coverage of unconfigured test/build/typecheck categories
 - A Task-scoped **Completion Suite Result** binds to one **Implementation Attempt**; a Wave-scoped result binds to a quiescent Wave workspace
 - Review Agents consume one immutable **Review Packet** per Task
 - A **Session TaskGraph Pointer Lease Registry** restores its previous target only after the generation's final exact lease is released

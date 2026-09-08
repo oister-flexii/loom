@@ -13,6 +13,8 @@ import { execFileSync } from "node:child_process";
 import { canonicalTempDir } from "../fixtures/canonical-temp-dir";
 import populate, { resolvedSpecFile } from "../../src/handlers/helpers/populate-task-graph";
 import type { Task, TaskGraph } from "../../src/types";
+import { deriveWaveCompletionSuiteReadiness } from "../../src/core/wave-gate-machine";
+import { StateManager } from "../../src/state-manager";
 import { taskFixture } from "../fixtures/task-lifecycle";
 import {
   defaultVerificationManifest,
@@ -188,6 +190,35 @@ describe("populate-task-graph — overwrite guard (funneled through the real han
 });
 
 describe("populate-task-graph — protected verification manifest authority", () => {
+  it.each(["absent-directory", "absent-file", "empty", "configured"] as const)(
+    "announces %s coverage on successful population and never re-freezes on later source edits",
+    async (source) => {
+      const dir = tempDir();
+      const plan = modelFreePlan(dir);
+      const statePath = writeState(dir, plan, []);
+      if (source === "absent-file") mkdirSync(join(dir, ".loom"));
+      if (source === "empty") writeManifest(dir, { ...manifestDocument(), checks: [] });
+      if (source === "configured") writeManifest(dir);
+      const result = await populate(decomposeJson(plan), []);
+      const coverage = source === "configured"
+        ? { kind: "configured", checkIds: ["project:test"] }
+        : { kind: "not-configured", reason: source === "empty" ? "empty-operator-manifest" : "engine-default" };
+      expect(result).toMatchObject({ kind: "passthrough", systemMessage: expect.stringContaining(
+        source === "configured" ? "checks configured: project:test" : "NOT CONFIGURED",
+      ) });
+      if (result.kind !== "passthrough") throw new Error("population must succeed");
+      expect(result.systemMessage).toContain("before population");
+      expect(result.systemMessage).toContain("later source edits do not change");
+      const before = stateBytes(statePath);
+      writeManifest(dir, { ...manifestDocument(), checks: source === "configured" ? [] : manifestDocument().checks });
+      const loaded = StateManager.fromPath(statePath)!.load();
+      expect(deriveWaveCompletionSuiteReadiness(loaded, 1, undefined)).toMatchObject({
+        kind: "required", projectVerificationCoverage: coverage,
+      });
+      expect(stateBytes(statePath)).toBe(before);
+    },
+  );
+
   it.each(["claude", "pi"] as const)(
     "derives a non-Git %s project root from its canonical absolute State File path",
     async (layout) => {
