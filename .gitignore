@@ -13,5 +13,6 @@
 .claude/specs/*/panel-runs/
 .claude/**/orchestration-runs/
 .claude/**/wave-gate-runs/
+.loom/completion-reports/
 
 node_modules/

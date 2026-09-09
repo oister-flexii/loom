@@ -13,7 +13,8 @@
       "cwd": ".",
       "timeoutMs": 1800000,
       "report": {
-        "kind": "not-required"
+        "kind": "required-file",
+        "path": ".loom/completion-reports/verify.junit.xml"
       }
     }
   ]

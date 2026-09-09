@@ -135,15 +135,15 @@ Loom's own repository uses this exact check; other projects choose their own ope
       "args": ["run", "verify"],
       "cwd": ".",
       "timeoutMs": 1800000,
-      "report": { "kind": "not-required" }
+      "report": { "kind": "required-file", "path": ".loom/completion-reports/verify.junit.xml" }
     }
   ]
 }
 ```
 
-For Loom, this is the same root `npm run verify` used locally and by Linux CI, including tag pushes: engine prerequisites, then typecheck, then the entire existing Vitest + six-smoke test script. Install both root and engine frozen dependencies first and use a full-history checkout: deterministic calibration tests resolve committed historical revisions from remote refs, so CI uses `actions/checkout` with `fetch-depth: 0`. See [Development validation](operations.md#development-validation). The manifest is an operator source, not an executable script: `verify` must not call the manifest runner or a Wave Gate, which would recurse. A local/CI process success does not mint a Wave receipt. Only the registered runtime suite observes the frozen command and installs its own evidence; never create a receipt manually. `report: {"kind":"not-required"}` is the existing report policy, not a test waiver—and it makes this check ineligible for critical Defect-Family repair evidence.
+For Loom, this is the same root `npm run verify` used locally and by Linux CI, including tag pushes: engine prerequisites, then typecheck, then the entire existing Vitest + six-smoke test script. Install both root and engine frozen dependencies first and use a full-history checkout: deterministic calibration tests resolve committed historical revisions from remote refs, so CI uses `actions/checkout` with `fetch-depth: 0`. See [Development validation](operations.md#development-validation). The manifest is an operator source, not an executable script: `verify` must not call the manifest runner or a Wave Gate, which would recurse. A local/CI process success does not mint a Wave receipt. Only the registered runtime suite observes the frozen command and installs its own evidence; never create a receipt manually. The user-approved 2026-09-09 idle enrollment changed only the report policy, not the fixed command. Its existing Vitest invocation now writes the required root JUnit file via `--reporter=default --reporter=junit --outputFile=../.loom/completion-reports/verify.junit.xml` from `engine/`; `.loom/completion-reports/` is Git-ignored and generated reports stay untracked. JUnit describes only Vitest tests; normal zero exit of the whole command also proves the compiler and six smokes passed. A green report never overrides a later smoke failure. This enrollment is not a completed live schema-v2 remediation; the registered engine must still observe a fresh passing command and report.
 
-A critical-remediation check must instead use `required-file`. Here is a complete Vitest alternative whose fixed argv names the exact output file:
+Critical-remediation checks must use `required-file`. For other projects, here is a complete Vitest alternative whose fixed argv names the exact output file:
 
 ```json
 {

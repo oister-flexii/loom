@@ -59,3 +59,7 @@ Completed-v2 replay parses both checkpoint audit-path arrays before event assess
 - A failed repaired check or candidate drift requires a fresh immutable remediation run rather than reusing prior success.
 - Critical P3 operation depends on operator enrollment of a required-file structured-report check. A `report.kind: "not-required"` command is ineligible.
 - Pi must `/reload` or restart after package installation so the loaded runtime revision matches the schema-v2 mutator. Bootstrap review/installation of this feature may use the currently admitted CLI and loaded Skill 3.1 under their existing protocol **after external validation**; that completed v1 history is not this feature's own v2 repair-checked publication. No runtime-admission bypass is permitted.
+
+## Dated follow-through — 2026-09-09
+
+The separate user-approved idle enrollment now configures `project:verify` with required report `.loom/completion-reports/verify.junit.xml`, produced by the existing Vitest invocation within the unchanged root `npm run verify`. This satisfies the configuration prerequisite above without changing this ADR's evidence or installation boundaries. JUnit contains Vitest facts only; compiler and smoke success additionally require normal zero exit of the complete command. Enrollment is not a live schema-v2 completion, and the historical bootstrap context and P3 Plan remain historical. See the [enrollment follow-up](../../.claude/plans/2026-09-09-junit-verification-enrollment.md).
