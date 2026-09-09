@@ -292,8 +292,15 @@ reconciliation/new appends, and CLI inspection enforce **12 MiB per encoded even
 These are not blanket limits on other Run artifacts or legacy journal consumers.
 Multiple groups may select the same check ID; each distinct selected ID executes
 once. See [operator enrollment](../../docs/operations.md#enrolling-a-critical-repair-check).
-Loom's existing protected `project:verify` has `report.kind: "not-required"` and
-remains ineligible for critical P3; these examples do not enroll a replacement.
+Loom's user-approved 2026-09-09 idle enrollment now gives the unchanged root
+`project:verify` command required report `.loom/completion-reports/verify.junit.xml`.
+The existing Vitest invocation writes that Git-ignored, untracked report; it
+contains only Vitest facts, not compiler or smoke testcases. Normal zero exit of
+the whole command also proves the compiler and all six smokes passed; a green
+unit report cannot override a later smoke failure. Enrollment and development
+runs are not registered P3 evidence or a completed live schema-v2 remediation.
+The create-only manifest helper was neither used nor changed for this approved
+operator replacement; existing populated TaskGraphs retain frozen authority.
 
 The engine proves observed dirty paths are authorized, rejects excluded Run
 evidence and unrelated staged work, stages literal paths in a temporary index,
