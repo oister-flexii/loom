@@ -231,12 +231,11 @@ describe("orchestration-contract volume graph", () => {
     }));
     const cyclicModules = scanCyclicMembers(graph).members;
 
-    // The Guarded Skill Machine's three-volume legacy cycle predates the
-    // orchestration kernel and is explicitly outside ADR-0007. No shared-kernel
-    // or schema-root module may join it or form another cycle.
+    // Shared structured-report facts now live in the pure core, so the former
+    // three-volume Guarded Skill Machine cycle is reduced to its historical
+    // evidence/types pair. No shared-kernel or schema-root module may join it.
     expect(cyclicModules).toEqual([
       "machine/evidence",
-      "machine/test-report",
       "machine/types",
     ]);
     expect(readFileSync(join(CORE_DIR, "model-profiles.ts"), "utf-8")).toContain('from "./phases"');

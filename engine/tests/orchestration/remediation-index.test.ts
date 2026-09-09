@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -18,6 +19,12 @@ import {
   type GitRepository,
 } from "../../src/orchestration/git-remediation";
 import { git, gitResult, pathspecContract, write } from "../fixtures/git-repository";
+import { verifiedRemediationInstallation } from "../fixtures/verified-remediation-installation";
+import {
+  parseVerifiedIndexInstallation,
+  type CurrentVerifiedIndexInstallation,
+} from "../../src/core/remediation-machine";
+import { standalonePublicationResolver, valueOf } from "../fixtures/standalone-remediation-authority";
 
 const cleanup: string[] = [];
 
@@ -260,22 +267,59 @@ describe("staging into a temporary index", () => {
 // --- Installation -----------------------------------------------------------
 
 describe("installing a verified index", () => {
+  it("refuses parsed historical authority and forged current authority before any Git or accessor effects", () => {
+    const repository = fixtureRepository();
+    write(repository.root, "src/edited.ts", "export const edited = 2;\n");
+    const { temporary } = stageInto(repository, ["src/edited.ts"]);
+    const current = verifiedRemediationInstallation(repository, temporary);
+    const identity = { verifiedIndexDigest: current.verifiedIndexDigest, intent: current.intent };
+    const historical = valueOf(parseVerifiedIndexInstallation({
+      schemaVersion: 1,
+      kind: "verified-index-installation",
+      verified: current.verified,
+      ...identity,
+      digest: createHash("sha256").update(JSON.stringify(identity)).digest("hex"),
+    }, standalonePublicationResolver(["src/edited.ts"])));
+    if (historical.schemaVersion !== 1) throw new Error("expected historical installation");
+    if (false) {
+      // @ts-expect-error Historical receipts do not grant current Git installation authority.
+      installVerifiedIndex(repository, temporary, historical);
+    }
+    const before = readRepositoryBytes(repository.root, ".git/index");
+    let effects = 0;
+    const forged = Object.defineProperty({ ...current }, "intent", {
+      get() { effects++; throw new Error("forged installation accessor ran"); },
+    });
+    const revoked = Proxy.revocable(current, {});
+    revoked.revoke();
+    for (const authority of [historical, forged, revoked.proxy]) {
+      const installed = installVerifiedIndex({
+        get root() { effects++; return repository.root; },
+        gitDir: repository.gitDir,
+      }, temporary, authority as CurrentVerifiedIndexInstallation);
+      expect(installed).toMatchObject({ ok: false, error: { operation: "install" } });
+    }
+    expect(effects).toBe(0);
+    expect(readRepositoryBytes(repository.root, ".git/index")).toEqual(before);
+    expect(readRepositoryBytes(repository.root, ".git/index.lock")).toBeNull();
+    expect(installVerifiedIndex(repository, temporary, current).ok).toBe(true);
+    expect(gitResult(repository.root, ["diff", "--cached", "--name-only"]).stdout.trim()).toBe("src/edited.ts");
+  });
+
   it("installs the staged set and leaves unrelated worktree bytes unchanged", () => {
     const repository = fixtureRepository();
     write(repository.root, "src/edited.ts", "export const edited = 2;\n");
-    write(repository.root, "unrelated.ts", "export const unrelated = 2;\n");
     const unrelatedBefore = readRepositoryBytes(repository.root, "unrelated.ts");
 
     const { temporary, staged } = stageInto(repository, ["src/edited.ts"]);
     expect(staged.ok).toBe(true);
-    const witness = snapshotRepositoryWitness(repository);
-    if (!witness.ok) throw new Error(witness.error.message);
+    const installation = verifiedRemediationInstallation(repository, temporary);
 
-    const installed = installVerifiedIndex(repository, temporary, witness.value);
+    const installed = installVerifiedIndex(repository, temporary, installation);
 
     expect(installed.ok).toBe(true);
     if (!installed.ok) return;
-    expect(installed.value.installedPaths).toEqual(["src/edited.ts"]);
+    expect(installed.value.kind).toBe("verified-index-installed");
     expect(readRepositoryBytes(repository.root, "unrelated.ts")).toEqual(unrelatedBefore);
   });
 
@@ -284,13 +328,12 @@ describe("installing a verified index", () => {
     write(repository.root, "src/edited.ts", "export const edited = 2;\n");
     const { temporary, staged } = stageInto(repository, ["src/edited.ts"]);
     expect(staged.ok).toBe(true);
-    const witness = snapshotRepositoryWitness(repository);
-    if (!witness.ok) throw new Error(witness.error.message);
+    const installation = verifiedRemediationInstallation(repository, temporary);
 
     // Someone edits an unrelated file between verification and installation.
     write(repository.root, "unrelated.ts", "export const unrelated = 99;\n");
 
-    const installed = installVerifiedIndex(repository, temporary, witness.value);
+    const installed = installVerifiedIndex(repository, temporary, installation);
 
     expect(installed.ok).toBe(false);
     if (installed.ok) return;
@@ -298,22 +341,44 @@ describe("installing a verified index", () => {
     expect(installed.error.message).toContain("nothing was installed");
   });
 
+  it.each([
+    ["dirty bytes", (root: string) => write(root, "src/edited.ts", "export const edited = 3;\n")],
+    ["file mode", (root: string) => chmodSync(join(root, "src/edited.ts"), 0o755)],
+    ["path roster", (root: string) => write(root, "new-untracked.ts", "export const added = true;\n")],
+  ] as const)("rechecks candidate %s under the real index lock and leaves the index unchanged", (_label, mutate) => {
+    const repository = fixtureRepository();
+    write(repository.root, "src/edited.ts", "export const edited = 2;\n");
+    const { temporary, staged } = stageInto(repository, ["src/edited.ts"]);
+    expect(staged.ok).toBe(true);
+    const installation = verifiedRemediationInstallation(repository, temporary);
+    const before = snapshotRepositoryWitness(repository);
+    expect(before.ok).toBe(true);
+
+    mutate(repository.root);
+    const installed = installVerifiedIndex(repository, temporary, installation);
+
+    expect(installed.ok).toBe(false);
+    const after = snapshotRepositoryWitness(repository);
+    expect(after.ok).toBe(true);
+    if (!before.ok || !after.ok) return;
+    expect(after.value.indexDigest).toBe(before.value.indexDigest);
+  });
+
   it("rechecks the witness under the real index lock and preserves a concurrent writer's staged work", () => {
     const repository = fixtureRepository();
     write(repository.root, "src/edited.ts", "export const edited = 2;\n");
-    write(repository.root, "unrelated.ts", "export const unrelated = 2;\n");
     const { temporary, staged } = stageInto(repository, ["src/edited.ts"]);
     expect(staged.ok).toBe(true);
-    const witness = snapshotRepositoryWitness(repository);
-    if (!witness.ok) throw new Error(witness.error.message);
+    const installation = verifiedRemediationInstallation(repository, temporary);
 
     // This is a real Git index writer, not a mocked witness. It lands after
     // verification and before installation. installVerifiedIndex must acquire
     // .git/index.lock first, observe the moved index there, and refuse rather
     // than overwrite the unrelated staged entry.
+    write(repository.root, "unrelated.ts", "export const unrelated = 2;\n");
     git(repository.root, ["add", "--", "unrelated.ts"]);
 
-    const installed = installVerifiedIndex(repository, temporary, witness.value);
+    const installed = installVerifiedIndex(repository, temporary, installation);
 
     expect(installed.ok).toBe(false);
     if (installed.ok) return;
@@ -326,12 +391,11 @@ describe("installing a verified index", () => {
     write(repository.root, "src/edited.ts", "export const edited = 2;\n");
     const { temporary, staged } = stageInto(repository, ["src/edited.ts"]);
     expect(staged.ok).toBe(true);
-    const witness = snapshotRepositoryWitness(repository);
-    if (!witness.ok) throw new Error(witness.error.message);
+    const installation = verifiedRemediationInstallation(repository, temporary);
     write(repository.root, "unrelated.ts", "export const unrelated = 99;\n");
     const indexBefore = snapshotRepositoryWitness(repository);
 
-    installVerifiedIndex(repository, temporary, witness.value);
+    installVerifiedIndex(repository, temporary, installation);
 
     const indexAfter = snapshotRepositoryWitness(repository);
     expect(indexBefore.ok && indexAfter.ok).toBe(true);
@@ -344,10 +408,9 @@ describe("installing a verified index", () => {
     write(repository.root, "src/edited.ts", "export const edited = 2;\n");
     const { temporary, staged } = stageInto(repository, ["src/edited.ts"]);
     expect(staged.ok).toBe(true);
-    const witness = snapshotRepositoryWitness(repository);
-    if (!witness.ok) throw new Error(witness.error.message);
+    const installation = verifiedRemediationInstallation(repository, temporary);
 
-    installVerifiedIndex(repository, temporary, witness.value);
+    installVerifiedIndex(repository, temporary, installation);
 
     expect(() => statSync(temporary.path)).toThrow();
   });
@@ -482,15 +545,14 @@ describe("installing against a concurrently held index lock", () => {
     write(repository.root, "src/edited.ts", "export const edited = 2;\n");
     const { temporary, staged } = stageInto(repository, ["src/edited.ts"]);
     expect(staged.ok).toBe(true);
-    const witness = snapshotRepositoryWitness(repository);
-    if (!witness.ok) throw new Error(witness.error.message);
+    const installation = verifiedRemediationInstallation(repository, temporary);
 
     // Another process holds the lock.
     const lockPath = join(repository.root, ".git", "index.lock");
     writeFileSync(lockPath, "");
     cleanup.push(lockPath);
 
-    const installed = installVerifiedIndex(repository, temporary, witness.value);
+    const installed = installVerifiedIndex(repository, temporary, installation);
 
     expect(installed.ok).toBe(false);
     if (installed.ok) return;

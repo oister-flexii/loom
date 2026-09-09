@@ -111,13 +111,15 @@ Typical guidance is 8–12 Tasks, 4–5 Waves, and 4–6 parallel Tasks per Wave
 
 ### Verification manifest
 
-Project-wide Wave checks are declared before Task population. Write the JSON to an unguarded temporary file, then install it through the sole validating write seam:
+Project-wide Wave checks are declared before Task population. For the **first** installation, write the JSON to an unguarded temporary file, then pass it through the validating create-only seam:
 
 ```bash
 bun ${LOOM_DIR}/engine/src/cli.ts helper write-verification-manifest < /tmp/loom-verification-manifest.json
 ```
 
-The helper requires an existing, loadable empty TaskGraph at the canonical `.claude/state/active_task_graph.json` or `.pi/state/active_task_graph.json` path. It validates before writing, refuses symlinked paths and conflicting replacement, and refuses all changes after Tasks are populated. In normal `/loom` use, Phase 0 initialization already supplied that graph. For operator-approved source installation without a live orchestration, use official `init-state` to create an empty bootstrap, install with `write-verification-manifest`, then use `helper cleanup-state` on that same graph. Prepare real metadata/spec directories as required by initialization; never hand-author state JSON, session pointers, Tasks, Waves, or completion receipts. Do not tear down an unrelated active graph. This metadata bootstrap installs source configuration only; it creates no Task/Wave verification authority.
+The helper requires an existing, loadable empty TaskGraph at the canonical `.claude/state/active_task_graph.json` or `.pi/state/active_task_graph.json` path. It validates before writing, accepts a byte-equivalent canonical replay, refuses to overwrite different existing authority, and refuses all changes after Tasks are populated. It is **not** an update command. In normal `/loom` use, Phase 0 initialization already supplied that empty graph. For an approved first installation without a live orchestration, use official `init-state` to create an empty bootstrap, install with `write-verification-manifest`, then use `helper cleanup-state` on that same graph. Prepare real metadata/spec directories as required by initialization; never hand-author state JSON, session pointers, Tasks, Waves, or completion receipts. Do not tear down an unrelated active graph. This metadata bootstrap installs source configuration only; it creates no Task/Wave verification authority.
+
+Standalone remediation itself has no TaskGraph requirement. The empty-TaskGraph condition belongs only to this manifest creation helper. Replacing an existing operator manifest is an explicit operator-controlled action at an approved idle boundary under the repository's protected-state policy; the helper cannot perform it. Never bypass protected paths or mutate a populated graph. Existing TaskGraphs keep the commands frozen at their own population even after a later source replacement.
 
 Loom's own repository uses this exact check; other projects choose their own operator-approved commands:
 
@@ -139,7 +141,49 @@ Loom's own repository uses this exact check; other projects choose their own ope
 }
 ```
 
-For Loom, this is the same root `npm run verify` used locally and by Linux CI, including tag pushes: engine prerequisites, then typecheck, then the entire existing Vitest + six-smoke test script. Install both root and engine frozen dependencies first and use a full-history checkout: deterministic calibration tests resolve committed historical revisions from remote refs, so CI uses `actions/checkout` with `fetch-depth: 0`. See [Development validation](operations.md#development-validation). The manifest is an operator source, not an executable script: `verify` must not call the manifest runner or a Wave Gate, which would recurse. A local/CI process success does not mint a Wave receipt. Only the registered runtime suite observes the frozen command and installs its own evidence; never create a receipt manually. `report: {"kind":"not-required"}` is the existing report policy, not a test waiver.
+For Loom, this is the same root `npm run verify` used locally and by Linux CI, including tag pushes: engine prerequisites, then typecheck, then the entire existing Vitest + six-smoke test script. Install both root and engine frozen dependencies first and use a full-history checkout: deterministic calibration tests resolve committed historical revisions from remote refs, so CI uses `actions/checkout` with `fetch-depth: 0`. See [Development validation](operations.md#development-validation). The manifest is an operator source, not an executable script: `verify` must not call the manifest runner or a Wave Gate, which would recurse. A local/CI process success does not mint a Wave receipt. Only the registered runtime suite observes the frozen command and installs its own evidence; never create a receipt manually. `report: {"kind":"not-required"}` is the existing report policy, not a test waiver—and it makes this check ineligible for critical Defect-Family repair evidence.
+
+A critical-remediation check must instead use `required-file`. Here is a complete Vitest alternative whose fixed argv names the exact output file:
+
+```json
+{
+  "schemaVersion": 1,
+  "kind": "loom-verification-manifest",
+  "checks": [
+    {
+      "id": "project:repair-regression",
+      "scope": "wave",
+      "executable": "node_modules/.bin/vitest",
+      "args": ["run", "tests/repair-regression.test.ts", "--reporter=json", "--outputFile=.loom/completion-reports/repair-regression.json"],
+      "cwd": ".",
+      "timeoutMs": 120000,
+      "report": { "kind": "required-file", "path": ".loom/completion-reports/repair-regression.json" }
+    }
+  ]
+}
+```
+
+A Node JUnit alternative is also parser-valid:
+
+```json
+{
+  "schemaVersion": 1,
+  "kind": "loom-verification-manifest",
+  "checks": [
+    {
+      "id": "project:repair-regression",
+      "scope": "wave",
+      "executable": "node",
+      "args": ["--test", "--test-reporter=junit", "--test-reporter-destination=.loom/completion-reports/repair-regression.xml", "tests/repair-regression.test.mjs"],
+      "cwd": ".",
+      "timeoutMs": 120000,
+      "report": { "kind": "required-file", "path": ".loom/completion-reports/repair-regression.xml" }
+    }
+  ]
+}
+```
+
+These are alternatives, not commands Loom adds automatically. The operator must choose a real repository test and ensure the selected fixed command produces the exact configured path. That path must be below `.loom/completion-reports/`, untracked, and Git-ignored; the config neither creates the report nor ignores it. Critical repair acceptance requires a newly produced report, normal exit, more than zero executed tests, and zero failures—an empty or all-skipped report is not evidence. Before launching, the engine removes the exact old ignored/untracked regular report via no-follow, descriptor-relative unlink anchored to its Linux parent; touching stale bytes cannot pass, but an identical fresh rewrite may. Reset failure blocks before launch. This strict critical-remediation reset is **Linux-only**; Darwin fails closed before launch, without changing zero-critical remediation or Wave behavior. Reports are bounded to **8 MiB** and XML depth **128**; v2 event reads, append reconciliation/new appends, and inspection are bounded to **12 MiB per encoded event, 64 MiB per encoded journal, 1024 records**. See [report boundary and enrollment](operations.md#enrolling-a-critical-repair-check) for exact scope and recovery. Do not add a generic root task runner solely for enrollment.
 
 Commands always execute with `shell: false` under an explicit executable/subcommand policy:
 
@@ -286,12 +330,16 @@ Review aspects are `code`, `errors`, `tests`, `types`, `comments`, `architecture
 This workflow composes two registered programs around semantic remediation:
 
 1. **Standalone review and adjudication.** Produce authoritative review `result.json`.
-2. **Plan.** Record exact scope, surviving criticals, accepted advisories, refuted audit, concrete fixes, and validation commands.
-3. **Implement and validate.** Fix only surviving/accepted Findings and run real checks. `--dry-run` stops before implementation.
-4. **Registered remediation.** Freeze the source result plus explicitly allowed support paths, audit observed dirty paths, reject unrelated or evidence paths, stage literal paths in a temporary Git index, prove audited equals staged, recheck repository witnesses under the real index lock, and atomically install the verified index.
-5. **Commit/push.** Commit the installed index and push unless `--no-push`. Loom never force-pushes.
+2. **Plan and account.** Copy every surviving-critical Finding ID exactly once into a disposition. Repaired dispositions point to separately named Declared Repair Groups; unresolved and out-of-scope dispositions are allowed but block installation. Keep advisories under the existing autonomous accepted/deferred/dismissed policy outside critical groups, and retain refuted criticals for audit without repairing them.
+3. **Implement and validate.** Fix only repaired criticals and accepted advisories, declare root cause/invariant/sibling accounting/Historical RED with `DECLARED` provenance, and run real development checks. `--dry-run` stops before implementation.
+4. **Registered remediation v2.** Always supply `defectFamily`, including `{ "kind": "not-required" }` for an authoritative source with zero surviving criticals. The engine authenticates the source, performs preflight before Run Directory creation, selects fixed report-producing operator checks for critical repairs, records fresh repaired-state observations, binds them to immutable candidate authority, audits paths, and installs only an opaque versioned assessment.
+5. **Commit/push.** Read the actual nested `outcome.installation` receipt from `done`, commit that installed index, and push unless `--no-push`. Loom never force-pushes.
 
-The parent must not substitute its own `git add` recipe: exact staged-set installation is a security and correctness boundary, not convenience automation.
+A Declared Repair Group does not replace or mint Finding IDs. Compatible sibling reuse across distinct groups is allowed; duplicate sibling paths inside one group or conflicting cross-group statuses are rejected. `repair-checked` means the repaired-state checks were engine-observed on unchanged candidate bytes. It does not prove the declared family, root cause, invariant, sibling completeness, or Historical RED, and it is not `ResolvedFinding` status. An operator-owned fixed command can still fabricate a syntactically valid new report; structured fresh engine observations are not semantic proof.
+
+Completed schema-v1 remediation remains read-only `historical-unknown`, returning its old receipt without reinstalling; unfinished v1 cannot install and missing v2 authority never downgrades. Completed-v2 replay refuses missing/malformed checkpoint audit arrays with an explicit audit-path diagnostic. The source review's immutable publication remains source authority, not a new P3 assessment. For installing this feature itself, the admitted CLI with loaded Skill 3.1 may use its existing protocol after external validation; that bootstrap becomes historical-unknown, not v2 repair-checked. New live P3 use requires package reload/restart; never bypass runtime admission.
+
+The parent must not substitute its own `git add` recipe or inject process outcomes, report bytes, manifests, installation receipts, or Run JSON through remediation input or hand-built run artifacts. Exact staged-set installation is a security and correctness boundary, not convenience automation. See the canonical [Review and Fix Skill](../skills/review-and-fix/SKILL.md) and [operations recovery](operations.md#remediation-and-git-safety).
 
 ## Standalone requirement workflows
 

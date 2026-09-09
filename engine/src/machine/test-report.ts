@@ -1,93 +1,18 @@
-/**
- * Machine-readable test report parsing + the TestRun trust judgment.
- *
- * Deterministic parsing of structured artifacts (vitest/jest JSON, JUnit
- * XML) — never regex over human-oriented prose. The report artifact is the
- * anti-spoof: `echo "npm test: 5 passing"` exits 0 but writes no report.
- *
- * PURE module: report *discovery* (filesystem walking, freshness stats)
- * lives in report-discovery.ts so the reducer core can import the judgment
- * without transitively importing node:fs.
- */
+/** Guarded Skill Machine policy over shared structured report facts. */
 
-import type { TestReportSummary } from "./types";
+import type { TestReportSummary } from "../core/structured-test-report";
 
-// --- Pure parsers ---
-
-/**
- * The single count-sanity gate for every TestReportSummary: a summary that
- * exists has non-negative integer counts with failed ≤ total. Every
- * construction site (the artifact parsers below AND the ledger read-back in
- * evidence.ts) funnels through here, so an impossible-count report can never
- * exist to vouch — fail closed to null (→ the run stays untrusted).
- */
-export function parseReportSummary(
-  total: unknown,
-  failed: unknown,
-  source: TestReportSummary["source"],
-): TestReportSummary | null {
-  if (typeof total !== "number" || typeof failed !== "number") return null;
-  if (!Number.isInteger(total) || !Number.isInteger(failed)) return null;
-  if (total < 0 || failed < 0 || failed > total) return null;
-  // Sole producer of the branded TestReportSummary: the count-sanity checks
-  // above ARE the brand's invariant, so the cast is justified exactly here.
-  return { total, failed, source } as TestReportSummary;
-}
-
-/** vitest `--reporter=json` / jest `--json` share the summary shape. */
-export function parseVitestJson(content: string): TestReportSummary | null {
-  let raw: unknown;
-  try {
-    raw = JSON.parse(content);
-  } catch {
-    return null;
-  }
-  if (typeof raw !== "object" || raw === null) return null;
-  const o = raw as Record<string, unknown>;
-  return parseReportSummary(o.numTotalTests, o.numFailedTests, "vitest-json");
-}
-
-/** Sum tests/failures/errors across <testsuite> elements (surefire, failsafe, gradle). */
-export function parseJunitXml(content: string): TestReportSummary | null {
-  const suites = [...content.matchAll(/<testsuite\b[^>]*>/g)];
-  if (suites.length === 0) return null;
-
-  let total = 0;
-  let failed = 0;
-  let sawCounts = false;
-  for (const [tag] of suites) {
-    const tests = tag.match(/\btests="(\d+)"/);
-    if (!tests) continue;
-    sawCounts = true;
-    total += Number(tests[1]);
-    const failures = tag.match(/\bfailures="(\d+)"/);
-    const errors = tag.match(/\berrors="(\d+)"/);
-    failed += Number(failures?.[1] ?? 0) + Number(errors?.[1] ?? 0);
-  }
-  // \d+ capture groups guarantee non-negative integers per suite, but the
-  // failures+errors sum can still exceed tests in a malformed report —
-  // parseReportSummary refuses it (fail closed) rather than vouch.
-  return sawCounts ? parseReportSummary(total, failed, "junit-xml") : null;
-}
-
-/** Merge summaries from multiple report files of one run. The inputs must
- *  share ONE source — enforced at runtime, not by comment: a mixed-source
- *  merge would stamp the sum with the first summary's source, silently
- *  mislabeling half the counts. Fail closed to null instead. */
-export function mergeSummaries(summaries: readonly TestReportSummary[]): TestReportSummary | null {
-  if (summaries.length === 0) return null;
-  if (summaries.some((s) => s.source !== summaries[0].source)) return null;
-  // Route the summed counts back through the sole smart constructor rather
-  // than casting a fresh literal: summing sane summaries stays sane, but the
-  // brand must be minted where its invariant is (re)checked.
-  let total = 0;
-  let failed = 0;
-  for (const s of summaries) {
-    total += s.total;
-    failed += s.failed;
-  }
-  return parseReportSummary(total, failed, summaries[0].source);
-}
+export {
+  mergeSummaries,
+  parseJunitXml,
+  parseReportSummary,
+  parseStructuredTestReportBytes,
+  parseVitestJson,
+  type StructuredReportError,
+  type StructuredReportErrorReason,
+  type StructuredReportParseResult,
+  type TestReportSummary,
+} from "../core/structured-test-report";
 
 // --- Pure judgment ---
 

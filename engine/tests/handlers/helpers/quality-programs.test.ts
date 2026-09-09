@@ -135,10 +135,12 @@ describe("quality-program helper boundaries", () => {
     expect(Object.keys(surface).sort()).toEqual([
       "applyWaveFacadeSubmission",
       "handleWaveReviewContext",
+      "inspectRemediationFacade",
       "parseRegisteredFacadeProgram",
       "parseRemediationStartInput",
       "parseStandaloneStartInput",
       "parseWaveGateStartInput",
+      "prepareRemediationFacadeStart",
       "readStandaloneReviewedSource",
       "recoverOrphanedWaveGateFacade",
       "renderSpawnTask",

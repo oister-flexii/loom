@@ -260,6 +260,7 @@ function standaloneAndRemediationSmoke(): void {
     sourceRunsRoot: runsRoot,
     sourceRun: reviewRun,
     supportPaths: [],
+    defectFamily: { kind: "not-required" },
   })), "remediation start");
   asDone(run(cwd, ["resume", "--runs-root", runsRoot, "--run", remediationRun]), "remediation terminal replay");
   check(git(cwd, ["diff", "--cached", "--name-only"]) === changedPath, "remediation installed a non-authoritative staged set");

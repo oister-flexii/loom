@@ -14,6 +14,7 @@ export {
   type FacadeDriveResult,
   type ProgramParse,
   type RegisteredRemediationProgram,
+  type RemediationStartInputV2,
   type RegisteredStandaloneProgram,
   type RegisteredWaveGateProgram,
 } from './helpers';
@@ -35,4 +36,10 @@ export {
   waveGateDecisionMismatch,
   type WaveReviewContextAuthority,
 } from './wave-gate';
-export { resumeRemediationFacade, startRemediationFacade } from './remediation';
+export {
+  inspectRemediationFacade,
+  prepareRemediationFacadeStart,
+  resumeRemediationFacade,
+  startRemediationFacade,
+  type PreparedRemediationFacadeStart,
+} from './remediation';

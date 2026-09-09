@@ -131,6 +131,8 @@ export const DEFAULT_BOUNDARIES: readonly BoundaryRule[] = [
       "engine/src/core/review-panel.ts": ["node:path"],
       "engine/src/core/standalone-review.ts": ["node:crypto"],
       "engine/src/core/standalone-review-machine.ts": ["node:crypto", "node:util"],
+      // Exact runtime entry and transitive implementation bytes are gated by machine-purity.
+      "engine/src/core/structured-test-report.ts": ["saxes"],
       "engine/src/core/wave-gate-machine.ts": ["node:crypto"],
       "engine/src/utils/find-file.ts": ["node:fs", "node:path"],
     },

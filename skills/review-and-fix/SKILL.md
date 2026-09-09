@@ -1,6 +1,6 @@
 ---
 name: review-and-fix
-version: "3.1.0"
+version: "4.0.0"
 description: "Review a PR, adjudicate critical findings, remediate, validate, and install an exact verified Git index."
 ---
 
@@ -26,11 +26,20 @@ plan → remediation → validation → verified index installation → commit/p
 - Execute only `spawn-batch`, `await-user`, `blocked`, or `done` actions.
 - Never hand-build findings, verdicts, manifests, transcript files, Git
   pathspecs, or protected-state mutations.
-- Refuted criticals are audited and never fixed. Every surviving critical is
-  mandatory. By default, the parent autonomously dispositions each advisory as
-  accepted, deferred, or dismissed; it does not ask the operator to choose IDs.
-  Validation must pass before remediation installation.
-- Never force-push.
+- Refuted criticals are audited and never fixed. Every surviving critical ID
+  must be copied exactly once from canonical `result.json` into a disposition;
+  no caller mints a replacement Finding ID. A repaired disposition may refer to
+  a separately named Declared Repair Group, but that group ID never replaces
+  the source Finding ID. Unresolved/out-of-scope dispositions are valid and
+  block installation.
+- Advisory dispositions remain the existing parent policy: accepted, deferred,
+  or dismissed. Advisories are never inserted into critical repair groups.
+- Grouping, root cause, invariant, sibling accounting, and Historical RED are
+  `DECLARED`. Repaired checks alone become `ENGINE_OBSERVED`. Call the bounded
+  result `repair-checked`, never proven closure or `ResolvedFinding`. An
+  operator-owned fixed command can fabricate a syntactically valid new report;
+  fresh structured engine observations are not proof of test semantics.
+- Validation must pass before remediation installation. Never force-push.
 
 ## Phase 1 — Registered standalone review
 
@@ -77,65 +86,177 @@ critical sets through its registered Refutation Panel and publishes canonical
 
 ## Phase 2 — Plan
 
-Every surviving critical Finding is mandatory. Independently disposition every
-advisory as `accepted`, `deferred`, or `dismissed`. By default, make this choice
-autonomously from the evidence, correctness impact, risk, and reviewed scope;
-do not ask the operator to choose advisory IDs. Accept an advisory when its
-claim is sound and a complete in-scope fix is practical. Defer or dismiss only
-with a concrete evidence-based reason. An explicit user instruction about a
-specific advisory overrides this default.
+Every surviving critical Finding is mandatory to account for. Copy it exactly
+once using its canonical `result.json` ID unchanged:
 
-If neither criticals nor accepted advisories survive, report the clean review
-or advisory dispositions and stop.
+- `repaired` names one separately identified Declared Repair Group;
+- `unresolved` gives a non-empty reason and blocks installation;
+- `out-of-scope` gives a non-empty reason and blocks installation.
+
+A repair group has a unique group ID, a non-empty set of those original Finding
+IDs, one `DECLARED` root cause, one `DECLARED` invariant, mandatory sibling
+accounting, and at least one selected fixed check. It does not merge or replace
+Findings. Repeated sibling paths within one group are invalid. Distinct groups
+may reuse one sibling path when the statuses are compatible; reasons remain
+group-local declarations. Any unresolved/out-of-scope sibling blocks.
+
+Independently disposition every advisory as `accepted`, `deferred`, or
+`dismissed`. By default, make this choice autonomously from the evidence,
+correctness impact, risk, and reviewed scope; do not ask the operator to choose advisory IDs. Accept an advisory when its claim is sound and a complete
+in-scope fix is practical. Defer or dismiss only with a concrete evidence-based
+reason. An explicit user instruction about a specific advisory overrides this
+default. Never add an advisory or refuted critical to `defectFamily`.
+
+If no code or documentation fix remains after advisory disposition, report the
+clean review or dispositions and stop. Zero surviving criticals require no
+check, manifest, or subprocess, but every remediation start still requires the
+explicit `defectFamily: {"kind":"not-required"}` input.
 
 Write `.claude/plans/YYYY-MM-DD-pr-remediation.md` containing branch, exact
-scope, review Run Directory, every surviving critical and concrete fix, every
-advisory disposition and reason, accepted advisory fixes, refuted-finding
-audit, and validation commands. `--dry-run` stops here.
+scope, review Run Directory, every surviving-critical disposition, every
+Declared Repair Group, sibling disposition, selected check ID and Historical
+RED declaration, every advisory disposition/reason, accepted advisory fixes,
+refuted-finding audit, and validation commands. Keep `DECLARED` facts distinct
+from checks the engine will later observe. `--dry-run` stops here.
 
 ## Phase 3 — Implement and validate
 
-Read `rules/architecture.md` and relevant language rules. Apply only planned
-surviving findings. Register every necessary support path in the remediation
-start input. Run typecheck/build and full relevant tests; iterate to a real fix.
+Read `rules/architecture.md` and relevant language rules. Apply only criticals
+dispositioned `repaired` and accepted advisories; never repair a refuted
+Finding. Register every necessary support path in the remediation start input.
+Run typecheck/build and full relevant tests; iterate to a real fix. These
+development runs are not P3 evidence—the registered remediation runner must
+freshly observe each selected fixed check and its exact structured report.
 Stop without staging or committing if validation cannot pass.
 
 ## Phase 4 — Registered remediation
 
 Name a fresh remediation Run Directory. The source review run remains immutable
-authority, and `sourceRun` names it the same way `--run` does — bare run id or
-full path, resolved against `sourceRunsRoot`:
+authority, and `sourceRun` names it the same way `--run` does — bare run id or a
+full path resolved against `sourceRunsRoot`. Every new start input is schema v2
+and contains exactly `sourceRunsRoot`, `sourceRun`, `supportPaths`, and
+`defectFamily`.
+
+For a source with zero surviving criticals:
 
 ```bash
 bun ${LOOM_DIR}/engine/src/cli.ts helper orchestration start remediation \
   --runs-root ".claude/reviews/review-and-fix-runs" \
   --run "<fresh-remediation-run-id>" <<'JSON'
 {
-  "sourceRunsRoot":".claude/reviews/review-and-fix-runs",
-  "sourceRun":"<review-run-id>",
-  "supportPaths":["<plan-or-regression-path-not-in-reviewed-scope>"]
+  "sourceRunsRoot": ".claude/reviews/review-and-fix-runs",
+  "sourceRun": "<review-run-id>",
+  "supportPaths": ["<plan-or-accepted-advisory-path-not-in-reviewed-scope>"],
+  "defectFamily": { "kind": "not-required" }
 }
 JSON
 ```
 
-Every path the remediation touches that is NOT inside the frozen review scope —
-the plan file, a regression pin added for an accepted fix — must be named in
-`supportPaths` **here**, at start. The start input is registered exclusively and
-admits only a byte-identical re-registration, so a run cannot authorize a path
-its own start input never named.
+For critical repairs, copy real Finding IDs and selected manifest check IDs;
+do not reuse these placeholders literally:
 
-A `blocked` start reports the exact cause and leaves the run registered. Never
-delete a run directory to retry: the run holds the evidence of why it blocked.
+```json
+{
+  "sourceRunsRoot": ".claude/reviews/review-and-fix-runs",
+  "sourceRun": "run.source-review",
+  "supportPaths": ["tests/repair-regression.test.ts"],
+  "defectFamily": {
+    "kind": "declared-defect-family-accounting",
+    "provenance": "DECLARED",
+    "dispositions": [
+      {
+        "findingId": "code-reviewer:1",
+        "status": "repaired",
+        "repairGroupId": "group.repair-predicate"
+      }
+    ],
+    "groups": [
+      {
+        "kind": "declared-repair-group",
+        "provenance": "DECLARED",
+        "repairGroupId": "group.repair-predicate",
+        "findingIds": ["code-reviewer:1"],
+        "rootCause": {
+          "provenance": "DECLARED",
+          "statement": "The predicate returned the vulnerable constant."
+        },
+        "invariant": {
+          "provenance": "DECLARED",
+          "statement": "The repaired predicate returns the intended value."
+        },
+        "siblings": {
+          "kind": "none-declared",
+          "provenance": "DECLARED",
+          "reason": "No sibling implementation paths were identified."
+        },
+        "checks": [
+          {
+            "checkId": "project:repair-regression",
+            "historicalRed": {
+              "kind": "historical-red",
+              "provenance": "DECLARED",
+              "statement": "The assertion fails against the reviewed vulnerable behavior.",
+              "reference": null
+            }
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Every path the remediation touches that is NOT inside the frozen review scope —
+the plan file or a regression pin added for a fix — must be named in
+`supportPaths` **at start**. The registered input is immutable, so a run cannot
+authorize a path its own start input never named. If one was omitted, start a
+**fresh** remediation run whose start input adds the path to `supportPaths`.
+
+Preflight authenticates the source, parses accounting, selects operator check
+authority when criticals exist, and captures candidate bytes **before** creating
+the requested Run Directory. Invalid source/input/declaration/manifest/check
+configuration is a start error and creates no run. Once registration exists, a
+returned `blocked` action is durable run evidence. Never delete it to retry.
 Recovery depends on the cause:
 
-- **source review is not `done`** — finish or fix the source run, then `resume`
-  the SAME run.
-- **unrelated staged work** — unstage it, then `resume` the SAME run.
-- **unauthorized dirty paths** — resume the same run only if the dirty state is
-  genuinely unrelated and can be reverted or committed away. If the path belongs
-  to the remediation (the case `supportPaths` exists for), the same run can
-  never authorize it: start a **fresh** remediation run whose start input adds
-  the path to `supportPaths`. The blocked run stays in place as evidence.
+- **unrelated staged/dirty work** — remove it, then start a **fresh** run;
+  removal changes the registered candidate, so the old run cannot be reused;
+- **unauthorized remediation path** — start a **fresh** run whose input includes
+  that `supportPath`. The blocked run stays in place as evidence.
+- **failed/missing/malformed/zero-test check or candidate drift after
+  registration** — correct the cause and start a fresh run; a failed check or
+  changed candidate cannot reuse prior evidence;
+- **unfinished schema-v1 run** — start a fresh schema-v2 run. Completed v1 runs
+  remain read-only with `historical-unknown` assessment, returning the old
+  receipt without reinstalling or minting current installation authority.
+- **missing/malformed completed-v2 checkpoint audit arrays** — retain the
+  explicit `remediation checkpoint audit paths are missing or malformed`
+  diagnostic; do not replace missing facts with empty arrays or edit evidence.
+- **index installed but checkpoint recording failed** — preserve the actual
+  installation receipt and installed-index diagnostic. Do not claim rollback,
+  nothing-installed, or hand-repair/reinstall from the interrupted checkpoint.
+
+All-unresolved accounting is represented without fake groups or checks:
+
+```json
+{
+  "kind": "declared-defect-family-accounting",
+  "provenance": "DECLARED",
+  "dispositions": [
+    {
+      "findingId": "code-reviewer:1",
+      "status": "unresolved",
+      "reason": "The repair has not been implemented."
+    }
+  ],
+  "groups": []
+}
+```
+
+For a source whose exact critical set is represented above, this is valid
+accounting and intentionally blocked during preflight, so no remediation Run
+Directory is created. Do not convert the unresolved Finding into a fake repaired
+group merely to pass preflight.
 
 When a fresh run supersedes a blocked one, say so in the retired run rather
 than only in this session, so the next operator reading the runs root can tell
@@ -152,18 +273,58 @@ bun ${LOOM_DIR}/engine/src/cli.ts helper orchestration abandon \
 run's program, state, per-slot capture, and rejection diagnostics in one
 command — use it instead of hand-reading `checkpoint.json` and `events/`.
 
-Resume until `done`. The engine proves observed dirty paths are authorized,
-rejects excluded Run evidence and unrelated staged work, stages literal paths
-in a temporary index, proves `audited == staged`, rechecks the repository
-witness under the real index lock, and atomically installs the verified index.
-The parent must not run its own staging recipe.
+Resume until `done`. For critical repair, the selected operator command must
+have `report.kind = "required-file"` and itself produce its exact configured,
+ignored, untracked `.loom/completion-reports/...` JUnit/Vitest file **anew**.
+Before launch the engine removes that exact old regular report through a retained
+Linux parent descriptor with no-follow, descriptor-relative unlink. Touching
+seeded bytes cannot pass; a new report with identical bytes may. Only ENOENT is
+absence; unsafe paths, permission errors, or unsupported reset fail before launch
+with `required report reset failed before launch`. Strict critical reset is
+**Linux-only**: Darwin fails closed before launch. This does not change
+zero-critical remediation or Wave behavior.
 
-Commit the installed index and push unless `--no-push`. A push failure leaves
-the valid local commit intact and is reported with its SHA.
+The engine requires normal exit, more than zero executed tests, zero failures,
+and unchanged candidate authority. Reports are limited to **8 MiB**, with XML
+element depth at most **128** (including diagnostics). V2 event reads, append
+reconciliation/new appends, and CLI inspection enforce **12 MiB per encoded event,
+64 MiB per encoded journal, 1024 records**, before oversized decoding/JSON parsing.
+These are not blanket limits on other Run artifacts or legacy journal consumers.
+Multiple groups may select the same check ID; each distinct selected ID executes
+once. See [operator enrollment](../../docs/operations.md#enrolling-a-critical-repair-check).
+Loom's existing protected `project:verify` has `report.kind: "not-required"` and
+remains ineligible for critical P3; these examples do not enroll a replacement.
+
+The engine proves observed dirty paths are authorized, rejects excluded Run
+evidence and unrelated staged work, stages literal paths in a temporary index,
+proves `audited == staged`, rechecks candidate and repository witnesses under
+the real index lock, and atomically installs the verified index. The parent must
+not run its own staging recipe and must never inject command authority, process
+outcomes, report bytes/counts, events, manifests, temporary-index outcomes,
+installation receipts, or Run JSON through remediation input or hand-built run
+artifacts.
+
+Read success from the external action's `outcome.installation` (the actual Git
+adapter receipt) and `outcome.defectFamilyAssessment` (`repair-checked` or
+`not-required`). Commit the installed index and push unless `--no-push`. A push
+failure leaves the valid local commit intact and is reported with its SHA.
+
+**Installing this feature itself:** after external validation, the currently
+admitted CLI and loaded Skill 3.1 may review/install under their existing
+protocol. This is not a v2 repair-checked publication; its completed v1 run becomes
+read-only historical-unknown after reload. The immutable source review remains
+source authority and is not rewritten. The parent owns registered installation
+and publication; documentation edits neither advance a Run nor grant authority.
+
+A newly installed/updated Pi package requires `/reload` or a full Pi restart
+before this schema-v2 live workflow can mutate anything. Never unset runtime
+admission variables to force a fresh CLI through an older loaded extension.
 
 ## Phase 5 — Report
 
-Report found/refuted/surviving/fixed/advisory counts, every advisory disposition
-and reason, both Run Directories, plan, changed files, validation evidence,
-installation receipt, commit SHA, branch, and push status. Include every
-refuted finding with panel reasoning.
+Report found/refuted/surviving/repaired/advisory counts, every original critical
+Finding ID and disposition, Declared Repair Groups, blockers, every advisory
+disposition/reason, both Run Directories, plan, changed files, validation
+evidence, Defect-Family Assessment with provenance, actual installation receipt,
+commit SHA, branch, and push status. Include every refuted finding with panel
+reasoning. Say `repair-checked`, not closed/proven/resolved.

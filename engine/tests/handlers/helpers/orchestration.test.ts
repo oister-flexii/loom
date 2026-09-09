@@ -22,7 +22,7 @@ import {
 import { persistedWaveAttemptTwoCompatibilityProblem, prepareOrphanedWaveGateRecovery } from "../../../src/handlers/helpers/programs/wave-gate";
 import { captureKey } from "../../../src/core/harness-capture";
 import { buildContextPacket, encodeByteSection } from "../../../src/orchestration/context-packets";
-import { openRunDirectory, inspectRunDirectoryEntry, type RunDirHandle } from "../../../src/orchestration/run-directory-handle";
+import { createRunDirectory, openRunDirectory, inspectRunDirectoryEntry, type RunDirHandle } from "../../../src/orchestration/run-directory-handle";
 import { readSessionRunBindings } from "../../../src/orchestration/session-run-bindings";
 import type { Task, TaskGraph } from "../../../src/types";
 import {
@@ -876,17 +876,27 @@ describe("orchestration CLI", () => {
     expect(stored.value?.requestId).toBe(request.requestId);
   });
 
-  it.each([
-    ["wave-gate", { wave: null }],
-    ["remediation", { sourceRunsRoot: "/missing", sourceRun: "/missing/run", supportPaths: [] }],
-  ] as const)("exposes the %s façade and returns a typed blocked action when authority is unavailable", (program, input) => {
+  it("exposes the wave-gate façade and returns a typed blocked action when authority is unavailable", () => {
     const root = project();
     const runsRoot = join(root, "runs");
-    const runDir = join(runsRoot, `run.${program}`);
+    const runDir = join(runsRoot, "run.wave-gate");
     mkdirSync(runDir, { recursive: true });
-    const result = runCli(["start", program, "--runs-root", runsRoot, "--run", runDir], JSON.stringify(input), root);
+    const result = runCli(["start", "wave-gate", "--runs-root", runsRoot, "--run", runDir], JSON.stringify({ wave: null }), root);
     expect(result.status, result.stderr).toBe(0);
     expect(JSON.parse(result.stdout).kind).toBe("blocked");
+  });
+
+  it("refuses unavailable remediation source authority before claiming a Run Directory", () => {
+    const root = project();
+    const runsRoot = join(root, "runs");
+    const runDir = join(runsRoot, "run.remediation");
+    mkdirSync(runsRoot, { recursive: true });
+    const result = runCli(["start", "remediation", "--runs-root", runsRoot, "--run", runDir], JSON.stringify({
+      sourceRunsRoot: "/missing", sourceRun: "/missing/run", supportPaths: [], defectFamily: { kind: "not-required" },
+    }), root);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("source run:");
+    expect(existsSync(runDir)).toBe(false);
   });
 
   it("publishes Pi session capture authority before returning a spawn batch", () => {
@@ -1148,7 +1158,7 @@ describe("orchestration CLI", () => {
     expect(resumed.stderr).toContain("invalid JSON");
   });
 
-  it("preserves the parser cause and Run Directory for malformed facade checkpoints", () => {
+  it("preserves the parser cause and Run Directory for malformed facade checkpoints", async () => {
     const root = project();
     const runsRoot = join(root, "runs");
     const standaloneRun = join(runsRoot, "run.malformed-standalone-checkpoint");
@@ -1166,10 +1176,15 @@ describe("orchestration CLI", () => {
     expect(standaloneResumed.status).not.toBe(0);
     expect(standaloneResumed.stderr).toContain(`standalone review checkpoint is invalid JSON for ${standaloneRun}:`);
 
-    const remediationStarted = runCli([
-      "start", "remediation", "--runs-root", runsRoot, "--run", remediationRun,
-    ], JSON.stringify({ sourceRunsRoot: runsRoot, sourceRun: "run.absent-source", supportPaths: [] }), root);
-    expect(remediationStarted.status, remediationStarted.stderr).toBe(0);
+    const remediation = createRunDirectory(runsRoot, remediationRun);
+    expect(remediation.ok).toBe(true);
+    if (!remediation.ok) return;
+    const remediationStarted = await remediation.value.registerProgram({
+      schemaVersion: 1,
+      kind: "remediation",
+      input: { sourceRunsRoot: runsRoot, sourceRun: "run.absent-source", supportPaths: [] },
+    });
+    expect(remediationStarted.ok).toBe(true);
     writeFileSync(join(remediationRun, "checkpoint.json"), "{broken\n");
 
     const remediationResumed = runCli(["resume", "--runs-root", runsRoot, "--run", remediationRun], "", root);
@@ -3470,7 +3485,7 @@ describe("orchestration CLI", () => {
   it("installs only a standalone-authorized dirty set through the remediation façade", async () => {
     const { repository, runsRoot, sourceRun, remediationRun, git } = await cleanStandaloneReviewFixture("loom-remediation-facade-runs-");
     const remediated = runCli(["start", "remediation", "--runs-root", runsRoot, "--run", remediationRun], JSON.stringify({
-      sourceRunsRoot: runsRoot, sourceRun, supportPaths: [],
+      sourceRunsRoot: runsRoot, sourceRun, supportPaths: [], defectFamily: { kind: "not-required" },
     }), repository);
     expect(remediated.status, remediated.stderr).toBe(0);
     expect(JSON.parse(remediated.stdout).kind).toBe("done");
@@ -3495,7 +3510,7 @@ describe("orchestration CLI", () => {
     // the frozen review scope — so `supportPaths` is its only authorization.
     writeFileSync(join(repository, "pin.test.ts"), "regression pin\n");
     const blocked = runCli(["start", "remediation", "--runs-root", runsRoot, "--run", remediationRun], JSON.stringify({
-      sourceRunsRoot: runsRoot, sourceRun, supportPaths: [],
+      sourceRunsRoot: runsRoot, sourceRun, supportPaths: [], defectFamily: { kind: "not-required" },
     }), repository);
 
     expect(blocked.status, blocked.stderr).toBe(0);
@@ -3514,7 +3529,7 @@ describe("orchestration CLI", () => {
     const freshRun = join(runsRoot, "remediation-2");
     mkdirSync(freshRun);
     const fresh = runCli(["start", "remediation", "--runs-root", runsRoot, "--run", freshRun], JSON.stringify({
-      sourceRunsRoot: runsRoot, sourceRun, supportPaths: ["pin.test.ts"],
+      sourceRunsRoot: runsRoot, sourceRun, supportPaths: ["pin.test.ts"], defectFamily: { kind: "not-required" },
     }), repository);
     expect(fresh.status, fresh.stderr).toBe(0);
     expect(JSON.parse(fresh.stdout).kind).toBe("done");
@@ -3673,6 +3688,7 @@ describe("orchestration CLI", () => {
         sourceRunsRoot: runsRoot,
         sourceRun: join("nested", "run.not-a-child"),
         supportPaths: [],
+        defectFamily: { kind: "not-required" },
       }), root);
 
       expect(started.status).not.toBe(0);
@@ -3680,7 +3696,7 @@ describe("orchestration CLI", () => {
       expect(existsSync(join(runsRoot, "remediation.bad-source"))).toBe(false);
     });
 
-    it("accepts a bare sourceRun naming a run beside its own runs-root", () => {
+    it("accepts a bare sourceRun reference shape but refuses an absent source before claiming a run", () => {
       const root = project();
       const runsRoot = join(root, "runs");
       mkdirSync(runsRoot, { recursive: true });
@@ -3694,13 +3710,13 @@ describe("orchestration CLI", () => {
         sourceRunsRoot: runsRoot,
         sourceRun: "run.absent-review",
         supportPaths: [],
+        defectFamily: { kind: "not-required" },
       }), root);
 
-      expect(started.status, started.stderr).toBe(0);
-      const action = JSON.parse(started.stdout) as { kind: string; diagnostic: { message: string } };
-      expect(action.kind).toBe("blocked");
-      expect(action.diagnostic.message).toContain("source run: ");
-      expect(action.diagnostic.message).toContain("does not exist");
+      expect(started.status).not.toBe(0);
+      expect(started.stderr).toContain("source run: ");
+      expect(started.stderr).toContain("does not exist");
+      expect(existsSync(join(runsRoot, "remediation.bare-source"))).toBe(false);
     });
   });
 

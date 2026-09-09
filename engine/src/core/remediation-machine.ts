@@ -28,6 +28,13 @@ import {
   type AuthoritativeStandaloneReviewResult,
 } from "./standalone-review-machine";
 import { parseReviewPath } from "./review-packet";
+import {
+  compareCandidateRepositoryWitnesses,
+  inspectInstallableDefectFamilyAssessment,
+  type CandidateRepositoryWitness,
+  type InstallableDefectFamilyAssessment,
+  type InstallableDefectFamilyAssessmentProjection,
+} from "./defect-family-accounting";
 
 const ok = <T, E = never>(value: T): DomainResult<T, E> => canonicalRecord({ ok: true, value });
 const fail = <T = never, E = never>(error: E): DomainResult<T, E> => canonicalRecord({ ok: false, error });
@@ -1982,9 +1989,9 @@ export function parseVerifiedTemporaryIndex(
 }
 
 declare class VerifiedIndexInstallationMembership { private readonly verifiedIndexInstallationMembership: true }
+declare class HistoricalIndexInstallationMembership { private readonly historicalIndexInstallationMembership: true }
 
-export type VerifiedIndexInstallation = VerifiedIndexInstallationMembership & Readonly<{
-  schemaVersion: 1;
+type VerifiedIndexInstallationFields = Readonly<{
   kind: "verified-index-installation";
   verified: VerifiedTemporaryIndex;
   verifiedIndexDigest: ArtifactDigest;
@@ -1992,15 +1999,59 @@ export type VerifiedIndexInstallation = VerifiedIndexInstallationMembership & Re
   digest: ArtifactDigest;
 }>;
 
-const verifiedInstallationCache = new WeakSet<object>();
+type CurrentIndexInstallationFields = VerifiedIndexInstallationFields & Readonly<{
+  schemaVersion: 2;
+  assessment: InstallableDefectFamilyAssessment;
+  assessmentDigest: ArtifactDigest;
+  candidateWitness: CandidateRepositoryWitness;
+  candidateWitnessDigest: ArtifactDigest;
+}>;
+
+/** Read-only installation history; never authority for a new Git installation. */
+export type HistoricalVerifiedIndexInstallation = HistoricalIndexInstallationMembership &
+  VerifiedIndexInstallationFields & Readonly<{ schemaVersion: 1 }>;
+
+export type CurrentVerifiedIndexInstallation = VerifiedIndexInstallationMembership & CurrentIndexInstallationFields;
+
+export type VerifiedIndexInstallation = HistoricalVerifiedIndexInstallation | CurrentVerifiedIndexInstallation;
+
+export type VerifiedIndexInstallationAuthority = Readonly<{
+  verified: VerifiedTemporaryIndex;
+  intent: InstallVerifiedIndex;
+  assessment: InstallableDefectFamilyAssessmentProjection;
+  candidateWitness: CandidateRepositoryWitness;
+}>;
+
+const verifiedInstallationAuthority = new WeakMap<object, VerifiedIndexInstallationAuthority>();
 
 export function prepareVerifiedIndexInstallation(
   verified: VerifiedTemporaryIndex,
+  assessment: InstallableDefectFamilyAssessment,
   rawEffectId: unknown,
   currentRepositoryWitness: RepositorySnapshotWitness,
-): DomainResult<VerifiedIndexInstallation, TemporaryIndexError> {
+  currentCandidateWitness: CandidateRepositoryWitness,
+): DomainResult<CurrentVerifiedIndexInstallation, TemporaryIndexError> {
   if (!verifiedTemporaryIndexCache.has(verified)) {
     return fail(canonicalRecord({ kind: "temporary-index-rejected", field: "verified", message: "installation accepts only a nominal verified temporary index" }));
+  }
+  const assessmentProjection = inspectInstallableDefectFamilyAssessment(assessment);
+  if (!assessmentProjection.ok) {
+    return fail(canonicalRecord({ kind: "temporary-index-rejected", field: "assessment", message: assessmentProjection.error.failures.map(({ message }) => message).join("; ") }));
+  }
+  const parsedCandidate = compareCandidateRepositoryWitnesses(currentCandidateWitness, currentCandidateWitness);
+  if (!parsedCandidate.ok) {
+    return fail(canonicalRecord({ kind: "temporary-index-rejected", field: "currentCandidateWitness", message: parsedCandidate.error.failures.map(({ message }) => message).join("; ") }));
+  }
+  if (assessmentProjection.value.candidateWitnessDigest !== null &&
+      assessmentProjection.value.candidateWitnessDigest !== currentCandidateWitness.digest) {
+    return fail(canonicalRecord({ kind: "temporary-index-rejected", field: "assessment", message: "repair-checked assessment belongs to a different candidate witness" }));
+  }
+  const gitFields = currentCandidateWitness.gitWitness;
+  if (gitFields.baseTreeDigest !== currentRepositoryWitness.baseTreeDigest ||
+      gitFields.indexDigest !== currentRepositoryWitness.indexDigest ||
+      gitFields.worktreeDigest !== currentRepositoryWitness.worktreeDigest ||
+      gitFields.digest !== currentRepositoryWitness.digest) {
+    return fail(canonicalRecord({ kind: "temporary-index-rejected", field: "currentCandidateWitness", message: "candidate Git witness does not match current repository witness" }));
   }
   const effectId = parseEffectId(rawEffectId);
   if (!effectId.ok) return fail(canonicalRecord({ kind: "temporary-index-rejected", field: "effectId", message: effectId.error.message }));
@@ -2020,36 +2071,104 @@ export function prepareVerifiedIndexInstallation(
     indexDigest: verified.indexDigest,
     witnessDigest: verified.witnessDigest,
   });
-  const installation = canonicalRecord({
-    schemaVersion: 1 as const,
+  const identity = {
+    verifiedIndexDigest: verified.digest,
+    assessmentDigest: assessmentProjection.value.assessmentDigest,
+    candidateWitnessDigest: currentCandidateWitness.digest,
+    intent,
+  };
+  const fields: CurrentIndexInstallationFields = {
+    schemaVersion: 2,
     kind: "verified-index-installation" as const,
     verified,
     verifiedIndexDigest: verified.digest,
+    assessment,
+    assessmentDigest: assessmentProjection.value.assessmentDigest,
+    candidateWitness: currentCandidateWitness,
+    candidateWitnessDigest: currentCandidateWitness.digest,
     intent,
-    digest: digestJson({ verifiedIndexDigest: verified.digest, intent }),
-  }) as unknown as VerifiedIndexInstallation;
-  verifiedInstallationCache.add(installation);
+    digest: digestJson(identity),
+  };
+  const installation = canonicalRecord(fields) as CurrentVerifiedIndexInstallation;
+  verifiedInstallationAuthority.set(installation, canonicalRecord({
+    verified,
+    intent,
+    assessment: assessmentProjection.value,
+    candidateWitness: currentCandidateWitness,
+  }));
   return ok(installation);
+}
+
+export function inspectVerifiedIndexInstallation(
+  installation: VerifiedIndexInstallation,
+): DomainResult<VerifiedIndexInstallationAuthority, TemporaryIndexError> {
+  const authority = typeof installation === "object" && installation !== null
+    ? verifiedInstallationAuthority.get(installation)
+    : undefined;
+  return authority === undefined
+    ? fail(canonicalRecord({ kind: "temporary-index-rejected", field: "installation", message: "verified installation lacks opaque P3 authority" }))
+    : ok(authority);
 }
 
 export function parseVerifiedIndexInstallation(
   raw: unknown,
   publicationResolver: StandaloneResultPublicationAuthorityResolver,
+  assessment?: InstallableDefectFamilyAssessment,
+  candidateWitness?: CandidateRepositoryWitness,
 ): DomainResult<VerifiedIndexInstallation, string> {
-  const record = exactRecord(raw, ["schemaVersion", "kind", "verified", "verifiedIndexDigest", "intent", "digest"], "installation");
+  let version: unknown;
+  try {
+    version = typeof raw === "object" && raw !== null
+      ? Object.getOwnPropertyDescriptor(raw, "schemaVersion")?.value
+      : undefined;
+  } catch {
+    return fail("installation schema could not be safely inspected");
+  }
+  const fields = version === 2
+    ? ["schemaVersion", "kind", "verified", "verifiedIndexDigest", "assessment", "assessmentDigest", "candidateWitness", "candidateWitnessDigest", "intent", "digest"]
+    : ["schemaVersion", "kind", "verified", "verifiedIndexDigest", "intent", "digest"];
+  const record = exactRecord(raw, fields, "installation");
   if (!record.ok) return record;
-  if (record.value.schemaVersion !== 1 || record.value.kind !== "verified-index-installation") return fail("installation schema or kind is invalid");
+  if ((version !== 1 && version !== 2) || record.value.kind !== "verified-index-installation") return fail("installation schema or kind is invalid");
   const verified = parseVerifiedTemporaryIndex(record.value.verified, publicationResolver);
   const intent = exactRecord(record.value.intent, ["kind", "effectId", "runId", "indexDigest", "witnessDigest"], "installation.intent");
   if (!verified.ok) return verified;
-  if (!intent.ok) return intent;
-  if (intent.value.kind !== "install-verified-index") return fail("installation.intent.kind is invalid");
-  const reconstructed = prepareVerifiedIndexInstallation(verified.value, intent.value.effectId, verified.value.repositoryWitness);
+  if (!intent.ok || intent.value.kind !== "install-verified-index") return fail(intent.ok ? "installation.intent.kind is invalid" : intent.error);
+  if (version === 1) {
+    const expectedDigest = digestJson({ verifiedIndexDigest: verified.value.digest, intent: record.value.intent });
+    if (record.value.verifiedIndexDigest !== verified.value.digest || record.value.digest !== expectedDigest ||
+        intent.value.runId !== verified.value.runId || intent.value.indexDigest !== verified.value.indexDigest ||
+        intent.value.witnessDigest !== verified.value.witnessDigest) return fail("installation nested relationship or digest mismatch");
+    const effectId = parseEffectId(intent.value.effectId);
+    if (!effectId.ok) return fail(effectId.error.message);
+    const historicalIntent: InstallVerifiedIndex = canonicalRecord({
+      kind: "install-verified-index",
+      effectId: effectId.value,
+      runId: verified.value.runId,
+      indexDigest: verified.value.indexDigest,
+      witnessDigest: verified.value.witnessDigest,
+    });
+    const fields: VerifiedIndexInstallationFields & Readonly<{ schemaVersion: 1 }> = {
+      schemaVersion: 1,
+      kind: "verified-index-installation",
+      verified: verified.value,
+      verifiedIndexDigest: verified.value.digest,
+      intent: historicalIntent,
+      digest: expectedDigest,
+    };
+    const legacy = canonicalRecord(fields) as HistoricalVerifiedIndexInstallation;
+    return ok(legacy);
+  }
+  if (assessment === undefined || candidateWitness === undefined) return fail("v2 installation rehydration requires reconstructed assessment and candidate authority");
+  const reconstructed = prepareVerifiedIndexInstallation(
+    verified.value,
+    assessment,
+    intent.value.effectId,
+    verified.value.repositoryWitness,
+    candidateWitness,
+  );
   if (!reconstructed.ok) return fail(reconstructed.error.message);
-  if (record.value.verifiedIndexDigest !== reconstructed.value.verifiedIndexDigest ||
-      record.value.digest !== reconstructed.value.digest ||
-      intent.value.runId !== reconstructed.value.intent.runId || intent.value.indexDigest !== reconstructed.value.intent.indexDigest ||
-      intent.value.witnessDigest !== reconstructed.value.intent.witnessDigest) return fail("installation nested relationship or digest mismatch");
+  if (JSON.stringify(record.value) !== JSON.stringify(reconstructed.value)) return fail("installation nested relationship or digest mismatch");
   return ok(reconstructed.value);
 }
 
@@ -2112,6 +2231,7 @@ export type DoneRemediationState = Readonly<RemediationStateBase & {
   state: "done";
   verified: VerifiedTemporaryIndex;
   installation: VerifiedIndexInstallation;
+  defectFamilyAssessment?: InstallableDefectFamilyAssessmentProjection["assessment"];
   receipt: VerifiedIndexInstalled;
 }>;
 
@@ -2399,7 +2519,8 @@ function reduceParserMintedRemediation(
       return ok(canonicalRecord({ ...state, state: "verified" as const, verified: event.verified }));
     case "verified": {
       if (event.kind !== "index-installed") return transitionFailure(state, event, "invalid-remediation-transition", "event", `event ${event.kind} is not declared from verified`);
-      if (!verifiedInstallationCache.has(event.installation) || event.installation.verifiedIndexDigest !== state.verified.digest) {
+      const installationAuthority = inspectVerifiedIndexInstallation(event.installation);
+      if (!installationAuthority.ok || event.installation.verifiedIndexDigest !== state.verified.digest) {
         return transitionFailure(state, event, "remediation-authority-mismatch", "installation", "installation is stale, foreign, or not prepared from this verified index");
       }
       const reconciled = reconcileEffectReceipt(event.installation.intent, event.receipt);
@@ -2419,6 +2540,7 @@ function reduceParserMintedRemediation(
         consumedRecoveryReceiptIds: state.consumedRecoveryReceiptIds,
         verified: state.verified,
         installation: event.installation,
+        defectFamilyAssessment: installationAuthority.value.assessment.assessment,
         receipt: reconciled.value,
       }));
     }
@@ -2616,6 +2738,8 @@ function parseRemediationStateVariant(
   raw: unknown,
   state: string | null,
   publicationResolver: StandaloneResultPublicationAuthorityResolver,
+  assessment?: InstallableDefectFamilyAssessment,
+  candidateWitness?: CandidateRepositoryWitness,
 ): DomainResult<RemediationState, RemediationStateParseError> {
   if (state !== "recoverable-blocked" && state !== "done") {
     const active = parseActiveState(raw, publicationResolver);
@@ -2715,8 +2839,10 @@ function parseRemediationStateVariant(
       failure: canonicalRecord({ ...failureFields, digest: digest.value }),
     }));
   }
+  const hasP3Assessment = typeof raw === "object" && raw !== null && Object.hasOwn(raw, "defectFamilyAssessment");
   const record = exactRecord(raw, [
-    "state", "authority", "recoveryAttemptIds", "consumedRecoveryReceiptIds", "verified", "installation", "receipt",
+    "state", "authority", "recoveryAttemptIds", "consumedRecoveryReceiptIds", "verified", "installation",
+    ...(hasP3Assessment ? ["defectFamilyAssessment"] : []), "receipt",
   ], "remediationState");
   if (!record.ok) return stateParseFailure(state, "state", record.error);
   const authorityInspection = guardStateRecordInspection(record.value.authority);
@@ -2731,7 +2857,12 @@ function parseRemediationStateVariant(
   const authority = parseRemediationPathAuthority(record.value.authority, publicationResolver);
   const parsedHistory = history(record.value, "remediationState");
   const verified = parseVerifiedTemporaryIndex(record.value.verified, publicationResolver);
-  const installation = parseVerifiedIndexInstallation(record.value.installation, publicationResolver);
+  const installation = parseVerifiedIndexInstallation(
+    record.value.installation,
+    publicationResolver,
+    assessment,
+    candidateWitness,
+  );
   if (!authority.ok) return stateParseFailure(state, "authority", authority.error.message);
   if (!parsedHistory.ok) return stateParseFailure(state, "history", parsedHistory.error);
   const lifecycleHistory = enforceRecoveryHistoryLifecycle(parsedHistory.value, "done", "remediationState");
@@ -2747,12 +2878,22 @@ function parseRemediationStateVariant(
   if (!receipt.ok || receipt.value.kind !== "verified-index-installed") {
     return stateParseFailure(state, "receipt", receipt.ok ? "receipt kind is invalid" : receipt.error.message);
   }
+  const installationAuthority = inspectVerifiedIndexInstallation(installation.value);
+  if (hasP3Assessment) {
+    if (!installationAuthority.ok ||
+        JSON.stringify(record.value.defectFamilyAssessment) !== JSON.stringify(installationAuthority.value.assessment.assessment)) {
+      return stateParseFailure(state, "defectFamilyAssessment", "done P3 assessment does not match opaque installation authority");
+    }
+  } else if (installation.value.schemaVersion === 2) {
+    return stateParseFailure(state, "defectFamilyAssessment", "schema-v2 done remediation requires its P3 assessment");
+  }
   return ok(canonicalRecord({
     state: "done",
     authority: authority.value,
     ...parsedHistory.value,
     verified: verified.value,
     installation: installation.value,
+    ...(installationAuthority.ok ? { defectFamilyAssessment: installationAuthority.value.assessment.assessment } : {}),
     receipt: receipt.value,
   }));
 }
@@ -2761,6 +2902,8 @@ function parseRemediationStateVariant(
 export function parseRemediationState(
   raw: unknown,
   publicationResolver: StandaloneResultPublicationAuthorityResolver,
+  assessment?: InstallableDefectFamilyAssessment,
+  candidateWitness?: CandidateRepositoryWitness,
 ): DomainResult<RemediationState, RemediationStateParseError> {
   const inspection = guardStateRecordInspection(raw);
   if (!inspection.ok) {
@@ -2771,7 +2914,13 @@ export function parseRemediationState(
     return stateParseFailure(null, "state", discriminant.error.message, discriminant.error.cause);
   }
   try {
-    const parsed = parseRemediationStateVariant(raw, discriminant.value.state, publicationResolver);
+    const parsed = parseRemediationStateVariant(
+      raw,
+      discriminant.value.state,
+      publicationResolver,
+      assessment,
+      candidateWitness,
+    );
     return parsed.ok ? ok(mintRemediationState(parsed.value)) : parsed;
   } catch (thrown) {
     return stateParseFailure(

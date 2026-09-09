@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { lstatSync, type BigIntStats } from "node:fs";
 import { join } from "node:path";
 import {
@@ -6,19 +6,32 @@ import {
   parseCompletionSignal,
   type AuthorizedWaveCompletionCheck,
   type CompletionCheckResult,
+  type CompletionProcessOutcome,
   type CompletionReportOutcome,
+  type CompletionSignal,
   type NonEmptyString,
 } from "../core/completion-suite";
+import type {
+  AuthorizedRemediationCheck,
+  ProjectCommandAuthority,
+  RemediationCheckScope,
+} from "../core/defect-family-accounting";
 import { parseArtifactDigest } from "../core/orchestration-contract";
+import {
+  MAX_STRUCTURED_REPORT_BYTES,
+  parseStructuredTestReportBytes,
+  type StructuredReportParseResult,
+} from "../core/structured-test-report";
 import { sha256Bytes } from "../core/review-packet";
 import { inspectRepositoryPath } from "../utils/repository-path";
 import {
   parseCanonicalRepositoryRoot,
   type CanonicalRepositoryRoot,
 } from "../utils/workspace-digest";
-import { readRunBytesNoFollow } from "./no-follow-fs";
+import { readRunBytesNoFollow, removeRunRegularFileNoFollow } from "./no-follow-fs";
 
 type ProjectCommandCheck = Extract<AuthorizedWaveCompletionCheck, { readonly kind: "project-command" }>;
+type RunnerCommand = ProjectCommandCheck | ProjectCommandAuthority;
 
 export type CompletionCheckDiagnostics = Readonly<{
   stdoutTail: string;
@@ -35,6 +48,7 @@ export type CompletionCheckExecution = Readonly<{
 export type CompletionCheckRunnerFailure =
   | Readonly<{ kind: "invalid-runner-authority"; message: string }>
   | Readonly<{ kind: "path-rejected"; path: string; message: string }>
+  | Readonly<{ kind: "report-reset-failed"; path: string; message: string }>
   | Readonly<{ kind: "containment-unsupported"; message: string }>
   | Readonly<{
       kind: "cancelled";
@@ -60,6 +74,43 @@ export type CompletionCheckRunnerResult =
   | Readonly<{ ok: true; value: CompletionCheckExecution }>
   | Readonly<{ ok: false; error: CompletionCheckRunnerFailure }>;
 
+export type RawRemediationProcessOutcome =
+  | Extract<CompletionProcessOutcome, { readonly kind: "spawn-failed" }>
+  | Readonly<{
+      kind: "observed";
+      exitCode: number | null;
+      timedOut: boolean;
+      signal: CompletionSignal | null;
+    }>;
+
+export type StableProducedReport = Readonly<{
+  outcome: Extract<CompletionReportOutcome, { readonly kind: "produced" }>;
+  /** An owned copy of the one stable read; Uint8Array itself is intentionally mutable. */
+  bytes: Uint8Array;
+  mode: number;
+}>;
+
+type RequiredReportFailure = Extract<CompletionReportOutcome, { readonly kind: "missing" | "unreadable" }>;
+
+export type RemediationReportObservation =
+  | Readonly<{ outcome: RequiredReportFailure }>
+  | StableProducedReport & Readonly<{ parsedReportFacts: StructuredReportParseResult }>;
+
+export type RemediationCheckExecution = Readonly<{
+  kind: "remediation-check-execution";
+  checkId: AuthorizedRemediationCheck["command"]["checkId"];
+  scope: RemediationCheckScope;
+  manifestDigest: AuthorizedRemediationCheck["manifestDigest"];
+  authorityDigest: AuthorizedRemediationCheck["authorityDigest"];
+  process: RawRemediationProcessOutcome;
+  report: RemediationReportObservation | null;
+  diagnostics: CompletionCheckDiagnostics;
+}>;
+
+export type RemediationCheckRunnerResult =
+  | Readonly<{ ok: true; value: RemediationCheckExecution }>
+  | Readonly<{ ok: false; error: CompletionCheckRunnerFailure }>;
+
 export type CompletionCheckRunnerOptions = Readonly<{
   signal?: AbortSignal;
   terminationGraceMs?: number;
@@ -74,9 +125,9 @@ const MAX_TERMINATION_BOUND_MS = 60_000;
 const MAX_DIAGNOSTIC_TAIL_BYTES = 1_024 * 1_024;
 const MAX_MESSAGE_LENGTH = 4_096;
 
-const succeeded = (value: CompletionCheckExecution): CompletionCheckRunnerResult =>
+const completionSucceeded = (value: CompletionCheckExecution): CompletionCheckRunnerResult =>
   Object.freeze({ ok: true, value: Object.freeze(value) });
-const failed = (error: CompletionCheckRunnerFailure): CompletionCheckRunnerResult =>
+const failed = (error: CompletionCheckRunnerFailure): Readonly<{ ok: false; error: CompletionCheckRunnerFailure }> =>
   Object.freeze({ ok: false, error: Object.freeze(error) });
 
 function messageOf(cause: unknown): string {
@@ -117,19 +168,28 @@ class DiagnosticTail {
 }
 
 type ReportSnapshot = Readonly<{
-  ino: bigint;
+  device: bigint;
+  inode: bigint;
   size: bigint;
+  mode: bigint;
   mtimeNs: bigint;
   ctimeNs: bigint;
 }>;
 
 function snapshot(stat: BigIntStats): ReportSnapshot {
-  return Object.freeze({ ino: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs });
+  return Object.freeze({
+    device: stat.dev,
+    inode: stat.ino,
+    size: stat.size,
+    mode: stat.mode,
+    mtimeNs: stat.mtimeNs,
+    ctimeNs: stat.ctimeNs,
+  });
 }
 
 function sameSnapshot(left: ReportSnapshot, right: ReportSnapshot): boolean {
-  return left.ino === right.ino && left.size === right.size &&
-    left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+  return left.device === right.device && left.inode === right.inode && left.size === right.size &&
+    left.mode === right.mode && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
 }
 
 function changedSince(before: ReportSnapshot | null, after: ReportSnapshot): boolean {
@@ -159,7 +219,7 @@ type PreSpawnReportSnapshot =
 
 function preSpawnReportSnapshot(
   root: CanonicalRepositoryRoot,
-  check: ProjectCommandCheck,
+  check: RunnerCommand,
 ): PreSpawnReportSnapshot {
   if (check.reportPolicy.kind === "not-required") return Object.freeze({ kind: "not-required" });
   try {
@@ -180,12 +240,31 @@ function preSpawnReportSnapshot(
   }
 }
 
-function missingReport(check: ProjectCommandCheck): CompletionReportOutcome {
+/** Destructive permission is narrower than report-reading authority: only the
+ * exact currently ignored, untracked report may be removed. Git reads do not
+ * refresh the index, and the unlink itself retains its no-follow parent fd. */
+function resetRemediationReport(root: CanonicalRepositoryRoot, check: RunnerCommand): void {
+  if (check.reportPolicy.kind !== "required-file") throw new Error("remediation requires a report path");
+  const path = check.reportPolicy.path;
+  const tracked = spawnSync("git", ["--literal-pathspecs", "ls-files", "-z", "--", path], { cwd: root, encoding: "utf8" });
+  if (tracked.error || tracked.status !== 0 || tracked.stdout.length !== 0) {
+    throw new Error(`report reset cannot prove exact path is untracked: ${path}`);
+  }
+  const ignored = spawnSync("git", ["check-ignore", "-q", "--", path], { cwd: root, encoding: "utf8" });
+  if (ignored.error || ignored.status !== 0) throw new Error(`report reset requires a Git-ignored path: ${path}`);
+  removeRunRegularFileNoFollow(absoluteRepositoryPath(root, path));
+}
+
+type CollectedReport =
+  | Exclude<CompletionReportOutcome, { readonly kind: "produced" }>
+  | StableProducedReport;
+
+function missingReport(check: RunnerCommand): CollectedReport {
   if (check.reportPolicy.kind === "not-required") return Object.freeze({ kind: "not-required" });
   return Object.freeze({ kind: "missing", path: check.reportPolicy.path });
 }
 
-function unreadableReport(check: ProjectCommandCheck, cause: unknown): CompletionReportOutcome {
+function unreadableReport(check: RunnerCommand, cause: unknown): CollectedReport {
   if (check.reportPolicy.kind === "not-required") return Object.freeze({ kind: "not-required" });
   return Object.freeze({
     kind: "unreadable",
@@ -194,12 +273,13 @@ function unreadableReport(check: ProjectCommandCheck, cause: unknown): Completio
   });
 }
 
-/** Observe required report bytes only after process close and through no-follow reads. */
+/** Observe required report bytes only after process close and through one stable no-follow read. */
 function observeReportAfterClose(
   root: CanonicalRepositoryRoot,
-  check: ProjectCommandCheck,
+  check: RunnerCommand,
   before: ReportSnapshot | null,
-): CompletionReportOutcome {
+  maximumBytes?: number,
+): CollectedReport {
   if (check.reportPolicy.kind === "not-required") return Object.freeze({ kind: "not-required" });
   const absolute = absoluteRepositoryPath(root, check.reportPolicy.path);
   try {
@@ -209,22 +289,28 @@ function observeReportAfterClose(
     const first = snapshot(firstStat);
     if (!changedSince(before, first)) return missingReport(check);
 
-    const bytes = readRunBytesNoFollow(absolute);
+    const readBytes = readRunBytesNoFollow(absolute, maximumBytes);
     const finalStat = lstatIfPresent(absolute);
     if (finalStat === null || !finalStat.isFile() || !sameSnapshot(first, snapshot(finalStat))) {
       return unreadableReport(check, "completion report changed while it was being read");
     }
+    const bytes = Uint8Array.from(readBytes);
     const digest = parseArtifactDigest(sha256Bytes(bytes));
     if (!digest.ok) return unreadableReport(check, digest.error.message);
-    return Object.freeze({
-      kind: "produced",
+    const outcome = Object.freeze({
+      kind: "produced" as const,
       path: check.reportPolicy.path,
       digest: digest.value,
       byteLength: bytes.byteLength,
     });
+    return Object.freeze({ outcome, bytes, mode: Number(firstStat.mode) });
   } catch (cause) {
     return unreadableReport(check, cause);
   }
+}
+
+function completionReportOutcome(report: CollectedReport): CompletionReportOutcome {
+  return "outcome" in report ? report.outcome : report;
 }
 
 function diagnostics(stdout: DiagnosticTail, stderr: DiagnosticTail): CompletionCheckDiagnostics {
@@ -238,17 +324,25 @@ function diagnostics(stdout: DiagnosticTail, stderr: DiagnosticTail): Completion
   });
 }
 
-function spawnFailure(
-  check: ProjectCommandCheck,
-  cause: unknown,
-  output: CompletionCheckDiagnostics,
-): CompletionCheckRunnerResult {
-  const checkResult: CompletionCheckResult = Object.freeze({
-    checkId: check.checkId,
-    scope: check.scope,
-    outcome: Object.freeze({ kind: "spawn-failed", message: messageOf(cause) as NonEmptyString }),
+type CommandExecution = Readonly<{
+  process: RawRemediationProcessOutcome;
+  report: CollectedReport | null;
+  diagnostics: CompletionCheckDiagnostics;
+}>;
+
+type CommandRunnerResult =
+  | Readonly<{ ok: true; value: CommandExecution }>
+  | Readonly<{ ok: false; error: CompletionCheckRunnerFailure }>;
+
+function spawnFailure(cause: unknown, output: CompletionCheckDiagnostics): CommandRunnerResult {
+  return Object.freeze({
+    ok: true,
+    value: Object.freeze({
+      process: Object.freeze({ kind: "spawn-failed", message: messageOf(cause) as NonEmptyString }),
+      report: null,
+      diagnostics: output,
+    }),
   });
-  return succeeded({ checkResult, diagnostics: output });
 }
 
 type ProcessGroupProbe =
@@ -357,13 +451,14 @@ function parentObservation(child: ChildProcess): Promise<ParentObservation> {
 
 function observedExecution(
   root: CanonicalRepositoryRoot,
-  check: ProjectCommandCheck,
+  check: RunnerCommand,
   beforeReport: ReportSnapshot | null,
   stdout: DiagnosticTail,
   stderr: DiagnosticTail,
   observation: Extract<ParentObservation, { readonly kind: "closed" }>,
   timedOut: boolean,
-): CompletionCheckRunnerResult {
+  reportMode: "wave-snapshot" | "remediation-reset",
+): CommandRunnerResult {
   const output = diagnostics(stdout, stderr);
   const signal = observation.signal === null ? null : parseCompletionSignal(observation.signal);
   if (signal !== null && !signal.ok) {
@@ -373,19 +468,19 @@ function observedExecution(
       diagnostics: output,
     });
   }
-  return succeeded({
-    checkResult: Object.freeze({
-      checkId: check.checkId,
-      scope: check.scope,
-      outcome: Object.freeze({
-        kind: "observed",
+  return Object.freeze({
+    ok: true,
+    value: Object.freeze({
+      process: Object.freeze({
+        kind: "observed" as const,
         exitCode: observation.exitCode,
         timedOut,
         signal: signal === null ? null : signal.value,
-        report: observeReportAfterClose(root, check, beforeReport),
       }),
+      report: observeReportAfterClose(root, check, beforeReport,
+        reportMode === "remediation-reset" ? MAX_STRUCTURED_REPORT_BYTES : undefined),
+      diagnostics: output,
     }),
-    diagnostics: output,
   });
 }
 
@@ -394,23 +489,13 @@ function observedExecution(
  * owns a detached process group; no result is returned until that whole group
  * is proven gone. Every expected infrastructure failure is returned as data.
  */
-export async function runCompletionCheck(
-  rawCheck: ProjectCommandCheck,
+async function runProjectCommand(
+  selected: ProjectCommandCheck | AuthorizedRemediationCheck,
   repositoryRoot: CanonicalRepositoryRoot,
-  options: CompletionCheckRunnerOptions = {},
-): Promise<CompletionCheckRunnerResult> {
-  const parsedCheck = parseAuthorizedWaveCompletionCheck(rawCheck);
-  if (!parsedCheck.ok || parsedCheck.value.kind !== "project-command") {
-    return failed({
-      kind: "invalid-runner-authority",
-      message: parsedCheck.ok ? "runner accepts project-command checks only" : parsedCheck.error.errors.join("; "),
-    });
-  }
-  const parsedRoot = parseCanonicalRepositoryRoot(repositoryRoot);
-  if (!parsedRoot.ok) {
-    const message = "message" in parsedRoot.error ? parsedRoot.error.message : "repository root observation drifted";
-    return failed({ kind: "invalid-runner-authority", message });
-  }
+  options: CompletionCheckRunnerOptions,
+): Promise<CommandRunnerResult> {
+  const check = selected.kind === "authorized-remediation-check" ? selected.command : selected;
+  const reportMode = selected.kind === "authorized-remediation-check" ? "remediation-reset" : "wave-snapshot";
   if (!POSIX_PROCESS_GROUP_PLATFORMS.has(process.platform)) {
     return failed({
       kind: "containment-unsupported",
@@ -437,12 +522,11 @@ export async function runCompletionCheck(
     });
   }
 
-  const check = parsedCheck.value;
   let cwd: string;
   try {
-    if (check.cwd === ".") cwd = parsedRoot.value;
+    if (check.cwd === ".") cwd = repositoryRoot;
     else {
-      const inspected = inspectRepositoryPath(parsedRoot.value, check.cwd, "completion check cwd", { mustExist: true });
+      const inspected = inspectRepositoryPath(repositoryRoot, check.cwd, "completion check cwd", { mustExist: true });
       const stat = lstatSync(inspected.absolute);
       if (!stat.isDirectory()) throw new Error("completion check cwd must be a real directory");
       cwd = inspected.absolute;
@@ -451,7 +535,18 @@ export async function runCompletionCheck(
     return failed({ kind: "path-rejected", path: check.cwd, message: messageOf(cause) });
   }
 
-  const reportObservation = preSpawnReportSnapshot(parsedRoot.value, check);
+  if (reportMode === "remediation-reset") {
+    try {
+      resetRemediationReport(repositoryRoot, check);
+    } catch (cause) {
+      return failed({
+        kind: "report-reset-failed",
+        path: check.reportPolicy.kind === "required-file" ? check.reportPolicy.path : "",
+        message: `required report reset failed before launch: ${messageOf(cause)}`,
+      });
+    }
+  }
+  const reportObservation = preSpawnReportSnapshot(repositoryRoot, check);
   if (reportObservation.kind === "failure") return failed(reportObservation.error);
   const beforeReport = reportObservation.kind === "snapshot" ? reportObservation.value : null;
   const stdout = new DiagnosticTail(tailBytes);
@@ -465,12 +560,12 @@ export async function runCompletionCheck(
       stdio: ["ignore", "pipe", "pipe"],
     });
   } catch (cause) {
-    return spawnFailure(check, cause, diagnostics(stdout, stderr));
+    return spawnFailure(cause, diagnostics(stdout, stderr));
   }
   const parent = parentObservation(child);
   const processGroupId = child.pid;
   if (processGroupId === undefined) {
-    return spawnFailure(check, "spawn returned no process id", diagnostics(stdout, stderr));
+    return spawnFailure("spawn returned no process id", diagnostics(stdout, stderr));
   }
 
   child.stdout?.on("data", (chunk: Buffer | string) => stdout.append(chunk));
@@ -495,18 +590,19 @@ export async function runCompletionCheck(
 
   if (trigger.kind === "parent") {
     if (trigger.observation.kind === "spawn-failed") {
-      return spawnFailure(check, trigger.observation.cause, diagnostics(stdout, stderr));
+      return spawnFailure(trigger.observation.cause, diagnostics(stdout, stderr));
     }
     const group = probeProcessGroup(processGroupId);
     if (group.kind === "gone") {
       return observedExecution(
-        parsedRoot.value,
+        repositoryRoot,
         check,
         beforeReport,
         stdout,
         stderr,
         trigger.observation,
         false,
+        reportMode,
       );
     }
     const containment = await terminateProcessGroup(processGroupId, graceMs, hardKillWaitMs);
@@ -558,12 +654,110 @@ export async function runCompletionCheck(
     });
   }
   return observedExecution(
-    parsedRoot.value,
+    repositoryRoot,
     check,
     beforeReport,
     stdout,
     stderr,
     closed,
     true,
+    reportMode,
   );
+}
+
+function validatedRepositoryRoot(
+  repositoryRoot: CanonicalRepositoryRoot,
+): Readonly<{ ok: true; value: CanonicalRepositoryRoot }> |
+   Readonly<{ ok: false; error: CompletionCheckRunnerFailure }> {
+  const parsed = parseCanonicalRepositoryRoot(repositoryRoot);
+  if (parsed.ok) return Object.freeze({ ok: true, value: parsed.value });
+  const message = "message" in parsed.error ? parsed.error.message : "repository root observation drifted";
+  return failed({ kind: "invalid-runner-authority", message });
+}
+
+/** Existing Wave wrapper. Its public result and report projection remain unchanged. */
+export async function runCompletionCheck(
+  rawCheck: ProjectCommandCheck,
+  repositoryRoot: CanonicalRepositoryRoot,
+  options: CompletionCheckRunnerOptions = {},
+): Promise<CompletionCheckRunnerResult> {
+  const parsedCheck = parseAuthorizedWaveCompletionCheck(rawCheck);
+  if (!parsedCheck.ok || parsedCheck.value.kind !== "project-command") {
+    return failed({
+      kind: "invalid-runner-authority",
+      message: parsedCheck.ok ? "runner accepts project-command checks only" : parsedCheck.error.errors.join("; "),
+    });
+  }
+  const root = validatedRepositoryRoot(repositoryRoot);
+  if (!root.ok) return root;
+  const execution = await runProjectCommand(parsedCheck.value, root.value, options);
+  if (!execution.ok) return execution;
+  const outcome: CompletionProcessOutcome = execution.value.process.kind === "spawn-failed"
+    ? execution.value.process
+    : Object.freeze({
+        ...execution.value.process,
+        report: completionReportOutcome(execution.value.report!),
+      });
+  const checkResult: CompletionCheckResult = Object.freeze({
+    checkId: parsedCheck.value.checkId,
+    scope: "wave",
+    outcome,
+  });
+  return completionSucceeded({ checkResult, diagnostics: execution.value.diagnostics });
+}
+
+function remediationReportObservation(
+  report: Exclude<CollectedReport, { readonly kind: "not-required" }>,
+): RemediationReportObservation {
+  if (!("outcome" in report)) return Object.freeze({ outcome: report });
+  return Object.freeze({
+    outcome: report.outcome,
+    bytes: report.bytes,
+    mode: report.mode,
+    parsedReportFacts: parseStructuredTestReportBytes(report.bytes),
+  });
+}
+
+/**
+ * Execute one core-authorized standalone remediation check. The returned facts
+ * are raw event ingredients, never a pass or installation authority.
+ */
+export async function runRemediationCheck(
+  check: AuthorizedRemediationCheck,
+  repositoryRoot: CanonicalRepositoryRoot,
+  options: CompletionCheckRunnerOptions = {},
+): Promise<RemediationCheckRunnerResult> {
+  if (check.kind !== "authorized-remediation-check" ||
+      check.scope.kind !== "standalone-remediation" ||
+      check.command.kind !== "project-command" ||
+      check.command.reportPolicy.kind !== "required-file") {
+    return failed({
+      kind: "invalid-runner-authority",
+      message: "runner requires a core-authorized standalone remediation project command with a required report",
+    });
+  }
+  const root = validatedRepositoryRoot(repositoryRoot);
+  if (!root.ok) return root;
+  const execution = await runProjectCommand(check, root.value, options);
+  if (!execution.ok) return execution;
+  if (execution.value.report !== null && "kind" in execution.value.report &&
+      execution.value.report.kind === "not-required") {
+    return failed({
+      kind: "invalid-runner-authority",
+      message: "required remediation report observation unexpectedly became not-required",
+    });
+  }
+  return Object.freeze({
+    ok: true,
+    value: Object.freeze({
+      kind: "remediation-check-execution" as const,
+      checkId: check.command.checkId,
+      scope: check.scope,
+      manifestDigest: check.manifestDigest,
+      authorityDigest: check.authorityDigest,
+      process: execution.value.process,
+      report: execution.value.report === null ? null : remediationReportObservation(execution.value.report),
+      diagnostics: execution.value.diagnostics,
+    }),
+  });
 }

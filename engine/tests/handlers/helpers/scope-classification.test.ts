@@ -83,7 +83,7 @@ describe("parseRegisteredFacadeProgram preserves variant diagnostics", () => {
     });
     expect(parsed).toEqual({
       kind: "invalid",
-      message: "remediation input must contain sourceRunsRoot, sourceRun, and supportPaths",
+      message: "remediation input sourceRunsRoot and sourceRun must be non-empty strings",
     });
   });
 

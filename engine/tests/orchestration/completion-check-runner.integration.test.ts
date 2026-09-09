@@ -1,4 +1,5 @@
-import { cpSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { canonicalTempDir } from "../fixtures/canonical-temp-dir";
 import { afterEach, describe, expect, it } from "vitest";
@@ -8,8 +9,21 @@ import {
 } from "../../src/core/completion-suite";
 import {
   runCompletionCheck,
+  runRemediationCheck,
   type CompletionCheckRunnerResult,
+  type RemediationCheckRunnerResult,
 } from "../../src/orchestration/completion-check-runner";
+import {
+  authorizeRemediationChecks,
+  createCandidateRepositoryWitness,
+  createRemediationCheckScope,
+  prepareDefectFamilyAccounting,
+  prepareDefectFamilyVerification,
+  type AuthorizedRemediationCheck,
+} from "../../src/core/defect-family-accounting";
+import { parseRepositorySnapshotWitness } from "../../src/core/remediation-machine";
+import { VERIFICATION_MANIFEST_KIND, freezeVerificationManifest } from "../../src/core/verification-manifest";
+import { standaloneFixture } from "../fixtures/standalone-remediation-authority";
 import {
   parseCanonicalRepositoryRoot,
   type CanonicalRepositoryRoot,
@@ -22,6 +36,9 @@ const roots: string[] = [];
 function fixtureRoot(): CanonicalRepositoryRoot {
   const root = canonicalTempDir("loom-completion-runner-");
   roots.push(root);
+  const initialized = spawnSync("git", ["init", "--quiet"], { cwd: root });
+  if (initialized.status !== 0) throw new Error("runner fixture Git init failed");
+  writeFileSync(join(root, ".gitignore"), ".loom/completion-reports/\n");
   cpSync(new URL("../fixtures/completion-process.mjs", import.meta.url), join(root, "completion-process.mjs"));
   const parsed = parseCanonicalRepositoryRoot(root);
   if (!parsed.ok) throw new Error("message" in parsed.error ? parsed.error.message : "root observation drifted");
@@ -59,6 +76,91 @@ function execution(result: CompletionCheckRunnerResult) {
   expect(result.ok).toBe(true);
   if (!result.ok) throw new Error(result.error.message);
   return result.value;
+}
+
+function remediationExecution(result: RemediationCheckRunnerResult) {
+  expect(result.ok).toBe(true);
+  if (!result.ok) throw new Error(result.error.message);
+  return result.value;
+}
+
+function valueOf<T>(result: { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: unknown }): T {
+  if (!result.ok) throw new Error(`fixture construction failed: ${JSON.stringify(result.error)}`);
+  return result.value;
+}
+
+const digest = (character: string): string => character.repeat(64);
+
+function remediationCheck(
+  root: CanonicalRepositoryRoot,
+  name: string,
+  args: readonly string[],
+  reportPath = `.loom/completion-reports/${name}.xml`,
+  executable = "node",
+  timeoutMs = 2_000,
+): AuthorizedRemediationCheck {
+  const source = standaloneFixture(["src/main.ts"], true).input.standaloneResult;
+  const findingId = source.survivingCriticals[0]!.id;
+  const accounting = valueOf(prepareDefectFamilyAccounting(source, {
+    kind: "declared-defect-family-accounting",
+    provenance: "DECLARED",
+    dispositions: [{ findingId, status: "repaired", repairGroupId: `family:${name}` }],
+    groups: [{
+      kind: "declared-repair-group",
+      provenance: "DECLARED",
+      repairGroupId: `family:${name}`,
+      findingIds: [findingId],
+      rootCause: { provenance: "DECLARED", statement: "The tested behavior regressed." },
+      invariant: { provenance: "DECLARED", statement: "The tested behavior remains fixed." },
+      siblings: { kind: "none-declared", provenance: "DECLARED", reason: "No siblings declared." },
+      checks: [{
+        checkId: `project:${name}`,
+        historicalRed: {
+          kind: "historical-red",
+          provenance: "DECLARED",
+          statement: "The check distinguishes the historical defect.",
+          reference: null,
+        },
+      }],
+    }],
+  }));
+  const manifest = valueOf(freezeVerificationManifest(new TextEncoder().encode(JSON.stringify({
+    schemaVersion: 1,
+    kind: VERIFICATION_MANIFEST_KIND,
+    checks: [{
+      id: `project:${name}`,
+      scope: "wave",
+      executable,
+      args,
+      cwd: ".",
+      timeoutMs,
+      report: { kind: "required-file", path: reportPath },
+    }],
+  }))));
+  const plan = valueOf(prepareDefectFamilyVerification(accounting, manifest));
+  if (plan.kind !== "selected-operator-checks") throw new Error("selected remediation plan required");
+  const gitWitness = valueOf(parseRepositorySnapshotWitness({
+    baseTreeDigest: digest("1"),
+    indexDigest: digest("2"),
+    worktreeDigest: digest("3"),
+  }));
+  const candidate = valueOf(createCandidateRepositoryWitness({
+    kind: "candidate-repository-witness",
+    repositoryRoot: root,
+    workspaceDigest: digest("4"),
+    pathCount: 1,
+    observedPaths: ["src/candidate.ts"],
+    gitWitness,
+    generatedReportExclusions: [reportPath],
+  }));
+  const scope = valueOf(createRemediationCheckScope(plan.source, candidate, {
+    kind: "standalone-remediation",
+    remediationRunId: `run.runner-${name}`,
+    sourceRunId: plan.source.sourceRunId,
+    registrationDigest: digest("a"),
+    candidateWitnessDigest: candidate.digest,
+  }));
+  return valueOf(authorizeRemediationChecks(plan, scope))[0];
 }
 
 afterEach(() => {
@@ -246,5 +348,325 @@ describe("completion check process shell", () => {
       ok: false,
       error: { kind: "path-rejected", path: "linked/report.bin" },
     });
+  });
+});
+
+describe("standalone remediation check process/report seam", () => {
+  function nodeTestArgs(reportPath: string, testPath: string): readonly string[] {
+    return [
+      "--test",
+      "--test-reporter=junit",
+      `--test-reporter-destination=${reportPath}`,
+      testPath,
+    ];
+  }
+
+  async function runNodeTest(name: string, testSource: string) {
+    const root = fixtureRoot();
+    const reportPath = `.loom/completion-reports/${name}.xml`;
+    const testPath = `${name}.test.mjs`;
+    mkdirSync(join(root, ".loom", "completion-reports"), { recursive: true });
+    writeFileSync(join(root, testPath), testSource);
+    const authorized = remediationCheck(root, name, nodeTestArgs(reportPath, testPath), reportPath);
+    return remediationExecution(await runRemediationCheck(authorized, root));
+  }
+
+  it("returns proper remediation scope and exact owned bytes from a passing actual Node JUnit run", async () => {
+    const result = await runNodeTest(
+      "node-pass",
+      'import test from "node:test"; import assert from "node:assert"; test("passes", () => assert.equal(1, 1));',
+    );
+
+    expect(result.scope.kind).toBe("standalone-remediation");
+    expect(result.process).toEqual({ kind: "observed", exitCode: 0, timedOut: false, signal: null });
+    expect(result).not.toHaveProperty("passed");
+    expect(result.report).toMatchObject({
+      outcome: { kind: "produced", path: ".loom/completion-reports/node-pass.xml" },
+      parsedReportFacts: { ok: true, value: { total: 1, failed: 0, source: "junit-xml" } },
+    });
+    if (result.report !== null && "bytes" in result.report) {
+      expect(Buffer.isBuffer(result.report.bytes)).toBe(false);
+      expect(result.report.bytes.byteLength).toBe(result.report.outcome.byteLength);
+      expect(result.report.mode & 0o777).toBe(0o644);
+      expect(new TextDecoder().decode(result.report.bytes)).toContain("<testsuites>");
+    }
+  });
+
+  it("retains failing and all-skipped actual Node JUnit facts without calling either a pass", async () => {
+    const failing = await runNodeTest(
+      "node-fail",
+      'import test from "node:test"; import assert from "node:assert"; test("fails", () => assert.equal(1, 2));',
+    );
+    expect(failing.process).toMatchObject({ kind: "observed", exitCode: 1 });
+    expect(failing.report).toMatchObject({
+      parsedReportFacts: { ok: true, value: { total: 1, failed: 1, source: "junit-xml" } },
+    });
+
+    const skipped = await runNodeTest(
+      "node-all-skip",
+      'import test from "node:test"; test("skipped", { skip: true }, () => {});',
+    );
+    expect(skipped.process).toMatchObject({ kind: "observed", exitCode: 0 });
+    expect(skipped.report).toMatchObject({
+      parsedReportFacts: { ok: true, value: { total: 0, failed: 0, source: "junit-xml" } },
+    });
+  });
+
+  it("returns zero and malformed structured report facts without upgrading produced metadata to pass", async () => {
+    const root = fixtureRoot();
+    const script = "write-report.mjs";
+    mkdirSync(join(root, ".loom", "completion-reports"), { recursive: true });
+    writeFileSync(join(root, script), `
+      import { writeFileSync } from "node:fs";
+      writeFileSync(process.argv[2], process.argv[3]);
+    `);
+
+    const zeroPath = ".loom/completion-reports/zero.json";
+    const zero = remediationExecution(await runRemediationCheck(remediationCheck(
+      root,
+      "zero",
+      [script, zeroPath, JSON.stringify({
+        numTotalTests: 0, numPassedTests: 0, numFailedTests: 0, numPendingTests: 0, numTodoTests: 0,
+      })],
+      zeroPath,
+    ), root));
+    expect(zero.report).toMatchObject({
+      outcome: { kind: "produced" },
+      parsedReportFacts: { ok: true, value: { total: 0, failed: 0 } },
+    });
+
+    const malformedPath = ".loom/completion-reports/malformed.json";
+    const malformed = remediationExecution(await runRemediationCheck(remediationCheck(
+      root,
+      "malformed",
+      [script, malformedPath, JSON.stringify({
+        numTotalTests: 1, numPassedTests: 2, numFailedTests: 0, numPendingTests: 0, numTodoTests: 0,
+      })],
+      malformedPath,
+    ), root));
+    expect(malformed.report).toMatchObject({
+      outcome: { kind: "produced" },
+      parsedReportFacts: { ok: false, error: { reason: "malformed-counts" } },
+    });
+  });
+
+  it("rejects touching seeded green bytes but accepts identical freshly rewritten bytes", async () => {
+    const root = fixtureRoot();
+    const reportPath = ".loom/completion-reports/touch.xml";
+    const green = '<testsuite tests="1" failures="0"/>';
+    mkdirSync(join(root, ".loom", "completion-reports"), { recursive: true });
+    writeFileSync(join(root, "touch-report.mjs"), `
+      import { closeSync, openSync, utimesSync, writeFileSync } from "node:fs";
+      const [mode, path, green] = process.argv.slice(2);
+      if (mode === "touch") {
+        closeSync(openSync(path, "a"));
+        utimesSync(path, new Date(), new Date());
+      } else writeFileSync(path, green);
+    `);
+    writeFileSync(join(root, reportPath), green);
+    expect(spawnSync("git", ["add", ".gitignore"], { cwd: root }).status).toBe(0);
+    const indexBefore = readFileSync(join(root, ".git", "index"));
+    const touched = remediationExecution(await runRemediationCheck(remediationCheck(
+      root, "touch", ["touch-report.mjs", "touch", reportPath, green], reportPath,
+    ), root));
+    expect(touched.process).toMatchObject({ kind: "observed", exitCode: 0 });
+    expect(touched.report).toMatchObject({ outcome: { kind: "produced", byteLength: 0 }, parsedReportFacts: { ok: false } });
+    expect(readFileSync(join(root, ".git", "index"))).toEqual(indexBefore);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      writeFileSync(join(root, reportPath), green);
+      const rewritten = remediationExecution(await runRemediationCheck(remediationCheck(
+        root, "rewrite", ["touch-report.mjs", "rewrite", reportPath, green], reportPath,
+      ), root));
+      expect(rewritten.report).toMatchObject({ parsedReportFacts: { ok: true, value: { total: 1, failed: 0 } } });
+      expect(readFileSync(join(root, ".git", "index"))).toEqual(indexBefore);
+    }
+  });
+
+  it("records reset failure without launching or touching tracked, foreign, or inaccessible paths", async () => {
+    for (const mode of ["tracked", "not-ignored", "directory", "symlink", "parent-symlink", "permission"] as const) {
+      const root = fixtureRoot();
+      const parent = join(root, ".loom", "completion-reports");
+      const reportPath = ".loom/completion-reports/refused.xml";
+      const report = join(root, reportPath);
+      mkdirSync(parent, { recursive: true });
+      writeFileSync(join(root, "must-not-launch.mjs"), 'import { writeFileSync } from "node:fs"; writeFileSync("launched", "bad");');
+      writeFileSync(join(root, "foreign"), "foreign sentinel");
+      if (mode === "directory") mkdirSync(report);
+      else if (mode === "symlink") symlinkSync(join(root, "foreign"), report);
+      else writeFileSync(report, "stale");
+      if (mode === "parent-symlink") {
+        rmSync(parent, { recursive: true });
+        symlinkSync(root, parent);
+      }
+      if (mode === "not-ignored") writeFileSync(join(root, ".gitignore"), "");
+      const staged = spawnSync("git", ["add", ".gitignore"], { cwd: root });
+      expect(staged.status).toBe(0);
+      if (mode === "tracked") expect(spawnSync("git", ["add", "-f", reportPath], { cwd: root }).status).toBe(0);
+      const index = readFileSync(join(root, ".git", "index"));
+      if (mode === "permission") {
+        expect(process.getuid?.()).not.toBe(0);
+        chmodSync(parent, 0o500);
+      }
+      try {
+        const result = await runRemediationCheck(remediationCheck(root, "refused", ["must-not-launch.mjs"], reportPath), root);
+        expect(result, mode).toMatchObject({ ok: false, error: { kind: "report-reset-failed", message: expect.stringContaining("before launch") } });
+        expect(existsSync(join(root, "launched"))).toBe(false);
+        expect(readFileSync(join(root, "foreign"), "utf8")).toBe("foreign sentinel");
+        expect(readFileSync(join(root, ".git", "index"))).toEqual(index);
+        if (mode === "tracked" || mode === "permission") expect(readFileSync(report, "utf8")).toBe("stale");
+      } finally { if (mode === "permission") chmodSync(parent, 0o700); }
+    }
+  });
+
+  it("refuses post-reset parent rename/symlink substitution without reading its foreign target", async () => {
+    const root = fixtureRoot();
+    const reportPath = ".loom/completion-reports/rebound.xml";
+    mkdirSync(join(root, ".loom", "completion-reports"), { recursive: true });
+    mkdirSync(join(root, "foreign"));
+    const foreign = join(root, "foreign", "rebound.xml");
+    const green = '<testsuite tests="1" failures="0"/>';
+    writeFileSync(foreign, green);
+    writeFileSync(join(root, reportPath), green);
+    writeFileSync(join(root, "rebind.mjs"), `
+      import { renameSync, symlinkSync } from "node:fs";
+      renameSync(".loom/completion-reports", ".loom/moved-reports");
+      symlinkSync("../foreign", ".loom/completion-reports");
+    `);
+    expect(spawnSync("git", ["add", ".gitignore"], { cwd: root }).status).toBe(0);
+    const indexBefore = readFileSync(join(root, ".git", "index"));
+    const result = remediationExecution(await runRemediationCheck(remediationCheck(root, "rebound", ["rebind.mjs"], reportPath), root));
+    expect(result.process).toMatchObject({ kind: "observed", exitCode: 0 });
+    expect(result.report).toMatchObject({ outcome: { kind: "unreadable" } });
+    expect(readFileSync(foreign, "utf8")).toBe(green);
+    expect(readFileSync(join(root, ".git", "index"))).toEqual(indexBefore);
+  });
+
+  it("refuses limit+1 report bytes while accepting exactly the byte limit", async () => {
+    const root = fixtureRoot();
+    const reportPath = ".loom/completion-reports/bounded.xml";
+    mkdirSync(join(root, ".loom", "completion-reports"), { recursive: true });
+    writeFileSync(join(root, "bounded-report.mjs"), `
+      import { writeFileSync } from "node:fs";
+      const xml = '<testsuite tests="1" failures="0"/>';
+      writeFileSync(process.argv[2], xml.padEnd(Number(process.argv[3]), " "));
+    `);
+    for (const extra of [0, 1]) {
+      const result = remediationExecution(await runRemediationCheck(remediationCheck(
+        root, "bounded", ["bounded-report.mjs", reportPath, String(8 * 1024 * 1024 + extra)], reportPath,
+      ), root));
+      expect(result.report).toMatchObject(extra === 0
+        ? { outcome: { kind: "produced", byteLength: 8 * 1024 * 1024 }, parsedReportFacts: { ok: true } }
+        : { outcome: { kind: "unreadable", message: expect.stringContaining("limit") } });
+    }
+  });
+
+  it("marks a pre-existing unchanged report stale", async () => {
+    const root = fixtureRoot();
+    const reportPath = ".loom/completion-reports/stale.json";
+    mkdirSync(join(root, ".loom", "completion-reports"), { recursive: true });
+    writeFileSync(join(root, reportPath), JSON.stringify({
+      numTotalTests: 1, numPassedTests: 1, numFailedTests: 0,
+    }));
+    writeFileSync(join(root, "no-report.mjs"), "// intentionally leaves the stale report untouched\n");
+    const result = remediationExecution(await runRemediationCheck(remediationCheck(
+      root, "stale", ["no-report.mjs"], reportPath,
+    ), root));
+    expect(result.report).toEqual({ outcome: { kind: "missing", path: reportPath } });
+  });
+
+  it("retains non-zero exit, timeout, signal, and spawn-failure independently of green report bytes", async () => {
+    const root = fixtureRoot();
+    mkdirSync(join(root, ".loom", "completion-reports"), { recursive: true });
+    writeFileSync(join(root, "raw-outcome.mjs"), `
+      import { writeFileSync } from "node:fs";
+      const [mode, report] = process.argv.slice(2);
+      if (report) writeFileSync(report, JSON.stringify({
+        numTotalTests: 1, numPassedTests: 1, numFailedTests: 0, numPendingTests: 0, numTodoTests: 0,
+      }));
+      if (mode === "nonzero") process.exitCode = 7;
+      if (mode === "signal") process.kill(process.pid, "SIGTERM");
+      if (mode === "timeout") setInterval(() => {}, 1000);
+    `);
+
+    for (const [name, expected] of [
+      ["nonzero", { exitCode: 7, timedOut: false, signal: null }],
+      ["signal", { exitCode: null, timedOut: false, signal: "SIGTERM" }],
+      ["timeout", { exitCode: null, timedOut: true, signal: "SIGTERM" }],
+    ] as const) {
+      const reportPath = `.loom/completion-reports/${name}.json`;
+      const authorized = remediationCheck(
+        root, name, ["raw-outcome.mjs", name, reportPath], reportPath, "node", name === "timeout" ? 100 : 2_000,
+      );
+      const result = remediationExecution(await runRemediationCheck(
+        authorized,
+        root,
+        { terminationGraceMs: 100, hardKillWaitMs: 500 },
+      ));
+      expect(result.process).toEqual({ kind: "observed", ...expected });
+      expect(result.report).toMatchObject({
+        outcome: { kind: "produced" },
+        parsedReportFacts: { ok: true, value: { total: 1, failed: 0 } },
+      });
+    }
+
+    const spawned = remediationExecution(await runRemediationCheck(remediationCheck(
+      root,
+      "spawn-failed",
+      ["--test", "missing.test.mjs"],
+      ".loom/completion-reports/spawn-failed.xml",
+      "absent/node",
+    ), root));
+    expect(spawned.process).toMatchObject({ kind: "spawn-failed" });
+    expect(spawned.report).toBeNull();
+  });
+
+  it("rejects an oversized report while another process keeps appending to it", async () => {
+    const root = fixtureRoot();
+    const reportPath = ".loom/completion-reports/drifting.json";
+    mkdirSync(join(root, ".loom", "completion-reports"), { recursive: true });
+    writeFileSync(join(root, "large-report.mjs"), `
+      import { writeFileSync } from "node:fs";
+      const report = JSON.stringify({
+        numTotalTests: 1, numPassedTests: 1, numFailedTests: 0,
+        padding: "x".repeat(64 * 1024 * 1024),
+      });
+      writeFileSync(process.argv[2], report);
+    `);
+    writeFileSync(join(root, "mutate-report.mjs"), `
+      import { appendFileSync, existsSync } from "node:fs";
+      const path = process.argv[2];
+      const mutate = () => {
+        if (existsSync(path)) appendFileSync(path, " ");
+        setImmediate(mutate);
+      };
+      mutate();
+    `);
+    const mutator = spawn("node", ["mutate-report.mjs", reportPath], {
+      cwd: root,
+      stdio: "ignore",
+    });
+    try {
+      const result = remediationExecution(await runRemediationCheck(remediationCheck(
+        root, "drifting", ["large-report.mjs", reportPath], reportPath, "node", 10_000,
+      ), root));
+      expect(result.process).toMatchObject({ kind: "observed", exitCode: 0 });
+      expect(result.report).toMatchObject({
+        outcome: { kind: "unreadable", path: reportPath },
+      });
+    } finally {
+      mutator.kill("SIGTERM");
+      await new Promise<void>((resolve) => mutator.once("close", () => resolve()));
+    }
+  }, 15_000);
+
+  it("cancels through AbortSignal only after terminating the process group", async () => {
+    const root = fixtureRoot();
+    writeFileSync(join(root, "cancel.mjs"), "setInterval(() => {}, 1000);\n");
+    const controller = new AbortController();
+    const pending = runRemediationCheck(remediationCheck(
+      root, "cancel", ["cancel.mjs"], ".loom/completion-reports/cancel.json", "node", 5_000,
+    ), root, { signal: controller.signal, terminationGraceMs: 30, hardKillWaitMs: 500 });
+    setTimeout(() => controller.abort(), 30);
+    expect(await pending).toMatchObject({ ok: false, error: { kind: "cancelled" } });
   });
 });

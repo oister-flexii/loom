@@ -46,6 +46,8 @@ export type WorkspaceDigestObservation = Readonly<{
   repositoryRoot: CanonicalRepositoryRoot;
   digest: ArtifactDigest;
   pathCount: number;
+  /** The exact canonical roster hashed into digest, after fixed/exact exclusions. */
+  observedPaths: readonly ReviewPath[];
 }>;
 
 export type WorkspaceDigestOptions = Readonly<{
@@ -90,9 +92,21 @@ export function parseCanonicalRepositoryRoot(raw: unknown): WorkspaceDigestResul
 
 type GitOutput = WorkspaceDigestResult<Buffer>;
 
+function gitEnvironment(): NodeJS.ProcessEnv {
+  return {
+    PATH: process.env["PATH"] ?? "/usr/bin:/bin",
+    HOME: process.env["HOME"] ?? "",
+    LANG: "C",
+    LC_ALL: "C",
+    GIT_OPTIONAL_LOCKS: "0",
+    GIT_TERMINAL_PROMPT: "0",
+  };
+}
+
 function runGit(cwd: string, operation: "resolve-root" | "list-paths", args: readonly string[]): GitOutput {
-  const executed = spawnSync("git", ["-C", cwd, "--literal-pathspecs", ...args], {
+  const executed = spawnSync("git", ["-C", cwd, "--literal-pathspecs", "-c", "core.fsmonitor=false", ...args], {
     encoding: "buffer",
+    env: gitEnvironment(),
     maxBuffer: MAX_GIT_OUTPUT_BYTES,
     shell: false,
     stdio: ["ignore", "pipe", "pipe"],
@@ -347,5 +361,6 @@ export function observeWorkspaceDigest(
     repositoryRoot: root.value,
     digest: digestObservedWorkspaceEntries(entries.map(({ entry }) => entry)),
     pathCount: entries.length,
+    observedPaths: Object.freeze(entries.map(({ entry }) => entry.path)),
   }));
 }

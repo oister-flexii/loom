@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -9,15 +9,16 @@ import {
   observeDirtyPaths,
   openGitRepository,
   readStagedPaths,
+  readRepositoryBytes,
   runGit,
   snapshotRepositoryWitness,
   stageAuditedPaths,
   type GitRepository,
-  type RepositoryWitnessInput,
   type TemporaryIndex,
 } from "../../src/orchestration/git-remediation";
-import type { FixedGitPathspecContract } from "../../src/core/remediation-machine";
+import type { CurrentVerifiedIndexInstallation, FixedGitPathspecContract } from "../../src/core/remediation-machine";
 import { git, pathspecContract, write } from "../fixtures/git-repository";
+import { verifiedRemediationInstallation } from "../fixtures/verified-remediation-installation";
 
 const cleanup: string[] = [];
 
@@ -57,17 +58,47 @@ function worktreeBytes(root: string): ReadonlyMap<string, string> {
 
 function stageTarget(repository: GitRepository, paths: readonly string[]): Readonly<{
   temporary: TemporaryIndex;
-  witness: RepositoryWitnessInput;
+  witness: CurrentVerifiedIndexInstallation;
 }> {
   const temporary = createTemporaryIndex(repository);
   if (!temporary.ok) throw new Error(temporary.error.message);
   cleanup.push(temporary.value.directory);
   const staged = stageAuditedPaths(repository, temporary.value, pathspecContract(paths));
   if (!staged.ok) throw new Error(staged.error.message);
-  const witness = snapshotRepositoryWitness(repository);
-  if (!witness.ok) throw new Error(witness.error.message);
-  return { temporary: temporary.value, witness: witness.value };
+  const witness = verifiedRemediationInstallation(repository, temporary.value);
+  return { temporary: temporary.value, witness };
 }
+
+describe("repository byte reads distinguish absence from failure", () => {
+  it("returns exact existing bytes and null only for an absent path", () => {
+    const repository = fixtureRepository();
+    expect(readRepositoryBytes(repository.root, "src/target.ts"))
+      .toEqual(Buffer.from("export const target = 1;\n"));
+    expect(readRepositoryBytes(repository.root, "src/absent.ts")).toBeNull();
+  });
+
+  it("surfaces directory, non-directory ancestor, and symlink-loop errors", () => {
+    const repository = fixtureRepository();
+    symlinkSync("loop", join(repository.root, "loop"));
+    for (const [path, code] of [["src", "EISDIR"], ["src/target.ts/child", "ENOTDIR"], ["loop", "ELOOP"]] as const) {
+      expect(() => readRepositoryBytes(repository.root, path)).toThrow(expect.objectContaining({ code }));
+    }
+  });
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "surfaces permission errors for an unprivileged reader", () => {
+      const repository = fixtureRepository();
+      const target = join(repository.root, "src/target.ts");
+      chmodSync(target, 0o000);
+      try {
+        expect(() => readRepositoryBytes(repository.root, "src/target.ts"))
+          .toThrow(expect.objectContaining({ code: "EACCES" }));
+      } finally {
+        chmodSync(target, 0o644);
+      }
+    },
+  );
+});
 
 // --- Drift between verification and installation ----------------------------
 
@@ -140,7 +171,9 @@ describe("failure leaves index and worktree unchanged", () => {
 
   it("never reports a phantom staged set from a discarded index", () => {
     const repository = fixtureRepository();
-    const { temporary } = stageTarget(repository, ["src/target.ts"]);
+    const created = createTemporaryIndex(repository);
+    if (!created.ok) throw new Error(created.error.message);
+    const temporary = created.value;
     rmSync(temporary.directory, { recursive: true, force: true });
 
     const staged = readStagedPaths(repository, temporary);
@@ -164,24 +197,21 @@ describe("failure leaves index and worktree unchanged", () => {
     expect(worktreeBytes(repository.root)).toEqual(before);
   });
 
-  it("keeps an unrelated staged change out of the installed set", () => {
+  it("refuses an unrelated dirty path added after installation authority was minted", () => {
     const repository = fixtureRepository();
     write(repository.root, "src/target.ts", "export const target = 2;\n");
+    const { temporary, witness } = stageTarget(repository, ["src/target.ts"]);
     write(repository.root, "src/bystander.ts", "export const bystander = 2;\n");
 
-    const { temporary, witness } = stageTarget(repository, ["src/target.ts"]);
     const installed = installVerifiedIndex(repository, temporary, witness);
 
-    expect(installed.ok).toBe(true);
-    if (!installed.ok) return;
-    expect(installed.value.installedPaths).toEqual(["src/target.ts"]);
-    // The bystander's edit is still only in the work tree.
+    expect(installed.ok).toBe(false);
     const staged = spawnSync("git", ["diff", "--cached", "--name-only"], {
       cwd: repository.root,
       encoding: "utf-8",
       env: { PATH: process.env["PATH"] ?? "", HOME: repository.root, LC_ALL: "C" },
     });
-    expect(staged.stdout.trim().split("\n").filter(Boolean)).toEqual(["src/target.ts"]);
+    expect(staged.stdout.trim()).toBe("");
   });
 });
 

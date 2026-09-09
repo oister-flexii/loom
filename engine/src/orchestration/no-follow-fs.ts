@@ -43,7 +43,9 @@ import {
   mkdirSync,
   mkdtempSync,
   openSync,
+  opendirSync,
   readFileSync,
+  readSync,
   readdirSync,
   realpathSync,
   renameSync,
@@ -317,9 +319,21 @@ function assertLeafName(name: string): void {
  * such node, so it reads the proven-real path — whose own components were
  * checked when the anchor was opened.
  */
-export function listDirectoryNamesNoFollow(directory: AnchoredDirectory): readonly string[] {
+export function listDirectoryNamesNoFollow(directory: AnchoredDirectory, maximumEntries?: number): readonly string[] {
   assertAnchoredDirectory(directory);
-  return Object.freeze(readdirSync(anchoredDirectoryPath(directory)).sort());
+  if (maximumEntries === undefined) return Object.freeze(readdirSync(anchoredDirectoryPath(directory)).sort());
+  if (!Number.isSafeInteger(maximumEntries) || maximumEntries < 0) throw new Error("invalid directory entry limit");
+  const stream = opendirSync(anchoredDirectoryPath(directory), { bufferSize: 32 });
+  const names: string[] = [];
+  try {
+    for (let entry = stream.readSync(); entry !== null; entry = stream.readSync()) {
+      if (names.length >= maximumEntries) throw new Error(`directory exceeds ${maximumEntries} entry limit`);
+      names.push(entry.name);
+    }
+  } finally {
+    stream.closeSync();
+  }
+  return Object.freeze(names.sort());
 }
 
 /** Open one child directory relative to an anchored directory. */
@@ -356,14 +370,16 @@ export function closeAnchorGuarded(
 }
 
 /** Read one leaf relative to an anchored directory, following no component. */
-export function readDirectoryFileNoFollow(directory: AnchoredDirectory, name: string): Buffer {
+export function readDirectoryFileNoFollow(directory: AnchoredDirectory, name: string, maximumBytes?: number): Buffer {
   assertLeafName(name);
   let fileFd: number | null = null;
   let bytes: Buffer | null = null;
   let primaryError: unknown = null;
   try {
-    fileFd = openSync(anchoredChildPath(directory, name), leafFlags(fsConstants.O_RDONLY));
-    bytes = readFileSync(fileFd);
+    fileFd = openSync(anchoredChildPath(directory, name), leafFlags(
+      fsConstants.O_RDONLY | (maximumBytes === undefined ? 0 : fsConstants.O_NONBLOCK),
+    ));
+    bytes = maximumBytes === undefined ? readFileSync(fileFd) : readBoundedRegularFile(fileFd, maximumBytes);
   } catch (error) {
     primaryError = error;
   }
@@ -371,6 +387,30 @@ export function readDirectoryFileNoFollow(directory: AnchoredDirectory, name: st
   if (primaryError !== null) throw primaryError;
   if (bytes === null) throw new Error(`read of ${name} produced no bytes`);
   return bytes;
+}
+
+/** Read at most limit+1 bytes even if the file grows after fstat. Never issue
+ * an unbounded fd read; oversize data is rejected before concatenation. */
+function readBoundedRegularFile(fd: number, maximumBytes: number): Buffer {
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 0) throw new Error("invalid file byte limit");
+  const before = fstatSync(fd, { bigint: true });
+  if (!before.isFile()) throw new Error("bounded read requires a regular file");
+  if (before.size > BigInt(maximumBytes)) throw new Error(`file exceeds ${maximumBytes} byte limit`);
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for (;;) {
+    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, maximumBytes - total + 1));
+    const count = readSync(fd, chunk, 0, chunk.byteLength, null);
+    if (count === 0) break;
+    total += count;
+    if (total > maximumBytes) throw new Error(`file exceeds ${maximumBytes} byte limit`);
+    chunks.push(chunk.subarray(0, count));
+  }
+  const after = fstatSync(fd, { bigint: true });
+  if (before.size !== after.size || before.mode !== after.mode || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs) {
+    throw new Error("file changed during bounded read");
+  }
+  return Buffer.concat(chunks, total);
 }
 
 function writeDirectoryLeafNoFollow(
@@ -632,8 +672,8 @@ function recoveryGuardIsAbandoned(snapshot: RecoveryGuardSnapshot): boolean {
 
 const recoveryTombPrefix = (recoveryName: string): string => `${recoveryName}.tomb-`;
 
-function recoveryTombName(directory: AnchoredDirectory, recoveryName: string): string | null {
-  return listDirectoryNamesNoFollow(directory)
+function recoveryTombName(directory: AnchoredDirectory, recoveryName: string, maximumEntries?: number): string | null {
+  return listDirectoryNamesNoFollow(directory, maximumEntries)
     .find((name) => name.startsWith(recoveryTombPrefix(recoveryName))) ?? null;
 }
 
@@ -701,8 +741,9 @@ function settleRecoveryGuardTomb(
 function reclaimAbandonedRecoveryGuard(
   directory: AnchoredDirectory,
   recoveryName: string,
+  maximumEntries?: number,
 ): boolean {
-  const existingTomb = recoveryTombName(directory, recoveryName);
+  const existingTomb = recoveryTombName(directory, recoveryName, maximumEntries);
   if (existingTomb !== null) return settleRecoveryGuardTomb(directory, recoveryName, existingTomb);
 
   let observed: RecoveryGuardSnapshot;
@@ -761,10 +802,11 @@ function removeOwnedRecoveryGuard(
   directory: AnchoredDirectory,
   recoveryName: string,
   recoveryToken: string,
+  maximumEntries?: number,
 ): void {
   const ownedNames = [
     recoveryName,
-    ...listDirectoryNamesNoFollow(directory)
+    ...listDirectoryNamesNoFollow(directory, maximumEntries)
       .filter((name) => name.startsWith(recoveryTombPrefix(recoveryName))),
   ];
   const failures: unknown[] = [];
@@ -800,10 +842,11 @@ export function recoverStaleDirectoryLock(
   directory: AnchoredDirectory,
   lockName: string,
   afterTombstoned: (tombName: string) => void = () => undefined,
+  maximumEntries?: number,
 ): boolean {
   const recoveryName = `${lockName}.recovery`;
   const recoveryToken = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2, 12)}`;
-  if (recoveryTombName(directory, recoveryName) !== null) return false;
+  if (recoveryTombName(directory, recoveryName, maximumEntries) !== null) return false;
   try {
     publishDirectoryFileExclusiveNoFollow(directory, recoveryName, recoveryToken);
   } catch (error) {
@@ -813,8 +856,8 @@ export function recoverStaleDirectoryLock(
   // A reclaimer may have atomically tombstoned the preceding guard between
   // our pre-check and exclusive publication. Withdraw this exact replacement
   // before it can authorize a concurrent stale-lock recovery.
-  if (recoveryTombName(directory, recoveryName) !== null) {
-    removeOwnedRecoveryGuard(directory, recoveryName, recoveryToken);
+  if (recoveryTombName(directory, recoveryName, maximumEntries) !== null) {
+    removeOwnedRecoveryGuard(directory, recoveryName, recoveryToken, maximumEntries);
     return false;
   }
 
@@ -886,7 +929,7 @@ export function recoverStaleDirectoryLock(
     throw error;
   } finally {
     try {
-      removeOwnedRecoveryGuard(directory, recoveryName, recoveryToken);
+      removeOwnedRecoveryGuard(directory, recoveryName, recoveryToken, maximumEntries);
     } catch (cleanupError) {
       if (primaryFailed) {
         throw new AggregateError(
@@ -899,31 +942,37 @@ export function recoverStaleDirectoryLock(
   }
 }
 
-async function acquireDirectoryLock(directory: AnchoredDirectory, lockName: string): Promise<string> {
+async function acquireDirectoryLock(directory: AnchoredDirectory, lockName: string, maximumEntries?: number): Promise<string> {
   const ownerToken = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2, 12)}`;
   const recoveryName = `${lockName}.recovery`;
   for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt += 1) {
-    if (directoryEntryExistsNoFollow(directory, recoveryName) || recoveryTombName(directory, recoveryName) !== null) {
-      if (reclaimAbandonedRecoveryGuard(directory, recoveryName)) continue;
+    if (directoryEntryExistsNoFollow(directory, recoveryName) || recoveryTombName(directory, recoveryName, maximumEntries) !== null) {
+      if (reclaimAbandonedRecoveryGuard(directory, recoveryName, maximumEntries)) continue;
       await wait(LOCK_RETRY_MS);
       continue;
     }
     try {
       writeDirectoryFileExclusiveNoFollow(directory, lockName, ownerToken);
-      // Recovery may have claimed its guard between the pre-check and our
-      // exclusive create. Withdraw this exact token before entering; the
-      // recovery owner will either reclaim the prior stale file or stand down.
-      if (directoryEntryExistsNoFollow(directory, recoveryName) || recoveryTombName(directory, recoveryName) !== null) {
-        releaseDirectoryLock(directory, lockName, ownerToken);
-        await wait(LOCK_RETRY_MS);
-        continue;
-      }
-      return ownerToken;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (recoverStaleDirectoryLock(directory, lockName)) continue;
+      if (recoverStaleDirectoryLock(directory, lockName, undefined, maximumEntries)) continue;
       await wait(LOCK_RETRY_MS);
+      continue;
     }
+    // Once published, every post-acquisition refusal must release our token,
+    // including directory growth exceeding the enumeration budget.
+    let recoveryPending: boolean;
+    try {
+      recoveryPending = directoryEntryExistsNoFollow(directory, recoveryName) ||
+        recoveryTombName(directory, recoveryName, maximumEntries) !== null;
+    } catch (error) {
+      try { releaseDirectoryLock(directory, lockName, ownerToken); }
+      catch (releaseError) { throw new AggregateError([error, releaseError], "lock admission and release both failed"); }
+      throw error;
+    }
+    if (!recoveryPending) return ownerToken;
+    releaseDirectoryLock(directory, lockName, ownerToken);
+    await wait(LOCK_RETRY_MS);
   }
   throw new Error(`Could not acquire anchored lock after ${LOCK_ATTEMPTS} attempts: ${lockName}`);
 }
@@ -948,9 +997,10 @@ export async function withAnchoredDirectoryHandleLock<T>(
   anchored: AnchoredDirectory,
   lockName: string,
   operation: (directory: AnchoredDirectory) => T | Promise<T>,
+  maximumEntries?: number,
 ): Promise<T> {
   assertLeafName(lockName);
-  const ownerToken = await acquireDirectoryLock(anchored, lockName);
+  const ownerToken = await acquireDirectoryLock(anchored, lockName, maximumEntries);
   let operationFailed = false;
   let operationError: unknown;
   try {
@@ -986,13 +1036,14 @@ export async function withAnchoredDirectoryLock<T>(
   directory: string,
   lockName: string,
   operation: (directory: AnchoredDirectory) => T | Promise<T>,
+  maximumEntries?: number,
 ): Promise<T> {
   const anchored = openDirectoryNoFollow(directory);
   let outcome: AnchoredOperation<T>;
   try {
     outcome = {
       kind: "returned",
-      value: await withAnchoredDirectoryHandleLock(anchored, lockName, operation),
+      value: await withAnchoredDirectoryHandleLock(anchored, lockName, operation, maximumEntries),
     };
   } catch (error) {
     outcome = { kind: "threw", error };
@@ -1189,13 +1240,39 @@ export function readRunFileNoFollow(path: string): string {
 }
 
 /** Read exact bytes back, without any encoding round trip. */
-export function readRunBytesNoFollow(path: string): Buffer {
-  return readAnchoredRunFile(path);
+export function readRunBytesNoFollow(path: string, maximumBytes?: number): Buffer {
+  return readAnchoredRunFile(path, maximumBytes);
 }
 
-function readAnchoredRunFile(path: string): Buffer {
+function readAnchoredRunFile(path: string, maximumBytes?: number): Buffer {
   return withOpenedDirectoryNoFollow(dirname(path), `read of ${basename(path)}`, (parent) =>
-    readDirectoryFileNoFollow(parent, basename(path)));
+    readDirectoryFileNoFollow(parent, basename(path), maximumBytes));
+}
+
+/** Freshness requires descriptor-relative unlink, not a proved-then-reused
+ * absolute pathname. Darwin's real-path anchor cannot supply this guarantee. */
+export function removeDirectoryRegularFileNoFollow(directory: AnchoredDirectory, name: string): void {
+  assertAnchoredDirectory(directory);
+  if (directory.anchor !== "descriptor") throw new Error("report reset requires descriptor-anchored unlink; platform unsupported");
+  const path = anchoredChildPath(directory, name);
+  try {
+    if (!lstatSync(path).isFile()) throw new Error("report reset requires a regular file, never a directory or symlink");
+    // unlink never follows a swapped leaf link and never removes a directory.
+    unlinkSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
+/** ENOENT (including an absent parent) is the only idempotent absence. */
+export function removeRunRegularFileNoFollow(path: string): void {
+  if (process.platform !== "linux") throw new Error("report reset requires descriptor-anchored unlink; platform unsupported");
+  try {
+    withOpenedDirectoryNoFollow(dirname(path), `report reset of ${basename(path)}`, (parent) =>
+      removeDirectoryRegularFileNoFollow(parent, basename(path)));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
 }
 
 /**

@@ -20,8 +20,8 @@ import { makeViolation } from "../types";
  * `engine/src/core/` and `engine/src/parsers/` are NOT listed — despite the
  * "core"/"parser" naming, most of those files are harness-agnostic decision
  * functions that legitimately peek at the filesystem (existsSync) or write
- * to stderr, so they are not pure and would self-flag. The machine pure core
- * below is the only group verified by machine-purity.test.ts.
+ * to stderr, so they are not pure and would self-flag. The machine and
+ * Defect-Family Accounting closures below are verified by machine-purity.test.ts.
  */
 export const DEFAULT_PURE_MODULES: readonly string[] = [
   "engine/src/linter/types.ts",
@@ -36,7 +36,54 @@ export const DEFAULT_PURE_MODULES: readonly string[] = [
   "engine/src/machine/mermaid.ts",
   "engine/src/machine/test-report.ts",
   "engine/src/machine/evidence.ts",
+  "engine/src/core/structured-test-report.ts",
+  "engine/src/core/orchestration-contract/identity.ts",
   "engine/src/core/shell-command.ts",
+  "engine/src/core/frozen.ts",
+  "engine/src/core/tool-vocabulary.ts",
+  "engine/src/core/shell-ansi-c.ts",
+  "engine/src/core/shell-normalize.ts",
+  "engine/src/core/shell-quoting.ts",
+  // Defect-Family Accounting, including source authority, barrel re-exports,
+  // and type dependencies. No directory-wide core/ or infrastructure waiver.
+  "engine/src/core/defect-family-accounting.ts",
+  "engine/src/core/ordering.ts",
+  "engine/src/core/completion-suite.ts",
+  "engine/src/core/verification-manifest.ts",
+  "engine/src/core/standalone-review.ts",
+  "engine/src/core/standalone-review-machine.ts",
+  "engine/src/core/findings.ts",
+  "engine/src/core/review-packet.ts",
+  "engine/src/core/git-sha.ts",
+  "engine/src/core/panel-kernel.ts",
+  "engine/src/core/panel-program.ts",
+  "engine/src/core/panel-contract.ts",
+  "engine/src/core/review-panel.ts",
+  "engine/src/core/review-output.ts",
+  "engine/src/core/model-profiles.ts",
+  "engine/src/core/phases.ts",
+  "engine/src/core/repository-path.ts",
+  "engine/src/core/orchestration-contract/index.ts",
+  "engine/src/core/orchestration-contract/errors.ts",
+  "engine/src/core/orchestration-contract/bytes.ts",
+  "engine/src/core/orchestration-contract/artifacts.ts",
+  "engine/src/core/orchestration-contract/roster.ts",
+  "engine/src/core/orchestration-contract/publication.ts",
+  "engine/src/core/orchestration-contract/completion.ts",
+  "engine/src/core/orchestration-contract/diagnostics.ts",
+  "engine/src/core/orchestration-contract/actions.ts",
+  "engine/src/core/orchestration-contract/effects.ts",
+  "engine/src/types.ts",
+  "engine/src/utils/no-finding-sentinel.ts",
+  "engine/src/core/wave-gate-model.ts",
+  "engine/src/core/proof-obligations.ts",
+  "engine/src/core/verification-policy.ts",
+  "engine/src/core/requirement-coverage.ts",
+  "engine/src/core/parse-spec.ts",
+  "engine/src/core/artifact-baseline.ts",
+  "engine/src/core/implementation-retry.ts",
+  "engine/src/core/implementation-completion.ts",
+  "engine/src/core/task-id.ts",
 ];
 
 /** Import specifiers that indicate I/O capability or ambient non-determinism */
@@ -55,6 +102,10 @@ export const IO_IMPORTS: readonly string[] = [
   "node:process",
   "node:worker_threads",
   "node:readline",
+  "node:util",
+  "crypto",
+  "process",
+  "util",
   "fs",
   "net",
   "http",
@@ -81,11 +132,12 @@ export const BANNED_GLOBALS: readonly { pattern: RegExp; description: string }[]
   { pattern: /\bfetch\s*\(/, description: "fetch() (network I/O)" },
   { pattern: /\bconsole\.(log|error|warn|info|debug)\b/, description: "console output (I/O)" },
   { pattern: /\bMath\.random\s*\(/, description: "Math.random() (non-determinism)" },
-  { pattern: /\bnew\s+Date\s*\((?!\s*["'\d])/, description: "new Date() without argument (non-determinism)" },
+  { pattern: /\bnew\s+Date\s*\(\s*\)/, description: "new Date() without argument (non-determinism)" },
   { pattern: /\bDate\.now\s*\(/, description: "Date.now() (non-determinism — inject the clock)" },
   { pattern: /\bperformance\.now\s*\(/, description: "performance.now() (non-determinism)" },
   { pattern: /\bset(Timeout|Interval)\s*\(/, description: "setTimeout/setInterval (scheduling side effect)" },
-  { pattern: /\bcrypto\.randomUUID\s*\(/, description: "crypto.randomUUID() (non-determinism — inject the id generator)" },
+  { pattern: /\bcrypto\s*\.\s*(randomUUID|randomBytes|randomFill|randomFillSync|getRandomValues)\b/, description: "crypto entropy (non-determinism — inject the random source)" },
+  { pattern: /\bprocess\s*\.\s*(cwd|chdir|hrtime|uptime|platform|arch|argv|pid|kill|nextTick)\b/, description: "process ambient state or effects (inject shell-observed data)" },
 ];
 
 /** Import specifiers allowed even in pure modules (side-effect free) */
@@ -95,6 +147,14 @@ export const PURE_ALLOW_LIST: readonly string[] = [
   "path",
   "url",
   "ts-pattern",
+];
+
+/** Capability-level exceptions, never whole crypto/util modules. Hash instances
+ * stay local to deterministic byte transforms; randomness and debug I/O do not.
+ * Namespace/default/require/dynamic imports cannot prove a narrow capability. */
+const PURE_CAPABILITY_IMPORTS: readonly RegExp[] = [
+  /\bimport\s+\{\s*createHash(?:\s+as\s+[\w$]+)?\s*,?\s*\}\s+from\s*["'](?:node:)?crypto["']/g,
+  /\bimport\s+\{\s*isDeepStrictEqual(?:\s+as\s+[\w$]+)?\s*,?\s*\}\s+from\s*["'](?:node:)?util["']/g,
 ];
 
 // --- Matching ---
@@ -137,10 +197,16 @@ export function handler(
 
   const violations: Violation[] = [];
   const lines = content.split("\n");
+  const imports = [...content.matchAll(/\b(?:from|import|require)\s*\(?\s*["']([^"']+)["']\)?/g)];
+  const capabilityImports = PURE_CAPABILITY_IMPORTS.flatMap((pattern) =>
+    [...content.matchAll(pattern)].map((match) => ({ start: match.index, end: match.index + match[0].length })));
   let inBlockComment = false;
+  let nextLineStart = 0;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    const lineStart = nextLineStart;
+    nextLineStart += line.length + 1;
     const trimmed = line.trim();
 
     // Track block comments
@@ -155,11 +221,12 @@ export function handler(
     if (trimmed.startsWith("//")) continue;
 
     // Check for I/O imports
-    const importMatch = line.match(/(?:from|import|require)\s*\(?["']([^"']+)["']\)?/);
-    if (importMatch) {
+    for (const importMatch of imports.filter((match) => match.index >= lineStart && match.index < nextLineStart)) {
       const specifier = importMatch[1];
       const isIOImport = IO_IMPORTS.some((io) => specifier === io || specifier.startsWith(io + "/"));
-      const isAllowed = PURE_ALLOW_LIST.some((a) => specifier === a || specifier.startsWith(a + "/"));
+      const offset = importMatch.index;
+      const isAllowed = PURE_ALLOW_LIST.some((a) => specifier === a || specifier.startsWith(a + "/")) ||
+        capabilityImports.some(({ start, end }) => offset >= start && offset + importMatch[0].length <= end);
 
       if (isIOImport && !isAllowed) {
         violations.push(

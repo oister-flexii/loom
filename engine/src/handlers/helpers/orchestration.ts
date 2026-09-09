@@ -103,6 +103,7 @@ import {
   unavailable,
   type InspectedEvent,
   type ObservedFact,
+  type RemediationInspectionLabel,
   type RunInspectionObservation,
 } from "../../core/run-inspection";
 import { readSessionRunBindings, registerSessionRunBinding } from "../../orchestration/session-run-bindings";
@@ -139,8 +140,10 @@ import {
 } from "./panel-program";
 import {
   applyWaveFacadeSubmission,
+  inspectRemediationFacade,
   parseRegisteredFacadeProgram,
   parseRemediationStartInput,
+  prepareRemediationFacadeStart,
   parseStandaloneStartInput,
   parseWaveGateStartInput,
   renderSpawnTask,
@@ -156,11 +159,12 @@ import {
   waveGateDecisionMismatch,
   type FacadeDriveResult,
   type ProgramParse,
-  type RegisteredRemediationProgram,
+  type RemediationStartInputV2,
   type RegisteredStandaloneProgram,
   type RegisteredWaveGateProgram,
 } from "./programs";
 import { argumentValue, hasFlag } from "./cli-args";
+import { REMEDIATION_EVENT_RESOURCE_POLICY } from "./programs/remediation-events";
 
 const OPERATIONS = ["status", "inspect", "start", "restart", "recover-orphan", "resume", "submit", "correlate", "complete", "decide", "abandon"] as const;
 type Operation = (typeof OPERATIONS)[number];
@@ -613,7 +617,23 @@ const factOf = <T>(
  */
 async function observeRun(handle: RunDirHandle): Promise<RunInspectionObservation> {
   const authority = handle.readAuthority();
+  const programRegistration = handle.readProgramRegistration();
   const requests = handle.readIssuedRequests();
+  let remediationOutcome: ObservedFact<RemediationInspectionLabel | null> = observed(null);
+  let eventPolicy: Parameters<RunDirHandle["readEvents"]>[0];
+  if (programRegistration.ok && programRegistration.value !== null) {
+    const parsed = parseRegisteredFacadeProgram(programRegistration.value);
+    if (parsed.kind === "invalid" &&
+        typeof programRegistration.value === "object" && programRegistration.value !== null &&
+        (programRegistration.value as Record<string, unknown>)["kind"] === "remediation") {
+      remediationOutcome = unavailable(parsed.message);
+      eventPolicy = REMEDIATION_EVENT_RESOURCE_POLICY;
+    } else if (parsed.kind === "registered" && parsed.program.kind === "remediation") {
+      eventPolicy = parsed.program.schemaVersion === 2 ? REMEDIATION_EVENT_RESOURCE_POLICY : undefined;
+      const projected = await inspectRemediationFacade(handle, parsed.program);
+      remediationOutcome = projected.ok ? observed(projected.label) : unavailable(projected.message);
+    }
+  }
   const markerRejections: ObservedFact<ReadonlyMap<string, string>> = requests.ok
     ? ((): ObservedFact<ReadonlyMap<string, string>> => {
         const markers = new Map<string, string>();
@@ -633,12 +653,13 @@ async function observeRun(handle: RunDirHandle): Promise<RunInspectionObservatio
     // The authority's CONTENT is the identity already carried above; only its
     // readability is news, so the fact's payload is deliberately empty.
     authority: authority.ok ? observed<null>(null) : unavailable<null>(authority.error.message),
-    programRegistration: factOf(handle.readProgramRegistration()),
+    programRegistration: factOf(programRegistration),
     checkpoint: await observing(() => handle.readCheckpoint(), "checkpoint"),
+    remediationOutcome,
     requests: factOf(requests),
     capturedAttempts: factOf(handle.readCapturedAttempts()),
     markerRejections,
-    events: await observing<readonly InspectedEvent[]>(() => handle.readEvents(), "event log"),
+    events: await observing<readonly InspectedEvent[]>(() => handle.readEvents(eventPolicy), "event log"),
     abandonment: factOf(handle.readAbandonment()),
   });
 }
@@ -1089,7 +1110,7 @@ const isStartProgram = (value: string | undefined): value is StartProgram =>
  */
 type StartRequest =
   | Readonly<{ kind: "standalone-review"; input: RegisteredStandaloneProgram["input"] }>
-  | Readonly<{ kind: "remediation"; input: RegisteredRemediationProgram["input"] }>
+  | Readonly<{ kind: "remediation"; input: RemediationStartInputV2 }>
   | Readonly<{ kind: "wave-gate"; input: RegisteredWaveGateProgram["input"] }>
   | Readonly<{ kind: "panel"; registration: RegisteredPanelProgram }>;
 
@@ -1126,10 +1147,11 @@ function parseStartRequest(program: StartProgram, stdin: string): ProgramParse<S
   return { ok: true, value: Object.freeze({ kind: "panel", registration }) };
 }
 
-const driveStart = (handle: RunDirHandle, request: StartRequest): Promise<FacadeDriveResult> =>
+type NonRemediationStartRequest = Exclude<StartRequest, { kind: "remediation" }>;
+
+const driveStart = (handle: RunDirHandle, request: NonRemediationStartRequest): Promise<FacadeDriveResult> =>
   match(request)
     .with({ kind: "standalone-review" }, ({ input }) => startStandaloneFacade(handle, input))
-    .with({ kind: "remediation" }, ({ input }) => startRemediationFacade(handle, input))
     .with({ kind: "wave-gate" }, ({ input }) => startWaveGateFacade(handle, input))
     .with({ kind: "panel" }, async ({ registration }) => {
       const registered = await handle.registerProgram(registration);
@@ -1146,6 +1168,25 @@ async function startOperation(stdin: string, args: readonly string[]): Promise<H
   }
   const request = parseStartRequest(program, stdin);
   if (!request.ok) return { kind: "error", message: request.message };
+  if (request.value.kind === "remediation") {
+    const runRoot = argumentValue(args.slice(1), "--runs-root");
+    const run = argumentValue(args.slice(1), "--run");
+    if (runRoot === null || run === null) {
+      return { kind: "error", message: "remediation start requires --runs-root and --run" };
+    }
+    const prepared = await prepareRemediationFacadeStart({
+      input: request.value.input,
+      repositoryStartPath: process.cwd(),
+      remediationRunsRoot: runRoot,
+      remediationRun: run,
+    });
+    if (!prepared.ok) return { kind: "error", message: prepared.message };
+    const bound = bindLiveRun(args.slice(1), createRunDirectory);
+    if (!isBound(bound)) return bound;
+    const driven = await startRemediationFacade(bound.value.handle, prepared.value.registration);
+    if (!driven.ok) return { kind: "error", message: driven.message };
+    return emitRunAction(bound.value.handle, driven.action);
+  }
   const bound = bindLiveRun(args.slice(1), createRunDirectory);
   if (!isBound(bound)) return bound;
   const driven = await driveStart(bound.value.handle, request.value);

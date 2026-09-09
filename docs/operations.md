@@ -4,7 +4,7 @@ This guide covers status, persisted artifacts, recovery, validation, and contrib
 
 ## Prerequisites
 
-- Linux or macOS 13+ (anchored filesystem authority: `/proc/self/fd` descriptor-relative on Linux, `O_NOFOLLOW_ANY` on macOS — the kernel refuses older darwin kernels at startup)
+- Linux or macOS 13+ for the existing runtime (`/proc/self/fd` descriptor-relative authority on Linux; `O_NOFOLLOW_ANY` on macOS, with older Darwin kernels refused at startup). **Strict critical-remediation report reset requires Linux**; Darwin fails before check launch. This does not change zero-critical remediation or Wave behavior.
 - Bun (engine runtime and tests)
 - Git
 - Claude Code or Pi
@@ -258,16 +258,45 @@ Use it only with explicit operator intent. Preserve specs, plans, review runs, a
 
 ## Remediation and Git safety
 
-`/review-and-fix` must use the registered remediation program. It rejects:
+`/review-and-fix` must use the registered remediation program. Standalone remediation itself does **not** require a feature TaskGraph. Every new start is schema v2 and requires `defectFamily`, even when the source review has zero surviving criticals. Use the canonical Skill runbook for the complete input shape; do not hand-write a registration, checkpoint, event, or result.
 
+Before creating or claiming the requested Run Directory, start preflight authenticates the completed source review and its published result, parses complete critical-Finding accounting, selects any required operator checks, and captures the candidate baseline. Invalid input returns an ordinary start error and creates **no run**. Once preflight succeeds, the engine creates and registers the run; any later process/report failure, candidate drift, path audit failure, or installation refusal returns a durable `blocked` action for that registered run. Do not describe these two cases as the same recovery state.
+
+The program rejects:
+
+- a missing, duplicate, foreign, advisory, or refuted Finding ID in critical accounting;
+- unresolved or out-of-scope critical/sibling dispositions (valid declarations, but installation blockers);
 - dirty paths absent from review scope and explicit support paths;
 - Loom state, review, panel, and Run Directory evidence;
 - unrelated pre-staged work;
 - symlinks or non-canonical repository-relative paths at authority boundaries;
 - staged sets that differ from the audited set;
-- repository witness changes between audit and index installation.
+- selected checks without a fresh required-file JUnit/Vitest report containing at least one executed and zero failed tests;
+- candidate byte, mode, path-roster, HEAD, or index drift through execution and installation.
 
-It stages into a temporary index with literal path semantics, verifies that index, then installs it under the real index lock. Commit only after a `done` receipt. Never force-push.
+A failed check or changed candidate is immutable evidence for that run; start a fresh remediation run after correcting the cause. Removing unrelated dirty/staged state also changes the registered candidate, so it requires a fresh run rather than reuse of the old registration. A registered blocked run may be resumed idempotently for diagnosis or after a transient external condition only when source, registration, and candidate authority remain byte-identical. If remediation itself needs an omitted support path, the immutable registration cannot gain it: start a fresh run that names it and retain/abandon the older run as evidence.
+
+The engine stages into a temporary index with literal path semantics, verifies that index, and installs it under the real index lock only after an opaque installable Defect-Family Assessment exists. In the external schema-v2 `done` action, `outcome.kind` is `remediation-installed`, `outcome.installation` is the actual receipt returned by the Git adapter, and `outcome.defectFamilyAssessment` is the authenticated assessment. Read that action; never construct it. For zero surviving criticals, the assessment status is `not-required`; for critical repairs it is `repair-checked`. Neither means proven defect-family closure or a `ResolvedFinding`. Commit only after this `done` action. Never hand-stage, and never force-push.
+
+Completed schema-v1 remediation runs remain read-only and inspect as `done — historical P3 assessment unknown`; their external assessment is `historical-unknown`. Reading/resuming that history returns the existing receipt, never reinstalls the index or grants current installation authority. An unfinished schema-v1 run is blocked and must be replaced by a fresh schema-v2 run. Missing v2 fields never fall back to v1. The source Standalone Review Run retains its own schema and immutable publication; versioning remediation does not rewrite or invalidate that source history.
+
+Completed-v2 replay parses both checkpoint audit-path arrays before assessing retained observations. Missing or malformed arrays produce `remediation checkpoint audit paths are missing or malformed`, not invented empty-path evidence. If installation succeeds but checkpoint recording fails, preserve the explicit installed-index diagnostic and actual receipt: that failure does not mean rollback or “nothing was installed.” Do not hand-repair the checkpoint or reinstall from its prose; use read-only inspection and retain the interrupted evidence.
+
+**Runtime bootstrap:** after external validation, the currently admitted CLI and loaded Skill 3.1 may review and install this feature under their existing protocol. That bootstrap is not a schema-v2 `repair-checked` publication; after reload, its completed v1 run is historical-unknown. New live P3 operation requires the updated package and matching runtime revision: run `/reload` or restart Pi. Do not unset runtime-admission variables or use a fresh checkout's CLI against an older loaded extension. Installation/publication remains the parent's registered workflow, not a documentation operation.
+
+### Enrolling a critical-repair check
+
+Critical remediation selects check IDs from the operator-owned `.loom/verification-manifest.json`. The selected fixed executable/argv must itself create a **new** report at the **exact** configured path on every run. The file must be a fresh parseable JUnit XML or Vitest/Jest JSON report beneath `.loom/completion-reports/`, remain untracked, and be Git-ignored. A normal process exit is insufficient: the parsed report must show more than zero executed tests, zero failures, and not an all-skipped run.
+
+Before each selected critical check launches, the engine proves that exact literal report path is Git-ignored and untracked, then removes any old regular file through a retained Linux parent descriptor using no-follow, descriptor-relative unlink. Only ENOENT counts as absence; directories, symlinks, permission failures, and unsupported reset fail before launch with `required report reset failed before launch`. Merely touching seeded green bytes cannot pass. A newly written report may have identical bytes to the previous report. **Darwin is deliberately unsupported for this destructive reset**, because the existing pathname adapter cannot prove race-free parent anchoring. Zero-critical remediation launches no check, and Wave report freshness behavior is unchanged.
+
+Strict reports are capped at **8 MiB (8,388,608 bytes)** and actual XML element depth **128** (root depth 1, including diagnostic elements). Structural XML parsing rejects malformed documents and DTDs; comments/CDATA do not create tests. Capture, persistence, and base64 replay enforce the report byte bound before oversized allocation/decoding. V2 remediation additionally caps each encoded event file at **12 MiB**, the aggregate encoded journal at **64 MiB**, and the journal at **1024 records**. These limits apply to retained-event reads, append reconciliation/new appends, and CLI inspection's event-tail read, before oversized file decoding/JSON parsing; enumeration is bounded too. They are not blanket limits on every Run artifact/checkpoint, or a claim that decoded heap usage equals encoded bytes. Legacy/default journal consumers retain their existing policy.
+
+These are fresh structured engine observations, **not semantic proof**: an operator-owned fixed command can still fabricate a syntactically valid new report. Neither process success nor a report digest proves that tests exercised the declared invariant, root cause, sibling completeness, or Historical RED.
+
+The `helper write-verification-manifest` operation is **create-only**. It requires an existing loadable TaskGraph whose Task roster is empty, accepts an identical replay, refuses a different existing manifest, and refuses after Task population. It does not update this repository's existing manifest. Standalone remediation has no TaskGraph requirement; this enrollment helper's idle-TaskGraph requirement is a separate configuration-installation constraint.
+
+This repository currently has `project:verify` with `report.kind: "not-required"`; it cannot be selected for critical P3 evidence. Replacing existing operator configuration is an explicit operator action outside this feature implementation and must occur at an approved idle boundary under the repository's protected-state policy. Existing populated TaskGraphs retain their already-frozen commands. Do not bypass protected paths, edit a live graph, or add a generic root task runner merely to enroll a check. See [Verification manifest](workflows.md#verification-manifest) for parser-validated JUnit and Vitest examples.
 
 ## Linter operations
 
@@ -322,7 +351,7 @@ Without `LOOM_RUN_MODEL_CALIBRATION=1`, the script exits without running models.
 
 ### Locked bootstrap and mandatory full gate
 
-The development/CI baseline is a full-history Git checkout on non-root Linux, Node **22.23.2**, Bun **1.3.13**, npm, Git, jq, Bash **4+**, and GNU `timeout` on PATH. Runtime support for macOS 13+ is not a claim that this verification change was tested there; macOS would also need the development tools, including GNU coreutils and a suitable Bash. Full history is required because deterministic tests resolve the committed model-calibration corpus against historical revisions available through remote refs. A normal full clone checked out on `main` contains those objects; for an existing single-branch shallow clone, fetch every remote head before verification:
+The development/CI baseline is a full-history Git checkout on non-root Linux, Node **22.23.2**, Bun **1.3.13**, npm, Git, jq, Bash **4+**, and GNU `timeout` on PATH. The existing macOS 13+ runtime support excludes strict critical-remediation report reset and is not a claim that this verification change was tested there; macOS would also need the development tools, including GNU coreutils and a suitable Bash. Full history is required because deterministic tests resolve the committed model-calibration corpus against historical revisions available through remote refs. A normal full clone checked out on `main` contains those objects; for an existing single-branch shallow clone, fetch every remote head before verification:
 
 ```bash
 git fetch --unshallow origin '+refs/heads/*:refs/remotes/origin/*' --tags

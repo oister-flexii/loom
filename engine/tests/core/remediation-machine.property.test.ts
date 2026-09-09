@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import fc from "fast-check";
 import {
@@ -5,6 +6,7 @@ import {
   compareExactPathSets,
   createStandaloneResultPublicationAuthorityResolver,
   freezePathAuthority,
+  inspectVerifiedIndexInstallation,
   parseAuditedPathSet as parseAuditedPathSetWithAuthority,
   parseCanonicalRepositoryRelativePath,
   parseDirtyPathObservation,
@@ -17,7 +19,7 @@ import {
   parseVerifiedIndexInstallation as parseVerifiedIndexInstallationWithAuthority,
   parseVerifiedTemporaryIndex as parseVerifiedTemporaryIndexWithAuthority,
   prepareLiteralGitPathspec,
-  prepareVerifiedIndexInstallation,
+  prepareVerifiedIndexInstallation as prepareVerifiedIndexInstallationWithAuthority,
   recoveryReceiptFor,
   reduceRemediation,
   registerSupportPath,
@@ -37,6 +39,15 @@ import {
   type VerifiedTemporaryIndex,
 } from "../../src/core/remediation-machine";
 import { serializeAdjudicatedStandaloneReview } from "../../src/core/standalone-review";
+import {
+  createCandidateRepositoryWitness,
+  prepareDefectFamilyAccounting,
+  evaluateInstallableDefectFamilyAccounting,
+  parseCandidateRepositoryWitness,
+  prepareDefectFamilyVerification,
+  type CandidateRepositoryWitness,
+  type InstallableDefectFamilyAssessment,
+} from "../../src/core/defect-family-accounting";
 
 import {
   digest,
@@ -58,10 +69,41 @@ const parseStagedTemporaryIndex = (raw: unknown) =>
   parseStagedTemporaryIndexWithAuthority(raw, standalonePublicationResolver());
 const parseVerifiedTemporaryIndex = (raw: unknown) =>
   parseVerifiedTemporaryIndexWithAuthority(raw, standalonePublicationResolver());
-const parseVerifiedIndexInstallation = (raw: unknown) =>
-  parseVerifiedIndexInstallationWithAuthority(raw, standalonePublicationResolver());
-const parseRemediationState = (raw: unknown) =>
-  parseRemediationStateWithAuthority(raw, standalonePublicationResolver());
+function parsedCandidate(raw: unknown): CandidateRepositoryWitness {
+  const parsed = parseCandidateRepositoryWitness(raw);
+  return parsed.ok ? parsed.value : candidateWitness();
+}
+
+const parseVerifiedIndexInstallation = (raw: unknown) => {
+  const record = raw as { candidateWitness?: unknown };
+  const candidate = parsedCandidate(record.candidateWitness);
+  return parseVerifiedIndexInstallationWithAuthority(
+    raw,
+    standalonePublicationResolver(),
+    installableAssessment(),
+    candidate,
+  );
+};
+const parseRemediationState = (raw: unknown) => {
+  let rawCandidate: unknown;
+  try {
+    const installation = typeof raw === "object" && raw !== null
+      ? Object.getOwnPropertyDescriptor(raw, "installation")?.value
+      : undefined;
+    rawCandidate = typeof installation === "object" && installation !== null
+      ? Object.getOwnPropertyDescriptor(installation, "candidateWitness")?.value
+      : undefined;
+  } catch {
+    rawCandidate = undefined;
+  }
+  const candidate = parsedCandidate(rawCandidate);
+  return parseRemediationStateWithAuthority(
+    raw,
+    standalonePublicationResolver(),
+    installableAssessment(),
+    candidate,
+  );
+};
 
 function repositoryWitness(offset = 0): RepositorySnapshotWitness {
   return valueOf(parseRepositorySnapshotWitness({
@@ -69,6 +111,40 @@ function repositoryWitness(offset = 0): RepositorySnapshotWitness {
     indexDigest: digest(20 + offset),
     worktreeDigest: digest(30 + offset),
   }));
+}
+
+function installableAssessment(): InstallableDefectFamilyAssessment {
+  const accounting = valueOf(prepareDefectFamilyAccounting(standaloneFixture().input.standaloneResult, { kind: "not-required" }));
+  const plan = valueOf(prepareDefectFamilyVerification(accounting, null));
+  return valueOf(evaluateInstallableDefectFamilyAccounting(plan, candidateWitness(), {
+    auditedInstalledPaths: remediationPaths, dirtyOrStagedPaths: remediationPaths,
+  }, []));
+}
+
+function candidateWitness(repository = repositoryWitness()): CandidateRepositoryWitness {
+  return valueOf(createCandidateRepositoryWitness({
+    kind: "candidate-repository-witness",
+    repositoryRoot: "/repo",
+    workspaceDigest: digest(90),
+    pathCount: remediationPaths.length,
+    observedPaths: remediationPaths,
+    gitWitness: repository,
+    generatedReportExclusions: [],
+  }));
+}
+
+function prepareVerifiedIndexInstallation(
+  index: VerifiedTemporaryIndex,
+  effectId: unknown,
+  repository = repositoryWitness(),
+) {
+  return prepareVerifiedIndexInstallationWithAuthority(
+    index,
+    installableAssessment(),
+    effectId,
+    repository,
+    candidateWitness(repository),
+  );
 }
 
 function frozenAuthority(): FrozenPathAuthority {
@@ -560,6 +636,84 @@ const PATH_PRESENT_CHANGES = ["added", "modified", "renamed-to"] as const;
 const PATH_ABSENT_CHANGES = ["renamed-from", "deleted", "absent"] as const;
 
 describe("nominal proof chain, durable parsers, and TOCTOU", () => {
+  it("requires all current P3 fields after discriminant narrowing", () => {
+    const prepared = installation();
+    if (prepared.schemaVersion === 2) {
+      const assessment: InstallableDefectFamilyAssessment = prepared.assessment;
+      const candidate: CandidateRepositoryWitness = prepared.candidateWitness;
+      expect(assessment).toBeDefined();
+      expect(candidate).toBeDefined();
+      const { assessment: _assessment, ...missingAssessment } = prepared;
+      const { candidateWitness: _candidate, ...missingCandidate } = prepared;
+      if (false) {
+        // @ts-expect-error Current installation cannot omit assessment authority.
+        const noAssessment: VerifiedIndexInstallation = missingAssessment;
+        // @ts-expect-error Current installation cannot omit candidate authority.
+        const noCandidate: VerifiedIndexInstallation = missingCandidate;
+        // @ts-expect-error Current authority cannot be relabeled as historical authority.
+        const relabeled: VerifiedIndexInstallation = { ...prepared, schemaVersion: 1 };
+        void [noAssessment, noCandidate, relabeled];
+      }
+    }
+  });
+
+  it("rejects every nonempty subset of missing v2 authority fields without downgrading", () => {
+    const prepared = installation();
+    fc.assert(fc.property(fc.subarray([
+      "assessment", "assessmentDigest", "candidateWitness", "candidateWitnessDigest",
+    ], { minLength: 1 }), (missing) => {
+      const raw = jsonRoundTrip(prepared) as Record<string, unknown>;
+      for (const field of missing) delete raw[field];
+      expect(parseVerifiedIndexInstallation(raw).ok).toBe(false);
+      expect(inspectVerifiedIndexInstallation(raw as unknown as VerifiedIndexInstallation).ok).toBe(false);
+    }));
+  });
+
+  it("reads completed legacy installation facts without minting reinstall or transition authority", () => {
+    const states = lifecycleStates();
+    const prepared = states.prepared;
+    const identity = { verifiedIndexDigest: prepared.verifiedIndexDigest, intent: prepared.intent };
+    const legacy = {
+      schemaVersion: 1,
+      kind: "verified-index-installation",
+      verified: prepared.verified,
+      ...identity,
+      digest: createHash("sha256").update(JSON.stringify(identity)).digest("hex"),
+    };
+    const historical = valueOf(parseVerifiedIndexInstallationWithAuthority(legacy, standalonePublicationResolver()));
+    expect(historical.schemaVersion).toBe(1);
+    expect(inspectVerifiedIndexInstallation(historical).ok).toBe(false);
+    expect(reduceRemediation(states.verifiedState, {
+      kind: "index-installed", installation: historical, receipt: installedReceipt(prepared),
+    }).ok).toBe(false);
+    const done = jsonRoundTrip(states.done) as Record<string, unknown>;
+    done.installation = legacy;
+    delete done.defectFamilyAssessment;
+    const parsed = valueOf(parseRemediationStateWithAuthority(done, standalonePublicationResolver()));
+    expect(parsed.state).toBe("done");
+    expect(jsonRoundTrip(parsed)).toEqual(done);
+    expect(reduceRemediation(parsed, {
+      kind: "index-installed", installation: prepared, receipt: installedReceipt(prepared),
+    }).ok).toBe(false);
+    expect(parseVerifiedIndexInstallationWithAuthority({ ...legacy, assessment: installableAssessment() },
+      standalonePublicationResolver()).ok).toBe(false);
+  });
+
+  it("fails closed on hostile installation casts and descriptor proxies", () => {
+    const revoked = Proxy.revocable({}, {});
+    revoked.revoke();
+    let effects = 0;
+    const accessor = { get schemaVersion() { effects++; throw new Error("accessor ran"); } };
+    for (const raw of [accessor, revoked.proxy, new Proxy({}, {
+      getOwnPropertyDescriptor() { throw new Error("descriptor trap"); },
+    })]) {
+      expect(inspectVerifiedIndexInstallation(raw as VerifiedIndexInstallation).ok).toBe(false);
+      expect(() => parseVerifiedIndexInstallationWithAuthority(raw, standalonePublicationResolver())).not.toThrow();
+      expect(parseVerifiedIndexInstallationWithAuthority(raw, standalonePublicationResolver()).ok).toBe(false);
+    }
+    expect(effects).toBe(0);
+  });
+
   it("makes only audited staging and only verified installation type-correct", () => {
     if (false) {
       // @ts-expect-error Frozen authority lacks the unexported AuditedPathSet nominal brand.
@@ -1162,9 +1316,12 @@ describe("durable LC-3 lifecycle and recovery", () => {
     const replaced = jsonRoundTrip(lifecycleStates().done) as { authority: unknown };
     replaced.authority = jsonRoundTrip(replacementAuthority);
 
+    const rawInstallation = (replaced as unknown as { installation: { candidateWitness: unknown } }).installation;
     const parsed = parseRemediationStateWithAuthority(
       replaced,
       standalonePublicationResolverForScopes([defaultScope, replacementScope]),
+      installableAssessment(),
+      parsedCandidate(rawInstallation.candidateWitness),
     );
     expect(parsed.ok).toBe(false);
     if (!parsed.ok) {
