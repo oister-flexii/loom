@@ -433,7 +433,57 @@ export function parseRunDirectoryIdentity(
 // Handle
 // ---------------------------------------------------------------------------
 
+declare class RunEventResourcePolicyMembership {
+  private readonly runEventResourcePolicyMembership: true;
+}
+
+export type RunEventResourcePolicy = RunEventResourcePolicyMembership & Readonly<{
+  maxEventBytes: number;
+  maxJournalBytes: number;
+  maxRecords: number;
+}>;
+const eventPolicies = new WeakSet<object>();
+
+/** Parse once; no raw caller budget or mutable object reaches filesystem reads. */
+export function parseRunEventResourcePolicy(raw: unknown): DomainResult<RunEventResourcePolicy, RunDirectoryError> {
+  try {
+    if (typeof raw !== "object" || raw === null || Object.getPrototypeOf(raw) !== Object.prototype) {
+      return failure("eventPolicy", "event resource policy must be a plain own-data object");
+    }
+    const fields = ["maxEventBytes", "maxJournalBytes", "maxRecords"] as const;
+    const keys = Reflect.ownKeys(raw);
+    if (keys.length !== fields.length || keys.some(key => !fields.some(field => field === key))) {
+      return failure("eventPolicy", "event resource policy must contain exactly maxEventBytes, maxJournalBytes, maxRecords");
+    }
+    const values: readonly unknown[] = fields.map(field => {
+      const descriptor = Object.getOwnPropertyDescriptor(raw, field);
+      return descriptor !== undefined && "value" in descriptor && descriptor.enumerable ? descriptor.value : undefined;
+    });
+    const [maxEventBytes, maxJournalBytes, maxRecords] = values;
+    if (typeof maxEventBytes !== "number" || typeof maxJournalBytes !== "number" || typeof maxRecords !== "number" ||
+        values.some(value => typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0 || value > Number.MAX_SAFE_INTEGER - 8) ||
+        maxEventBytes > maxJournalBytes) {
+      return failure("eventPolicy", "event limits must be positive safe integers and maxEventBytes must not exceed maxJournalBytes");
+    }
+    const policy = Object.freeze({ maxEventBytes, maxJournalBytes, maxRecords }) as RunEventResourcePolicy;
+    eventPolicies.add(policy);
+    return success(policy);
+  } catch {
+    return failure("eventPolicy", "event resource policy could not be safely inspected");
+  }
+}
+
+function assertEventPolicy(policy: RunEventResourcePolicy | undefined): void {
+  if (policy !== undefined && !eventPolicies.has(policy)) throw new Error("event resource policy must be parser-minted");
+}
+
+// Eight slots cover the owned lock/recovery/tomb/prepared metadata, not extra events.
+const eventDirectoryLimit = (policy: RunEventResourcePolicy | undefined): number | undefined =>
+  policy === undefined ? undefined : policy.maxRecords + 8;
+
 export interface RunDirHandle extends ProgramJournal {
+  readEvents(policy?: RunEventResourcePolicy): Promise<readonly ProgramEventRecord[]>;
+  appendEvent(record: ProgramEventRecord, policy?: RunEventResourcePolicy): Promise<void>;
   readonly identity: RunDirectoryIdentity;
   readonly runId: OrchestrationRunId;
   readonly runDirectory: string;
@@ -521,15 +571,21 @@ function readJsonNoFollow(path: string): unknown {
 }
 
 /** The event records only; the retained descriptor also contains the lock. */
-function eventFileNames(events: AnchoredDirectory): readonly string[] {
-  return listDirectoryNamesNoFollow(events).filter((name) => name.endsWith(".json"));
+function eventFileNames(events: AnchoredDirectory, policy?: RunEventResourcePolicy): readonly string[] {
+  return listDirectoryNamesNoFollow(events, eventDirectoryLimit(policy)).filter((name) => name.endsWith(".json"));
 }
 
 const EVENT_FILE = /^(\d{6,})-([A-Za-z0-9:_-]{1,256})\.json$/;
 
-function readEventRecords(events: AnchoredDirectory): readonly ProgramEventRecord[] {
+function readEventRecords(events: AnchoredDirectory, policy?: RunEventResourcePolicy): Readonly<{
+  records: readonly ProgramEventRecord[];
+  byteLength: number;
+}> {
   const seenDedup = new Set<string>();
-  return Object.freeze(eventFileNames(events).map((name, index) => {
+  const names = eventFileNames(events, policy);
+  if (policy !== undefined && names.length > policy.maxRecords) throw new Error(`journal exceeds ${policy.maxRecords} record limit`);
+  let byteLength = 0;
+  const records = Object.freeze(names.map((name, index) => {
     const match = EVENT_FILE.exec(name);
     if (match === null) throw new Error(`Corrupt program event filename ${name}`);
     const filenameSequence = Number(match[1]);
@@ -537,7 +593,10 @@ function readEventRecords(events: AnchoredDirectory): readonly ProgramEventRecor
     if (!Number.isSafeInteger(filenameSequence) || filenameSequence !== index) {
       throw new Error(`Corrupt program event ${name}: sequence prefix is not contiguous from zero`);
     }
-    const raw = JSON.parse(readDirectoryFileNoFollow(events, name).toString("utf-8")) as unknown;
+    const remaining = policy === undefined ? undefined : Math.min(policy.maxEventBytes, policy.maxJournalBytes - byteLength);
+    const bytes = readDirectoryFileNoFollow(events, name, remaining);
+    byteLength += bytes.byteLength;
+    const raw = JSON.parse(bytes.toString("utf-8")) as unknown;
     const record = parseProgramEventRecord(raw, name);
     if (record.sequence !== filenameSequence || record.dedupKey !== filenameDedup) {
       throw new Error(`Corrupt program event ${name}: filename does not match record identity`);
@@ -548,6 +607,7 @@ function readEventRecords(events: AnchoredDirectory): readonly ProgramEventRecor
     seenDedup.add(record.dedupKey);
     return record;
   }));
+  return Object.freeze({ records, byteLength });
 }
 
 function inspectExistingDirectory(path: string): DomainResult<boolean, RunDirectoryError> {
@@ -938,29 +998,39 @@ function abandonmentOperations(runId: OrchestrationRunId, directory: string) {
  * lock while the dedup key keeps retry idempotency.
  */
 function appendEventOperation(directory: string) {
-  return async (record: ProgramEventRecord): Promise<void> => {
+  return async (record: ProgramEventRecord, policy?: RunEventResourcePolicy): Promise<void> => {
+    assertEventPolicy(policy);
     const parsedInput = parseProgramEventRecord(record, "append input");
     await withAnchoredDirectoryLock(join(directory, EVENTS), "append.lock", (eventsDirectory) => {
-      const events = readEventRecords(eventsDirectory);
-      if (events.some((event) => event.dedupKey === parsedInput.dedupKey)) return;
-      const sequence = events.length;
+      const journal = readEventRecords(eventsDirectory, policy);
+      if (journal.records.some((event) => event.dedupKey === parsedInput.dedupKey)) return;
+      const sequence = journal.records.length;
+      if (policy !== undefined && sequence >= policy.maxRecords) throw new Error(`journal exceeds ${policy.maxRecords} record limit`);
       const sequenced = Object.freeze({ ...parsedInput, sequence });
+      const body = JSON.stringify(sequenced);
+      const bytes = Buffer.byteLength(body);
+      if (policy !== undefined && (bytes > policy.maxEventBytes || bytes > policy.maxJournalBytes - journal.byteLength)) {
+        throw new Error("journal append exceeds event or journal byte limit");
+      }
       writeDirectoryFileExclusiveNoFollow(
         eventsDirectory,
         `${String(sequence).padStart(6, "0")}-${sequenced.dedupKey}.json`,
-        JSON.stringify(sequenced),
+        body,
       );
-    });
+    }, eventDirectoryLimit(policy));
   };
 }
 
 function readEventsOperation(directory: string) {
-  return async (): Promise<readonly ProgramEventRecord[]> =>
-    withAnchoredDirectoryLock(
+  return async (policy?: RunEventResourcePolicy): Promise<readonly ProgramEventRecord[]> => {
+    assertEventPolicy(policy);
+    return withAnchoredDirectoryLock(
       join(directory, EVENTS),
       "append.lock",
-      (eventsDirectory) => readEventRecords(eventsDirectory),
+      (eventsDirectory) => readEventRecords(eventsDirectory, policy).records,
+      eventDirectoryLimit(policy),
     );
+  };
 }
 
 function readCheckpointOperation(directory: string) {

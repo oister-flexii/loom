@@ -100,6 +100,22 @@ _Avoid_: Workspace, scratch dir, output dir
 An immutable review-and-adjudication record outside the wave lifecycle. It binds an exact file scope to the complete expected reviewer transcript set, identified Findings, optional Refutation Panel outcomes, and one finalized remediation input. It never reads or writes the State File.
 _Avoid_: Synthetic Task, fake Wave, ad-hoc review output
 
+**Defect-Family Accounting**:
+Exact accounting of one Standalone Review Run's surviving critical Finding IDs into Declared Repair Groups or explicit blocking dispositions. Grouping, root cause, invariant, sibling-path completeness, and Historical RED remain semantic declarations; accounting never changes the source Findings or creates a Resolved Finding.
+_Avoid_: Proven closure, automatic root-cause discovery, cross-run finding lineage
+
+**Declared Repair Group**:
+A separately identified grouping that retains every original Finding ID and declares one root cause, invariant, sibling-path accounting, and selected operator-owned regression checks. Grouping is declared, not confirmed by a digest or inferred from similar text.
+_Avoid_: Merged Finding, confirmed defect, replacement Finding ID
+
+**Historical RED Declaration**:
+An explicitly `DECLARED` statement about a regression against vulnerable behavior. It may cite historical evidence, but is never represented as engine-observed execution of the vulnerable snapshot.
+_Avoid_: Observed counterfactual, verified historical failure, execution receipt
+
+**Repair-Checked**:
+The bounded remediation outcome: every surviving critical and declared sibling is accounted for without blocking dispositions, and selected operator-owned checks produced fresh passing structured test reports under engine observation on unchanged candidate bytes. It proves neither the declared root cause nor historical RED. Zero surviving criticals instead yields `not-required`; legacy completion has `historical-unknown` accounting.
+_Avoid_: Proven closed, Resolved Finding, semantic proof
+
 **State File**:
 The single source of truth for orchestration progress (`active_task_graph.json`). Write-protected; Hooks and explicitly whitelisted StateManager-backed CLI helpers are its only mutation paths.
 _Avoid_: Config, manifest, plan file

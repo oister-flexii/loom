@@ -15,6 +15,16 @@ import { readRunBytesNoFollow } from '../../../orchestration/no-follow-fs';
 import { parseRunDirectoryReference, type RunDirHandle } from '../../../orchestration/run-directory-handle';
 import { isExcludedRemediationPath, parseCanonicalRepositoryRelativePath } from '../../../core/remediation-machine';
 import type { PersistentRefutationPanelEvent } from '../../../core/panel-program';
+import {
+  parseRegisteredRemediationProgram,
+  parseRemediationStartInputV2,
+  type RegisteredRemediationProgram,
+  type RemediationStartInputV2,
+} from './remediation-registration';
+export type {
+  RegisteredRemediationProgram,
+  RemediationStartInputV2,
+} from './remediation-registration';
 
 export type RegisteredStandaloneProgram = Readonly<{
   schemaVersion: 1;
@@ -41,12 +51,6 @@ export type RegisteredWaveGateProgram = Readonly<{
   authorityDigest: string;
   restart?: WaveGateRestartAudit;
   orphanRecovery?: OrphanedWaveGateRecoveryAudit;
-}>;
-
-export type RegisteredRemediationProgram = Readonly<{
-  schemaVersion: 1;
-  kind: "remediation";
-  input: Readonly<{ sourceRunsRoot: string; sourceRun: string; supportPaths: readonly string[] }>;
 }>;
 
 export type RegisteredFacadeProgram = RegisteredStandaloneProgram | RegisteredRemediationProgram | RegisteredWaveGateProgram;
@@ -457,26 +461,14 @@ export function parseWaveGateStartInput(raw: unknown): ProgramParse<RegisteredWa
   return { ok: true, value: Object.freeze({ wave: raw.wave as number | null }) };
 }
 
-export function parseRemediationStartInput(raw: unknown): ProgramParse<RegisteredRemediationProgram["input"]> {
-  if (!exactObject(raw, ["sourceRunsRoot", "sourceRun", "supportPaths"]) ||
-      typeof raw.sourceRunsRoot !== "string" || raw.sourceRunsRoot.length === 0 ||
-      typeof raw.sourceRun !== "string" || raw.sourceRun.length === 0 ||
-      !Array.isArray(raw.supportPaths) || raw.supportPaths.some((path) => typeof path !== "string" || path.length === 0)) {
-    return { ok: false, message: "remediation input must contain sourceRunsRoot, sourceRun, and supportPaths" };
-  }
-  // The source pair names a real Run Directory relation, so hold it to that
-  // relation HERE rather than at drive time. Shape-only validation deferred the
-  // check until after the new remediation run had been claimed, which turned a
-  // one-character payload mistake into a directory the operator had to delete
-  // by hand. The strings are stored exactly as authored — resolution belongs to
-  // the drive, so a registration stays portable and re-readable.
-  const source = parseRunDirectoryReference(raw.sourceRunsRoot, raw.sourceRun);
-  if (!source.ok) return { ok: false, message: `remediation input sourceRun: ${source.error.message}` };
-  return { ok: true, value: Object.freeze({
-    sourceRunsRoot: raw.sourceRunsRoot,
-    sourceRun: raw.sourceRun,
-    supportPaths: Object.freeze([...(raw.supportPaths as string[])]),
-  }) };
+export function parseRemediationStartInput(raw: unknown): ProgramParse<RemediationStartInputV2> {
+  const parsed = parseRemediationStartInputV2(raw);
+  if (!parsed.ok) return { ok: false, message: parsed.error.message };
+  // Refuse a malformed source relation before preflight does any I/O.
+  const source = parseRunDirectoryReference(parsed.value.sourceRunsRoot, parsed.value.sourceRun);
+  return source.ok
+    ? { ok: true, value: parsed.value }
+    : { ok: false, message: `remediation input sourceRun: ${source.error.message}` };
 }
 
 /**
@@ -514,13 +506,10 @@ export function parseRegisteredFacadeProgram(raw: unknown): FacadeRegistrationPa
   }
 
   if (kind === "remediation") {
-    if (!exactObject(raw, ["schemaVersion", "kind", "input"]) || raw.schemaVersion !== 1) {
-      return invalidRegistration("remediation registration must contain exactly schemaVersion 1, kind, and input");
-    }
-    const input = parseRemediationStartInput(raw.input);
-    return input.ok
-      ? registeredProgram(Object.freeze({ schemaVersion: 1, kind: "remediation", input: input.value }))
-      : invalidRegistration(input.message);
+    const remediation = parseRegisteredRemediationProgram(raw);
+    return remediation.ok
+      ? registeredProgram(remediation.value)
+      : invalidRegistration(remediation.error.message);
   }
 
   const waveBaseKeys = ["schemaVersion", "kind", "input", "taskIds", "authorityDigest"] as const;

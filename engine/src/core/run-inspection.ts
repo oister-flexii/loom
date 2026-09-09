@@ -64,6 +64,11 @@ export type InspectedAbandonment = Readonly<{
 }>;
 
 /** Everything the shell read off one Run Directory, before any interpretation. */
+export type RemediationInspectionLabel =
+  | "repair-checked"
+  | "repair-check-not-required"
+  | "done — historical P3 assessment unknown";
+
 export type RunInspectionObservation = Readonly<{
   runId: string;
   runsRoot: string;
@@ -71,6 +76,8 @@ export type RunInspectionObservation = Readonly<{
   authority: ObservedFact<null>;
   programRegistration: ObservedFact<unknown>;
   checkpoint: ObservedFact<string | null>;
+  /** Read-only façade replay over source publication, registered events, assessment, and receipt. */
+  remediationOutcome: ObservedFact<RemediationInspectionLabel | null>;
   requests: ObservedFact<readonly AgentRequestAuthority[]>;
   capturedAttempts: ObservedFact<ReadonlySet<CaptureKey>>;
   /** Rejection markers by request id, as read from the transcript slots. */
@@ -139,7 +146,12 @@ const CAPTURE_REJECTED_EVENT = "request-capture-rejected";
  * different program's shape after a schema change, which is the one case where
  * a wrong label is worse than none.
  */
-function checkpointStateLabel(program: InspectableProgram, raw: unknown): string | null {
+function checkpointStateLabel(
+  program: InspectableProgram,
+  raw: unknown,
+  rawRegistration: unknown,
+  remediationOutcome: RemediationInspectionLabel | null,
+): string | null {
   const record = (value: unknown): Record<string, unknown> | null =>
     typeof value === "object" && value !== null && !Array.isArray(value)
       ? value as Record<string, unknown>
@@ -149,7 +161,15 @@ function checkpointStateLabel(program: InspectableProgram, raw: unknown): string
   if (root === null) return null;
   return match(program)
     .with("standalone-review", "wave-gate", () => text(root["kind"]))
-    .with("remediation", () => text(record(root["state"])?.["state"]))
+    .with("remediation", () => {
+      const registrationVersion = record(rawRegistration)?.["schemaVersion"];
+      const state = record(root["state"]);
+      const stateName = text(state?.["state"]);
+      if (stateName !== "done") return stateName;
+      return registrationVersion === 1 || registrationVersion === 2
+        ? remediationOutcome
+        : null;
+    })
     .with("architecture", "refutation", () => text(record(record(root["data"])?.["state"])?.["stage"]))
     .exhaustive();
 }
@@ -246,7 +266,12 @@ export function deriveRunInspection(observation: RunInspectionObservation): RunI
     // A state label is only meaningful against a known program shape, so an
     // unreadable or unregistered program propagates as an unavailable state
     // rather than silently reporting "no checkpoint".
-    state: deriveState(program, observation.checkpoint),
+    state: deriveState(
+      program,
+      observation.programRegistration,
+      observation.checkpoint,
+      observation.remediationOutcome,
+    ),
     slots: deriveSlots(observation),
     events: mapFact(observation.events, summarizeEvents),
     abandonment: observation.abandonment,
@@ -255,7 +280,9 @@ export function deriveRunInspection(observation: RunInspectionObservation): RunI
 
 function deriveState(
   program: ObservedFact<InspectedProgram>,
+  registration: ObservedFact<unknown>,
   checkpoint: ObservedFact<string | null>,
+  remediationOutcome: ObservedFact<RemediationInspectionLabel | null>,
 ): ObservedFact<string | null> {
   if (program.kind === "unavailable") {
     return unavailable(`program registration is unavailable: ${program.reason}`);
@@ -274,7 +301,15 @@ function deriveState(
   } catch (error) {
     return unavailable(`checkpoint is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
   }
-  const label = checkpointStateLabel(program.value.program, raw);
+  if (program.value.program === "remediation" && remediationOutcome.kind === "unavailable") {
+    return unavailable(`remediation outcome is unavailable: ${remediationOutcome.reason}`);
+  }
+  const label = checkpointStateLabel(
+    program.value.program,
+    raw,
+    registration.kind === "observed" ? registration.value : null,
+    remediationOutcome.kind === "observed" ? remediationOutcome.value : null,
+  );
   return label === null
     ? unavailable(`checkpoint carries no ${program.value.program} state label`)
     : observed(label);

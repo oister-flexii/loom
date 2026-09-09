@@ -10,6 +10,13 @@ import {
 } from "../../../src/linter/programmatic/no-cross-boundary-imports";
 
 describe("no-cross-boundary-imports", () => {
+  it("declares the audited SAX dependency for only the structured report parser", () => {
+    expect(handler('import { SaxesParser } from "saxes";', "engine/src/core/structured-test-report.ts")).toEqual([]);
+    expect(handler('import { SaxesParser } from "saxes";', "engine/src/core/defect-family-accounting.ts")).toHaveLength(1);
+    expect(DEFAULT_BOUNDARIES.find(({ module }) => module === "engine/src/core/")?.perFileAllow?.["engine/src/core/structured-test-report.ts"]).toEqual(["saxes"]);
+    // Exact package entry/subpath rejection is exercised by machine-purity's
+    // executable closure gate; this older boundary policy matches prefixes.
+  });
   describe("underPrefix", () => {
     it("matches directory prefixes (trailing slash) by containment", () => {
       expect(underPrefix("engine/src/core/x.ts", "engine/src/core/")).toBe(true);

@@ -11,23 +11,8 @@ import type { AgentType } from "./evidence";
 
 // --- Evidence (ground truth events) ---
 
-/**
- * Brand: only `parseReportSummary` (test-report.ts) produces a
- * TestReportSummary. The symbol is declared (never exported, never given a
- * runtime value), so no other module can structurally construct one — the
- * count-sanity invariant (non-negative integers, failed ≤ total) is enforced
- * at the single smart-constructor rather than restated at each call site.
- * Mirrors the Epoch/SessionId/MachineDef branding pattern. Serialized as a
- * plain `{ total, failed, source }` JSON object; wire format unchanged.
- */
-declare const REPORT_SUMMARY_PARSED: unique symbol;
-
-/** Summary parsed from a machine-readable test report artifact. */
-export type TestReportSummary = {
-  readonly total: number;
-  readonly failed: number;
-  readonly source: "vitest-json" | "junit-xml";
-} & { readonly [REPORT_SUMMARY_PARSED]: true };
+import type { TestReportSummary } from "../core/structured-test-report";
+export type { TestReportSummary } from "../core/structured-test-report";
 
 /**
  * Provenance of a FileWrite: "tool" = the harness's own file-modifying tools

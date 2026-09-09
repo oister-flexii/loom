@@ -51,12 +51,18 @@ import {
   canonicalRecord,
   type ArtifactDigest,
   type DomainResult,
+  type VerifiedIndexInstalled,
 } from "../core/orchestration-contract";
 import {
+  inspectVerifiedIndexInstallation,
   isExcludedRemediationPath,
   parseCanonicalRepositoryRelativePath,
+  parseRepositorySnapshotWitness,
   type FixedGitPathspecContract,
+  type CurrentVerifiedIndexInstallation,
 } from "../core/remediation-machine";
+import { compareCandidateRepositoryWitnesses } from "../core/defect-family-accounting";
+import { recaptureRemediationCandidateWorkspace } from "./remediation-candidate";
 
 /** Fixed argument templates. Nothing here is ever built from caller input. */
 const GIT_EXECUTABLE = "git";
@@ -516,11 +522,6 @@ export function digestTemporaryIndex(
 // Installation
 // ---------------------------------------------------------------------------
 
-export type InstallationOutcome = Readonly<{
-  kind: "installed";
-  installedPaths: readonly string[];
-}>;
-
 /**
  * Install the verified temporary index as the real one, but only if the
  * repository has not moved underneath the verification.
@@ -533,8 +534,10 @@ export type InstallationOutcome = Readonly<{
 export function installVerifiedIndex(
   repository: GitRepository,
   temporary: TemporaryIndex,
-  expectedWitness: RepositoryWitnessInput,
-): DomainResult<InstallationOutcome, GitBoundaryError> {
+  installation: CurrentVerifiedIndexInstallation,
+): DomainResult<VerifiedIndexInstalled, GitBoundaryError> {
+  const authority = inspectVerifiedIndexInstallation(installation);
+  if (!authority.ok) return failure("install", authority.error.message);
   // A missing temporary index reads as an EMPTY index, which would write a
   // tree deleting every tracked file. Refuse before anything else.
   const present = requireTemporaryIndex(temporary, "install");
@@ -572,13 +575,33 @@ export function installVerifiedIndex(
     // check→read-tree window and be overwritten.
     const current = snapshotRepositoryWitness(repository);
     if (!current.ok) return current;
-    const drifted = driftedFields(expectedWitness, current.value);
+    const drifted = driftedFields(authority.value.verified.repositoryWitness, current.value);
     if (drifted.length > 0) {
       return failure("install", `repository changed since verification (${drifted.join(", ")}); nothing was installed`);
+    }
+    const parsedCurrent = parseRepositorySnapshotWitness(current.value);
+    if (!parsedCurrent.ok) return failure("install", parsedCurrent.error.message);
+    const recaptured = recaptureRemediationCandidateWorkspace(
+      { repositoryStartPath: repository.root, candidateBaseline: authority.value.candidateWitness },
+      parsedCurrent.value,
+    );
+    if (!recaptured.ok) return failure("install", recaptured.error.message);
+    const candidate = compareCandidateRepositoryWitnesses(authority.value.candidateWitness, recaptured.value.candidateWitness);
+    if (!candidate.ok) {
+      return failure("install", `candidate changed under the real index lock: ${candidate.error.failures.map(({ message }) => message).join("; ")}`);
     }
 
     const staged = readStagedPaths(repository, temporary);
     if (!staged.ok) return staged;
+    if (JSON.stringify(staged.value) !== JSON.stringify(authority.value.verified.exactPaths.actual.paths)) {
+      return failure("install", "temporary index staged path roster changed after verification; nothing was installed");
+    }
+    const indexDigest = digestTemporaryIndex(repository, temporary);
+    if (!indexDigest.ok) return indexDigest;
+    if (indexDigest.value !== authority.value.verified.indexDigest ||
+        authority.value.intent.indexDigest !== authority.value.verified.indexDigest) {
+      return failure("install", "temporary index bytes changed after verification; nothing was installed");
+    }
 
     writeFileSync(lockFd, readFileSync(temporary.path));
     fsyncSync(lockFd);
@@ -586,7 +609,13 @@ export function installVerifiedIndex(
     lockFd = null;
     renameSync(lockPath, indexPath);
     installed = true;
-    return success(canonicalRecord({ kind: "installed" as const, installedPaths: staged.value }));
+    return success(canonicalRecord({
+      kind: "verified-index-installed" as const,
+      effectId: authority.value.intent.effectId,
+      runId: authority.value.intent.runId,
+      indexDigest: authority.value.intent.indexDigest,
+      witnessDigest: authority.value.intent.witnessDigest,
+    }));
   } catch (error) {
     return failure("install", `cannot atomically install verified index: ${error instanceof Error ? error.message : String(error)}`);
   } finally {
@@ -626,7 +655,8 @@ function driftedFields(
 export function readRepositoryBytes(root: string, path: string): Buffer | null {
   try {
     return readFileSync(join(root, path));
-  } catch {
-    return null;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
+    throw error;
   }
 }

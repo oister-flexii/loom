@@ -30,7 +30,7 @@ The engine owns deterministic mechanics. Agents do semantic work; users make rea
 
 ### Prerequisites
 
-- Linux or macOS 13+ (anchored filesystem authority: `/proc/self/fd` descriptor-relative on Linux, `O_NOFOLLOW_ANY` on macOS — the kernel refuses older darwin kernels at startup)
+- Linux or macOS 13+ for the existing runtime (`/proc/self/fd` descriptor-relative authority on Linux; `O_NOFOLLOW_ANY` on macOS, with older Darwin kernels refused at startup). **Strict critical-remediation report reset is Linux-only**; Darwin fails before check launch. Zero-critical remediation and Wave behavior are unchanged.
 - [Bun](https://bun.sh/)
 - Git
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) or [Pi](https://github.com/earendil-works/pi-coding-agent)
@@ -182,7 +182,15 @@ Aspects: `code`, `errors`, `tests`, `types`, `comments`, `architecture`, `simpli
 
 ### `/review-and-fix`
 
-Runs adjudicated standalone review, writes a remediation plan, applies every surviving critical, and validates the code before opening a registered remediation run. By default, the parent autonomously dispositions each advisory as accepted, deferred, or dismissed from the evidence and fixes accepted advisories; it does not ask the operator to choose IDs unless explicitly requested. The engine audits dirty paths, excludes Loom evidence, stages literal paths in a temporary Git index, proves the staged set, rechecks repository witnesses, and atomically installs the verified index before commit. Push is optional; force-push is forbidden.
+Runs adjudicated standalone review, writes a remediation plan, accounts for every surviving critical, applies those dispositioned `repaired`, and validates the code before opening a registered remediation run. By default, the parent autonomously dispositions each advisory as accepted, deferred, or dismissed from the evidence and fixes accepted advisories; advisories remain outside critical repair groups. Refuted criticals are retained for audit and are never repaired.
+
+Every new remediation start uses schema v2 and supplies `defectFamily`, including the explicit `{ "kind": "not-required" }` declaration when the source review has zero surviving criticals. Otherwise every original surviving-critical Finding ID is copied exactly into one disposition; repaired dispositions refer to separately named Declared Repair Groups, while unresolved or out-of-scope criticals and siblings are valid declarations that block installation. Grouping, root cause, invariant, sibling accounting, and Historical RED are `DECLARED`; only fresh repaired-state JUnit/Vitest results are `ENGINE_OBSERVED`. The resulting label is `repair-checked`, not proven closure, a `ResolvedFinding`, or a new Finding identity.
+
+For critical checks, the engine first removes the exact old ignored/untracked regular report using no-follow, descriptor-relative unlink anchored to its Linux parent. The command must write a new report; touching old bytes cannot pass. Reports are capped at **8 MiB** and XML depth **128**; v2 event reads, append reconciliation/new appends, and inspection at **12 MiB per encoded event, 64 MiB per encoded journal, 1024 records**. An operator-owned fixed command can still fabricate a valid new report: fresh structured engine observations are not semantic proof. See [operations](docs/operations.md#enrolling-a-critical-repair-check) for scope and failures.
+
+The engine binds those observations to unchanged candidate bytes and modes, audits dirty paths, stages literal paths in a temporary Git index, proves the staged set, and installs only versioned opaque authority under the real index lock. The external `done` outcome contains the actual installation receipt and Defect-Family Assessment; callers do not supply staging outcomes, receipts, manifests, report bytes, or Run JSON. Push is optional; force-push is forbidden. Completed v1 remediation is read-only `historical-unknown`, never authority to reinstall; unfinished v1 blocks and missing v2 fields never downgrade. Completed-v2 replay refuses malformed checkpoint audit paths explicitly.
+
+For this feature's bootstrap, the admitted CLI and loaded Skill 3.1 may review/install under their existing protocol after external validation. That is not its own v2 repair-checked publication. New live P3 operation requires package reload/restart with matching runtime admission; see [runtime bootstrap](docs/operations.md#remediation-and-git-safety).
 
 ### Requirements and drift
 
@@ -324,7 +332,7 @@ The compiler checks all configured `engine/src`, `engine/tests`, `pi`, and `engi
 
 For tests without the compiler gate, use `npm --prefix engine run test` (or `cd engine && bun run test`). **Bare `bun test` invokes Bun's built-in runner, not the package's Vitest + smoke script.** The suite includes unit, property, fault-injection, integration, cross-harness, runbook-contract, and smoke coverage. Report platform-dependent skips and not-run stages explicitly; Linux validation is not evidence of macOS validation.
 
-The operator source `.loom/verification-manifest.json` selects `project:verify` (`npm run verify`, root cwd, Wave scope, 30-minute timeout, no required report). Population freezes it; configuration is not a passing result. See [Verification manifest](docs/workflows.md#verification-manifest) for installation and coverage semantics.
+The operator source `.loom/verification-manifest.json` selects `project:verify` (`npm run verify`, root cwd, Wave scope, 30-minute timeout, no required report). Population freezes it; configuration is not a passing result. Because that check has `report.kind: "not-required"`, Loom's current repository configuration is intentionally **ineligible** as evidence for a critical Defect-Family repair. Critical P3 use requires an operator-enrolled fixed command that produces a fresh required-file JUnit/Vitest report with at least one executed test. This feature does not change the protected manifest. See [Verification manifest](docs/workflows.md#verification-manifest) for enrollment and coverage semantics.
 
 Useful package operations:
 

@@ -39,6 +39,7 @@ function observation(overrides: Partial<RunInspectionObservation> = {}): RunInsp
     authority: observed<null>(null),
     programRegistration: observed<unknown>({ schemaVersion: 1, kind: "standalone-review" }),
     checkpoint: observed<string | null>(JSON.stringify({ kind: "awaiting-results" })),
+    remediationOutcome: observed(null),
     requests: observed<readonly AgentRequestAuthority[]>([]),
     capturedAttempts: observed<ReadonlySet<CaptureKey>>(new Set()),
     markerRejections: observed<ReadonlyMap<string, string>>(new Map()),
@@ -53,7 +54,7 @@ describe("deriveRunInspection — program and state", () => {
     const cases = [
       ["standalone-review", { kind: "awaiting-results" }, "awaiting-results"],
       ["wave-gate", { kind: "wave-gate-done" }, "wave-gate-done"],
-      ["remediation", { schemaVersion: 1, state: { state: "done" } }, "done"],
+      ["remediation", { schemaVersion: 1, state: { state: "done" } }, "done — historical P3 assessment unknown"],
       ["architecture", { schemaVersion: 1, data: { state: { stage: "awaiting-judges" } } }, "awaiting-judges"],
       ["refutation", { schemaVersion: 1, data: { state: { stage: "ready-to-tally" } } }, "ready-to-tally"],
     ] as const;
@@ -62,6 +63,7 @@ describe("deriveRunInspection — program and state", () => {
       const inspection = deriveRunInspection(observation({
         programRegistration: observed<unknown>({ schemaVersion: 1, kind }),
         checkpoint: observed<string | null>(JSON.stringify(checkpoint)),
+        remediationOutcome: observed(kind === "remediation" ? "done — historical P3 assessment unknown" : null),
       }));
       expect(inspection.program).toEqual({ kind: "observed", value: { kind: "registered", program: kind } });
       expect(inspection.state, `${kind} state`).toEqual({ kind: "observed", value: expected });
@@ -74,6 +76,37 @@ describe("deriveRunInspection — program and state", () => {
    * a different program's shape. Reading the wrong program's field is worse
    * than reading none, so a mismatched shape is `unavailable`.
    */
+  it("projects schema-v2 remediation terminal labels from the actual assessment", () => {
+    const repairChecked = deriveRunInspection(observation({
+      programRegistration: observed<unknown>({ schemaVersion: 2, kind: "remediation" }),
+      checkpoint: observed<string | null>(JSON.stringify({
+        schemaVersion: 2,
+        state: { state: "done", defectFamilyAssessment: { status: "repair-checked" } },
+      })),
+      remediationOutcome: observed("repair-checked"),
+    }));
+    const notRequired = deriveRunInspection(observation({
+      programRegistration: observed<unknown>({ schemaVersion: 2, kind: "remediation" }),
+      checkpoint: observed<string | null>(JSON.stringify({
+        schemaVersion: 2,
+        state: { state: "done", defectFamilyAssessment: { status: "not-required" } },
+      })),
+      remediationOutcome: observed("repair-check-not-required"),
+    }));
+    const missingAssessment = deriveRunInspection(observation({
+      programRegistration: observed<unknown>({ schemaVersion: 2, kind: "remediation" }),
+      checkpoint: observed<string | null>(JSON.stringify({ schemaVersion: 2, state: { state: "done" } })),
+      remediationOutcome: unavailable("registered event replay is incomplete"),
+    }));
+
+    expect(repairChecked.state).toEqual({ kind: "observed", value: "repair-checked" });
+    expect(notRequired.state).toEqual({ kind: "observed", value: "repair-check-not-required" });
+    expect(missingAssessment.state).toEqual({
+      kind: "unavailable",
+      reason: "remediation outcome is unavailable: registered event replay is incomplete",
+    });
+  });
+
   it("refuses to read one program's checkpoint through another's shape", () => {
     const inspection = deriveRunInspection(observation({
       programRegistration: observed<unknown>({ schemaVersion: 1, kind: "remediation" }),

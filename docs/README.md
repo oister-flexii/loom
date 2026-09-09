@@ -1,6 +1,6 @@
 # Loom documentation
 
-This directory documents the shipped Loom 1.1 architecture. Operational command files under `commands/` and `skills/` remain the executable runbooks; these documents explain the system around them.
+This directory documents the Loom 1.1 architecture and the explicitly marked P3 candidate contract. Defect-Family Accounting has one completed registered review and locally verified repairs; installation, publication, hosted CI, and merge are not claimed. Operational command files under `commands/` and `skills/` remain the executable runbooks; these documents explain the system around them.
 
 ## Start here
 
@@ -16,6 +16,10 @@ This directory documents the shipped Loom 1.1 architecture. Operational command 
 | [Guarded skill machines](../machines/README.md) | Engine contributors | Per-agent phase machines and evidence attribution |
 | [Lint-rule authoring](../lint-rules/README.md) | Rule authors | Regex/programmatic rules and project configuration |
 
+## P3 operating boundary
+
+Critical remediation requires a **new** exact report after the engine removes the old ignored/untracked regular file using Linux no-follow, descriptor-relative unlink. Darwin fails before critical-check launch; zero-critical remediation and Wave behavior are unchanged. Reports are limited to **8 MiB / XML depth 128**; v2 journal reads, append reconciliation/new appends, and inspection to **12 MiB per encoded event / 64 MiB per encoded journal / 1024 records**. An operator-owned fixed command can still fabricate a valid new report: fresh structured observations are not semantic proof. See [Operations](operations.md#remediation-and-git-safety) for historical read-only receipts, checkpoint diagnostics, and admitted Skill 3.1 bootstrap versus reloaded live P3 operation. The existing protected `project:verify` remains report-not-required and ineligible for critical P3; documentation examples do not enroll it.
+
 ## Decisions
 
 Architecture Decision Records preserve why the system has its current shape:
@@ -24,6 +28,10 @@ Architecture Decision Records preserve why the system has its current shape:
 - [ADR-0002: Defense-in-depth ReDoS protection](adr/ADR-0002-defense-in-depth-redos-protection.md)
 - [ADR-0003: Fail-closed error handling](adr/ADR-0003-fail-closed-error-handling.md)
 - [ADR-0004: Engine-owned orchestration automation](adr/ADR-0004-engine-owned-orchestration-automation.md)
+- [ADR-0005: Per-program façade drivers](adr/ADR-0005-per-program-facade-drivers.md)
+- [ADR-0006: LC-1 reaches production by projection](adr/ADR-0006-lc1-reaches-production-by-projection.md)
+- [ADR-0007: Curated Public Surface](adr/ADR-0007-curated-public-surface.md)
+- [ADR-0008: Versioned Defect-Family installation authority](adr/ADR-0008-versioned-defect-family-installation-authority.md)
 
 ## Harness and migration notes
 
