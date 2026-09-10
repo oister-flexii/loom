@@ -16,7 +16,6 @@ import type { HookHandler, HookResult } from "../../types";
 import {
   captureStandaloneReviewerBytes,
   finalizeStandaloneReview,
-  parseStandaloneAggregate,
   parseStandaloneReviewScope,
   serializeHistoricalAdjudicatedStandaloneReview,
   serializeStandaloneAggregate,
@@ -26,7 +25,7 @@ import {
   type StandaloneReviewAggregate,
   type StandaloneReviewerRole,
 } from "../../core/standalone-review";
-import { aggregateLegacyStandaloneReview } from "../../core/legacy-archive";
+import { aggregateLegacyStandaloneReview, parseHistoricalStandaloneAggregate } from "../../core/legacy-archive";
 import { parseArtifactRef, type ArtifactRef } from "../../core/orchestration-contract";
 import { resolveReviewFindings, reviewResolutionLog } from "../../core/review-output";
 import {
@@ -380,7 +379,7 @@ function aggregate(runDir: string, inputPath: string): HookResult {
         ...existing.errors,
       ]);
     }
-    const parsed = parseStandaloneAggregate(existing.value);
+    const parsed = parseHistoricalStandaloneAggregate(existing.value);
     return parsed.ok
       ? contractError("standalone review", ["this run has already been aggregated"])
       : contractError("standalone review", [
@@ -408,7 +407,7 @@ function aggregate(runDir: string, inputPath: string): HookResult {
   try {
     writeRunFileExclusiveNoFollow(pendingPath, json);
     stagedCreated = true;
-    const staged = parseStandaloneAggregate(JSON.parse(readRunFileNoFollow(pendingPath)));
+    const staged = parseHistoricalStandaloneAggregate(JSON.parse(readRunFileNoFollow(pendingPath)));
     if (!staged.ok) throw new Error(`staged aggregate failed validation: ${staged.errors.join("; ")}`);
     publishStagedRunFile(pendingPath, aggregatePath);
   } catch (error) {
@@ -439,7 +438,7 @@ function aggregate(runDir: string, inputPath: string): HookResult {
 function loadBoundAggregate(runDir: string): Parse<StandaloneReviewAggregate> {
   const raw = readJson(join(runDir, "aggregate.json"), "standalone aggregate", runDir);
   if (!raw.ok) return raw;
-  const aggregate = parseStandaloneAggregate(raw.value);
+  const aggregate = parseHistoricalStandaloneAggregate(raw.value);
   if (!aggregate.ok) return aggregate;
   return aggregate.value.runId === basename(runDir)
     ? aggregate
@@ -504,6 +503,7 @@ function finalize(runDir: string): HookResult {
   if (existsSync(join(runDir, "outcomes.json"))) return contractError("standalone review", ["clean review unexpectedly has panel outcomes"]);
   const finalized = finalizeStandaloneReview(aggregate.value, null);
   if (!finalized.ok) return contractError("standalone review", finalized.errors);
+  if (finalized.value.schemaVersion !== 1) return contractError("standalone review", ["current standalone results require canonical LC-2 publication"]);
   const json = serializeHistoricalAdjudicatedStandaloneReview(finalized.value) + "\n";
   const target = prepareWriteTargets(runDir, [], ["result.json", ".result.pending.json"]);
   if (!target.ok) return contractError("standalone review boundary", target.errors);

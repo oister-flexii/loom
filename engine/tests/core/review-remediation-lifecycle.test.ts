@@ -1,4 +1,81 @@
 import { describe, expect, it } from "vitest";
+import fc from "fast-check";
+import { CURRENT_REVIEWER_PROTOCOL, REVIEWER_PAYLOAD_EXAMPLE_V2, reviewerDraftV2Schema } from "../../src/core/reviewer-contract";
+import { attributeFindings, claimsOfSeverity, preserveAcceptedReviewRunFindings } from "../../src/core/findings";
+import type { CurrentReviewRun, CurrentReviewRunEvidence } from "../../src/types";
+
+function currentLifecycleTask(generation: number): Task {
+  const findings = attributeFindings([{ protocolVersion: 2, ...reviewerDraftV2Schema.parse({ ...REVIEWER_PAYLOAD_EXAMPLE_V2.findings[0], file: "src/x.ts", claim: "  original\n assertion " }) }], "old-reviewer");
+  const run: CurrentReviewRun = { reviewer_protocol: CURRENT_REVIEWER_PROTOCOL, generation, packet_id: PACKET, head_sha: HEAD,
+    expected_agents: AGENTS, prior_finding_ids: findings.map(({ id }) => id), evidence: [],
+    slot_authority: [{ agent: AGENTS[0], slot_id: "slot:first", attempted: 1, request_id: "request:first:1", context_digest: "c".repeat(64) },
+      { agent: AGENTS[1], slot_id: "slot:second", attempted: 1, request_id: "request:second:1", context_digest: "d".repeat(64) }],
+    workspace_scope: ["src/x.ts"], workspace_head_sha: "e".repeat(64), wave_gate_run_id: "run.current", wave_gate_authority_digest: "f".repeat(64),
+  };
+  return { ...reviewedTask(), review_generation: generation, findings, critical_findings: claimsOfSeverity(findings, "critical"), advisory_findings: [], review_run: run };
+}
+
+function currentEvidence(task: Task, agent: string, verdict: "still_present" | "resolved_by_remediation", count: number): CurrentReviewRunEvidence {
+  const run = task.review_run;
+  if (run?.reviewer_protocol === undefined) throw new Error("current fixture required");
+  const slot = run.slot_authority.find((slot) => slot.agent === agent);
+  if (slot === undefined) throw new Error("fixture slot missing");
+  return { protocolVersion: 2, ...slot,
+    prior_assessments: run.prior_finding_ids.map((finding_id) => ({ finding_id, verdict, reason: "  exact\n assessment " })),
+    new_findings: Array.from({ length: count }, () => ({ protocolVersion: 2, severity: "advisory", file: null, line: null, claim: "  new\n assertion ", reason: " exact benefit " })),
+  };
+}
+
+describe("current stored review lifecycle properties", () => {
+  it("does not claim a failure-state mutation when an unrelated reviewer failure is ignored", () => {
+    const task = currentLifecycleTask(1);
+    const resolution = { kind: "evidence-failed", agent: "foreign-reviewer", message: "invalid evidence" } as const;
+    const applied = applyReviewResolution(task, resolution);
+    expect(applied).toBe(task);
+    expect(reviewResolutionLog(task.id, resolution, applied, false)).toContain("review evidence rejected");
+    expect(reviewResolutionLog(task.id, resolution, applied, false)).not.toContain("marking evidence_capture_failed");
+  });
+  it("waits for the whole roster, conserves exact audits, and retains descriptor after completion", () => {
+    fc.assert(fc.property(fc.integer({ min: 1, max: 10000 }), fc.integer({ min: 1, max: 8 }), (generation, count) => {
+      const task = currentLifecycleTask(generation);
+      const first = recordReviewRunEvidence(task, PACKET, generation, currentEvidence(task, AGENTS[0], "resolved_by_remediation", count));
+      if (!first.ok) throw new Error(first.error);
+      expect(first.completed).toBe(false);
+      expect(first.task.findings).toEqual(task.findings);
+      const reloaded = parseTaskGraph(JSON.parse(JSON.stringify(graph(first.task))));
+      if (!reloaded.ok) throw new Error(JSON.stringify(reloaded));
+      const staged = reloaded.value.tasks[0]!;
+      expect(staged.review_run).toEqual(first.task.review_run);
+      const retained = preserveAcceptedReviewRunFindings(staged);
+      expect(retained.findings).toHaveLength(count + 1);
+      expect(retained.resolved_findings).toEqual([]);
+      expect(retained.findings?.slice(1).every((finding) => finding.protocolVersion === 2 && finding.severity === "advisory" && finding.reason === " exact benefit ")).toBe(true);
+      const last = recordReviewRunEvidence(staged, PACKET, generation, currentEvidence(staged, AGENTS[1], "resolved_by_remediation", count));
+      if (!last.ok) throw new Error(last.error);
+      expect(last.completed).toBe(true);
+      expect(last.task.findings).toHaveLength(count * 2);
+      expect(last.task.resolved_findings?.[0]?.finding).toEqual(task.findings?.[0]);
+      expect(last.task.resolved_findings?.[0]?.resolution.assessments.map(({ reason }) => reason)).toEqual(["  exact\n assessment ", "  exact\n assessment "]);
+      expect(last.task.accepted_review_authority?.reviewer_protocol).toEqual(CURRENT_REVIEWER_PROTOCOL);
+      const completed = parseTaskGraph(JSON.parse(JSON.stringify(graph(last.task))));
+      if (!completed.ok) throw new Error(JSON.stringify(completed));
+      expect(completed.value.tasks[0]?.resolved_findings).toEqual(last.task.resolved_findings);
+      expect(recordReviewRunEvidence(last.task, PACKET, generation, currentEvidence(task, AGENTS[0], "resolved_by_remediation", count)).ok).toBe(false);
+    }), { seed: 19471, numRuns: 60 });
+  });
+  it("refuses wrong request/context/attempt and contradictory exact re-emission without mutation", () => {
+    const task = currentLifecycleTask(2);
+    const evidence = currentEvidence(task, AGENTS[0], "still_present", 0);
+    for (const changed of [{ ...evidence, request_id: "request:foreign" }, { ...evidence, context_digest: "a".repeat(64) }, { ...evidence, attempted: 2 as const }]) {
+      expect(recordReviewRunEvidence(task, PACKET, 2, changed).ok).toBe(false);
+    }
+    const original = task.findings?.[0];
+    if (original?.protocolVersion !== 2) throw new Error("current prior expected");
+    const { id: _id, agent: _agent, review_generation: _generation, review_packet_id: _packet, ...draft } = original;
+    expect(recordReviewRunEvidence(task, PACKET, 2, { ...currentEvidence(task, AGENTS[0], "resolved_by_remediation", 0), new_findings: [draft] }).ok).toBe(false);
+    expect(task.review_run?.evidence).toEqual([]);
+  });
+});
 import {
   applyFindingOutcomes,
   mergeFindings,
@@ -543,9 +620,10 @@ describe("packet-bound remediation review runs", () => {
       { agent: AGENTS[0], slot_id: "wave-slot:code-reviewer", attempted: 2 as const },
       { agent: AGENTS[1], slot_id: "wave-slot:silent-failure-hunter", attempted: 1 as const },
     ] as const;
+    if (task.review_run === undefined || task.review_run.reviewer_protocol !== undefined) throw new Error("fixture requires legacy run");
     const bound: Task = {
       ...task,
-      review_run: { ...task.review_run!, slot_authority: slots },
+      review_run: { ...task.review_run, slot_authority: slots },
     };
     const base = {
       agent: AGENTS[0],

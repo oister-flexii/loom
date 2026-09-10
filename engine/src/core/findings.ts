@@ -51,6 +51,8 @@ import {
   type Task,
 } from "../types";
 import type {
+  CurrentReviewRunEvidence,
+  LegacyDraftFinding,
   DraftFinding,
   Finding,
   FindingResolutionAssessment,
@@ -63,9 +65,12 @@ import type {
   ReviewRun,
   ReviewRunEvidence,
 } from "../types";
-import type { HeadSha, PacketId } from "./review-packet";
+import type { FindingIdentity } from "../types";
+import { parseReviewPath, type HeadSha, type PacketId } from "./review-packet";
+import { parseRequestId, parseSlotId, parseOrchestrationRunId } from "./orchestration-contract";
 import { isNoFindingSentinel } from "../utils/no-finding-sentinel";
 import { isExactGitSha } from "./git-sha";
+import { reviewerDraftV2Schema, reviewerPayloadV2Schema, parseReviewerProtocolDescriptor } from "./reviewer-contract";
 
 // The shapes live in types.ts (the schema root, with `Task`); this module owns
 // their BEHAVIOUR. Re-exported so every existing import site keeps working and
@@ -103,7 +108,8 @@ export function parseFindingId(raw: unknown): string | null {
 }
 
 /**
- * Claims reach prompt templates (the verifier brief) and JSON manifests, so a
+ * Historical v1 only; current drafts preserve their exact strings and bypass
+ * this normalization. Legacy claims reach prompt templates and JSON manifests, so a
  * claim carrying a raw line terminator would break the one-finding-per-line
  * reading the legacy `string[]` views still rely on. Collapsed rather than
  * rejected: a multi-line claim from the JSON block is still a real finding.
@@ -126,11 +132,14 @@ function collapseWhitespace(claim: string): string {
  * disagree about what counts.
  */
 export function makeDraftFinding(input: {
+  readonly protocolVersion?: never;
+  readonly basis?: never;
+  readonly reason?: never;
   readonly severity: FindingSeverity;
   readonly claim: string;
   readonly file?: unknown;
   readonly line?: unknown;
-}): DraftFinding | null {
+}): LegacyDraftFinding | null {
   const claim = collapseWhitespace(input.claim);
   if (claim === "" || isNoFindingSentinel(claim)) return null;
   return {
@@ -167,11 +176,11 @@ function parseFindingLine(raw: unknown): number | null {
 export function draftsFromClaims(
   critical: readonly string[],
   advisory: readonly string[],
-): readonly DraftFinding[] {
+): readonly LegacyDraftFinding[] {
   return [
     ...critical.map((claim) => makeDraftFinding({ severity: "critical", claim })),
     ...advisory.map((claim) => makeDraftFinding({ severity: "advisory", claim })),
-  ].filter((finding): finding is DraftFinding => finding !== null);
+  ].filter((finding): finding is LegacyDraftFinding => finding !== null);
 }
 
 /** The derived view the legacy `critical_findings` / `advisory_findings` arrays hold. */
@@ -180,6 +189,13 @@ export function claimsOfSeverity(
   severity: FindingSeverity,
 ): readonly string[] {
   return findings.filter((finding) => finding.severity === severity).map((finding) => finding.claim);
+}
+
+export function reviewFindingCounts(findings: readonly DraftFinding[]): Readonly<{ critical: number; advisory: number }> {
+  return Object.freeze({
+    critical: findings.filter(({ severity }) => severity === "critical").length,
+    advisory: findings.filter(({ severity }) => severity === "advisory").length,
+  });
 }
 
 function activeFindingAggregate(
@@ -294,17 +310,14 @@ export function attributeFindings(
   return drafts.map((draft, index) => {
     const id = parseFindingId(`${safe}-${startOrdinal + index}`);
     if (id === null) throw new Error("finding identity minting produced an invalid id");
-    return {
-      ...draft,
-      id,
-      agent,
-      ...(provenance === undefined
-        ? {}
-        : {
-            review_generation: provenance.generation,
-            review_packet_id: provenance.packetId,
-          }),
-    };
+    let preserved: DraftFinding | null = draft;
+    if (draft.protocolVersion === 2) preserved = "id" in draft ? parseStoredFinding(draft) : parseStoredDraft(draft);
+    if (preserved === null) throw new Error("finding attribution requires a valid current draft");
+    const identity: FindingIdentity = provenance === undefined
+      ? { id, agent }
+      : { id, agent, review_generation: provenance.generation, review_packet_id: provenance.packetId };
+    const finding = { ...preserved, ...identity };
+    return preserved.protocolVersion === 2 ? Object.freeze(finding) : finding;
   });
 }
 
@@ -331,7 +344,7 @@ const FINDINGS_BLOCK = /^[ \t]*```[ \t]*findings[ \t]*\r?\n([\s\S]*?)^[ \t]*```[
 export type FindingsBlockParseResult =
   | Readonly<{ kind: "absent" }>
   | Readonly<{ kind: "rejected"; reason: string }>
-  | Readonly<{ kind: "parsed"; drafts: readonly DraftFinding[] }>;
+  | Readonly<{ kind: "parsed"; drafts: readonly LegacyDraftFinding[] }>;
 
 /** Parse the LAST fenced block; agents may echo the template before their result. */
 export function parseFindingsBlockResult(output: string): FindingsBlockParseResult {
@@ -353,7 +366,7 @@ export function parseFindingsBlockResult(output: string): FindingsBlockParseResu
     return Object.freeze({ kind: "rejected", reason: "root must be an array" });
   }
 
-  const drafts: DraftFinding[] = [];
+  const drafts: LegacyDraftFinding[] = [];
   for (const [index, entry] of raw.entries()) {
     if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
       return Object.freeze({ kind: "rejected", reason: `entry ${index} must be an object` });
@@ -387,6 +400,14 @@ export function parseFindingsBlockResult(output: string): FindingsBlockParseResu
  * simultaneously unloadable and unrepairable.
  */
 function parseStoredFinding(raw: unknown): Finding | null {
+  try {
+    return readStoredFinding(raw);
+  } catch {
+    return null;
+  }
+}
+
+function readStoredFinding(raw: unknown): Finding | null {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
   const record = raw as Record<string, unknown>;
   const severity = parseFindingSeverity(record.severity);
@@ -396,12 +417,15 @@ function parseStoredFinding(raw: unknown): Finding | null {
     : null;
   if (id === null) return null;
   if (typeof record.agent !== "string" || record.agent.trim() === "") return null;
-  const draft = makeDraftFinding({
-    severity,
-    claim: record.claim,
-    file: record.file,
-    line: record.line,
-  });
+  const current = hasReservedFindingFields(record);
+  if (current && Object.keys(record).some((key) => ![
+    "protocolVersion", "severity", "file", "line", "claim", "basis", "reason",
+    "id", "agent", "review_generation", "review_packet_id",
+  ].includes(key))) return null;
+  const draftRecord = current
+    ? Object.fromEntries(Object.entries(record).filter(([key]) => !["id", "agent", "review_generation", "review_packet_id"].includes(key)))
+    : record;
+  const draft = parseStoredDraft(draftRecord);
   if (draft !== null && (
     ("file" in record && record.file !== draft.file) ||
     ("line" in record && record.line !== draft.line)
@@ -415,14 +439,13 @@ function parseStoredFinding(raw: unknown): Finding | null {
     return null;
   }
   if ((reviewGeneration === undefined) !== (packetId === undefined)) return null;
-  return draft === null ? null : {
-    ...draft,
-    id,
-    agent: record.agent.trim(),
-    ...(reviewGeneration === undefined
-      ? {}
-      : { review_generation: reviewGeneration, review_packet_id: packetId as string }),
-  };
+  if (draft === null) return null;
+  const agent = draft.protocolVersion === 2 ? record.agent : record.agent.trim();
+  const identity: FindingIdentity = reviewGeneration === undefined
+    ? { id, agent }
+    : { id, agent, review_generation: reviewGeneration, review_packet_id: packetId as string };
+  const finding = { ...draft, ...identity };
+  return draft.protocolVersion === 2 ? Object.freeze(finding) : finding;
 }
 
 function parseStoredAssessment(raw: unknown): PriorFindingAssessment | null {
@@ -464,6 +487,31 @@ function parseStoredRefutation(raw: unknown): RefutedFinding | null {
   return { finding, refutations: nonEmpty };
 }
 
+function parseResolutionAssessments(input: Readonly<{
+  finding: Finding; generation: number; packetId: string; assessments: readonly unknown[];
+}>): readonly FindingResolutionAssessment[] | null {
+  const currentAssessments = input.finding.protocolVersion === 2 ? reviewerPayloadV2Schema.safeParse({
+    schemaVersion: 2, kind: "wave-review", packetId: input.packetId, generation: input.generation,
+    findings: [], prior_findings: input.assessments.map((raw) => {
+      if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return raw;
+      const { agent: _agent, ...assessment } = raw as Record<string, unknown>;
+      return assessment;
+    }),
+  }) : null;
+  if (currentAssessments !== null && (!currentAssessments.success || currentAssessments.data.kind !== "wave-review")) return null;
+  const assessments = input.assessments.map((raw, index) => {
+    const assessment = parseStoredAssessment(raw);
+    if (assessment === null || typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+    const agent = typeof (raw as Record<string, unknown>).agent === "string"
+      ? ((raw as Record<string, unknown>).agent as string).trim()
+      : "";
+    const exact = currentAssessments?.success && currentAssessments.data.kind === "wave-review"
+      ? currentAssessments.data.prior_findings[index] : assessment;
+    return agent === "" || exact === undefined ? null : { ...exact, agent };
+  });
+  return assessments.some((assessment) => assessment === null) ? null : assessments as FindingResolutionAssessment[];
+}
+
 function parseStoredResolution(raw: unknown): ResolvedFinding | null {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
   const record = raw as Record<string, unknown>;
@@ -484,16 +532,8 @@ function parseStoredResolution(raw: unknown): ResolvedFinding | null {
   if (firstExpectedAgent === undefined) return null;
   const expectedAgents = [firstExpectedAgent, ...remainingExpectedAgents];
   if (!Array.isArray(resolution.assessments) || resolution.assessments.length === 0) return null;
-  const assessments = resolution.assessments.map((raw) => {
-    const assessment = parseStoredAssessment(raw);
-    if (assessment === null || typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
-    const agent = typeof (raw as Record<string, unknown>).agent === "string"
-      ? ((raw as Record<string, unknown>).agent as string).trim()
-      : "";
-    return agent === "" ? null : { ...assessment, agent };
-  });
-  if (assessments.some((assessment) => assessment === null)) return null;
-  const parsed = assessments as FindingResolutionAssessment[];
+  const parsed = parseResolutionAssessments({ finding, generation: resolution.generation, packetId: resolution.packet_id, assessments: resolution.assessments });
+  if (parsed === null) return null;
   if (parsed.some((assessment) => assessment.finding_id !== finding.id ||
       assessment.verdict !== "resolved_by_remediation")) return null;
   if (new Set(parsed.map((assessment) => assessment.agent)).size !== parsed.length) return null;
@@ -553,12 +593,13 @@ export function parseStoredFindings(raw: unknown): Finding[] {
  * entry with no usable severity or an empty/sentinel claim carries nothing to
  * salvage, and the caller reports those as dropped.
  */
-export function salvageMalformedFindings(raw: unknown): readonly DraftFinding[] {
+export function salvageMalformedFindings(raw: unknown): readonly LegacyDraftFinding[] {
   if (!Array.isArray(raw)) return [];
   return raw.flatMap((entry) => {
     if (parseStoredFinding(entry) !== null) return [];
     if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return [];
     const record = entry as Record<string, unknown>;
+    if (hasReservedFindingFields(record)) return [];
     const severity = parseFindingSeverity(record.severity);
     if (severity === null || typeof record.claim !== "string") return [];
     const draft = makeDraftFinding({
@@ -739,9 +780,43 @@ export function resolutionsUnionError(raw: unknown, label: string): string | nul
   return retiredFindingsUnionError(raw, label, parseStoredResolution, "resolution", "resolved");
 }
 
+function hasReservedFindingFields(record: Record<string, unknown>): boolean {
+  return "protocolVersion" in record || "basis" in record || "reason" in record;
+}
+
+/** Reserved current authority cannot be repaired by stripping it into legacy data. */
+export function currentFindingAuthorityError(task: Record<string, unknown>): string | null {
+  const rawRun = task.review_run;
+  if (typeof rawRun === "object" && rawRun !== null && !Array.isArray(rawRun)) {
+    const run = rawRun as Record<string, unknown>;
+    const evidence = Array.isArray(run.evidence) ? run.evidence : [];
+    const reserved = "reviewer_protocol" in run || evidence.some((entry) => typeof entry === "object" && entry !== null &&
+      ("protocolVersion" in entry || "request_id" in entry || "context_digest" in entry ||
+        (Array.isArray(entry.new_findings) && entry.new_findings.some((draft: unknown) => typeof draft === "object" && draft !== null && hasReservedFindingFields(draft as Record<string, unknown>)))));
+    if (reserved && reviewRunError(rawRun, task.review_generation, task.findings, "review_run") !== null) {
+      return "malformed current Review Run authority cannot be repaired or downgraded";
+    }
+  }
+  const records = [
+    ...(Array.isArray(task.findings) ? task.findings : []),
+    ...[task.refuted_findings, task.resolved_findings].flatMap((raw) =>
+      Array.isArray(raw) ? raw.map((entry) => entry?.finding) : []),
+  ];
+  return records.some((entry) => typeof entry === "object" && entry !== null &&
+    hasReservedFindingFields(entry) && parseStoredFinding(entry) === null)
+    ? "malformed current Finding authority cannot be repaired or downgraded"
+    : null;
+}
+
 function parseStoredDraft(raw: unknown): DraftFinding | null {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
   const record = raw as Record<string, unknown>;
+  if (hasReservedFindingFields(record)) {
+    if (record.protocolVersion !== 2 || !Object.hasOwn(record, "protocolVersion")) return null;
+    const { protocolVersion: _version, ...wire } = record;
+    const parsed = reviewerDraftV2Schema.safeParse(wire);
+    return parsed.success ? Object.freeze({ protocolVersion: 2, ...parsed.data }) : null;
+  }
   const severity = parseFindingSeverity(record.severity);
   if (severity === null || typeof record.claim !== "string") return null;
   const draft = makeDraftFinding({ severity, claim: record.claim, file: record.file, line: record.line });
@@ -750,6 +825,29 @@ function parseStoredDraft(raw: unknown): DraftFinding | null {
     ("line" in record && record.line !== draft.line)
   )) return null;
   return draft;
+}
+
+function parseCurrentRunEvidence(raw: Record<string, unknown> | ReviewRunEvidence, packetId: unknown, generation: unknown): CurrentReviewRunEvidence | null {
+  if (raw.protocolVersion !== 2 || Object.keys(raw).length !== 8 ||
+      !["protocolVersion", "agent", "slot_id", "attempted", "request_id", "context_digest", "prior_assessments", "new_findings"].every((key) => Object.hasOwn(raw, key)) ||
+      typeof raw.agent !== "string" || typeof raw.slot_id !== "string" || typeof raw.request_id !== "string" ||
+      typeof raw.context_digest !== "string" || (raw.attempted !== 1 && raw.attempted !== 2) || !Array.isArray(raw.new_findings)) return null;
+  const drafts = raw.new_findings.map(parseStoredDraft);
+  if (drafts.some((draft) => draft?.protocolVersion !== 2)) return null;
+  const payload = reviewerPayloadV2Schema.safeParse({ schemaVersion: 2, kind: "wave-review", packetId, generation,
+    prior_findings: raw.prior_assessments,
+    findings: drafts.map((draft) => {
+      if (draft === null) return null;
+      const { protocolVersion: _version, ...wire } = draft;
+      return wire;
+    }),
+  });
+  if (!payload.success || payload.data.kind !== "wave-review") return null;
+  return Object.freeze({ protocolVersion: 2, agent: raw.agent, slot_id: raw.slot_id, attempted: raw.attempted,
+    request_id: raw.request_id, context_digest: raw.context_digest,
+    prior_assessments: payload.data.prior_findings,
+    new_findings: Object.freeze(payload.data.findings.map((draft) => Object.freeze({ protocolVersion: 2 as const, ...draft }))),
+  });
 }
 
 /** Prove the packet-bound in-progress review run before the Task cast. */
@@ -762,6 +860,11 @@ export function reviewRunError(
   if (raw === undefined) return null;
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return `${label} must be an object`;
   const run = raw as Record<string, unknown>;
+  const current = Object.hasOwn(run, "reviewer_protocol");
+  if (current && (!parseReviewerProtocolDescriptor(run.reviewer_protocol).ok ||
+      !parseOrchestrationRunId(run.wave_gate_run_id).ok || run.workspace_scope === undefined || run.slot_authority === undefined)) {
+    return `${label} current review requires supported descriptor, workspace and slots`;
+  }
   if (typeof run.generation !== "number" || !Number.isSafeInteger(run.generation) || run.generation < 0) {
     return `${label}.generation must be a non-negative safe integer`;
   }
@@ -798,6 +901,10 @@ export function reviewRunError(
       return `${label}.workspace_scope must be a non-empty canonical path array when present`;
     }
     const scope = run.workspace_scope as string[];
+    if (current && scope.some((path) => {
+      const parsed = parseReviewPath(path, "workspace scope");
+      return !parsed.ok || parsed.value !== path;
+    })) return `${label}.workspace_scope must contain canonical review paths`;
     if (new Set(scope).size !== scope.length || scope.some((path, index) => path !== [...scope].sort()[index])) {
       return `${label}.workspace_scope must be sorted and unique`;
     }
@@ -810,6 +917,25 @@ export function reviewRunError(
       run.wave_gate_authority_digest !== undefined) {
     return `${label}.Wave Gate workspace authority requires workspace_scope`;
   }
+  if (current && run.slot_authority !== undefined) {
+    if (!Array.isArray(run.slot_authority) || run.slot_authority.length !== expectedAgents.length) {
+      return `${label}.slot_authority must cover the exact expected roster`;
+    }
+    const slotIds = new Set<string>();
+    const requestIds = new Set<string>();
+    for (const [index, rawSlot] of run.slot_authority.entries()) {
+      if (typeof rawSlot !== "object" || rawSlot === null || Array.isArray(rawSlot)) return `${label}.slot_authority is malformed`;
+      const slot = rawSlot as Record<string, unknown>;
+      const keys = ["agent", "slot_id", "attempted", "request_id", "context_digest"];
+      if (Object.keys(slot).length !== keys.length || keys.some((key) => !Object.hasOwn(slot, key)) ||
+          slot.agent !== expectedAgents[index] || typeof slot.slot_id !== "string" || slot.slot_id.trim() === "" ||
+          !parseSlotId(slot.slot_id).ok || (slot.attempted !== 1 && slot.attempted !== 2) || slotIds.has(slot.slot_id)) return `${label}.slot_authority is malformed`;
+      slotIds.add(slot.slot_id);
+      if (typeof slot.request_id !== "string" || !parseRequestId(slot.request_id).ok || requestIds.has(slot.request_id) ||
+          typeof slot.context_digest !== "string" || !/^[0-9a-f]{64}$/.test(slot.context_digest)) return `${label}.slot_authority request/context is malformed`;
+      requestIds.add(slot.request_id);
+    }
+  }
   if (!Array.isArray(run.evidence)) return `${label}.evidence must be an array`;
   const evidenceAgents: string[] = [];
   for (const [index, rawEvidence] of run.evidence.entries()) {
@@ -818,6 +944,13 @@ export function reviewRunError(
       return `${evidenceLabel} must be an object`;
     }
     const evidence = rawEvidence as Record<string, unknown>;
+    if (current && !parseCurrentRunEvidence(evidence, run.packet_id, run.generation)) {
+      return `${evidenceLabel} current evidence is malformed`;
+    }
+    if (current ? evidence.protocolVersion !== 2 :
+        ["protocolVersion", "request_id", "context_digest"].some((key) => Object.hasOwn(evidence, key))) {
+      return `${evidenceLabel} protocol must match Review Run authority`;
+    }
     if (typeof evidence.agent !== "string" || !expectedAgents.includes(evidence.agent)) {
       return `${evidenceLabel}.agent must be expected by this run`;
     }
@@ -834,7 +967,8 @@ export function reviewRunError(
         (candidate as Record<string, unknown>).agent === evidence.agent);
       if (slot === undefined) return `${evidenceLabel} has no matching engine-issued Review Run slot`;
       const authority = slot as Record<string, unknown>;
-      if (evidence.slot_id !== authority.slot_id || evidence.attempted !== authority.attempted) {
+      if (evidence.slot_id !== authority.slot_id || evidence.attempted !== authority.attempted ||
+          (current && (evidence.request_id !== authority.request_id || evidence.context_digest !== authority.context_digest))) {
         return `${evidenceLabel} must bind the exact slot_id/attempted authority for ${evidence.agent}`;
       }
     }
@@ -845,7 +979,11 @@ export function reviewRunError(
     if (ids.length !== priorIds.length || ids.some((id, at) => id !== priorIds[at])) {
       return `${evidenceLabel}.prior_assessments must cover every prior finding exactly once in order`;
     }
-    if (!Array.isArray(evidence.new_findings) || evidence.new_findings.some((draft) => parseStoredDraft(draft) === null)) {
+    if (!Array.isArray(evidence.new_findings) || evidence.new_findings.some((rawDraft) => {
+      const draft = parseStoredDraft(rawDraft);
+      return draft === null || (draft.protocolVersion === 2) !== current ||
+        (current && draft.file !== null && !(run.workspace_scope as readonly string[]).includes(draft.file));
+    })) {
       return `${evidenceLabel}.new_findings must be well-formed draft findings`;
     }
   }
@@ -1070,21 +1208,18 @@ function viewOnlyClaims(
   advisoryView: readonly string[] | undefined,
 ): { readonly critical: readonly string[]; readonly advisory: readonly string[] } {
   // Normalized before comparison, because the view is RAW disk text while every
-  // claim in `findings` went through `makeDraftFinding`. Without this a view
+  // legacy claim in `findings` went through `makeDraftFinding`. Current exact
+  // occurrences are consumed first, before normalizing the remainder. Without this a view
   // claim differing only by an internal whitespace run read as an orphan, and
   // `--fix` minted a SECOND finding for a claim that was already identified —
   // turning one critical the panel must refute into two. `collapseWhitespace` is
   // idempotent, so a view that is already normalized is unaffected.
-  return {
-    critical: removeOnce(
-      (criticalView ?? []).map(collapseWhitespace),
-      claimsOfSeverity(findings, "critical"),
-    ),
-    advisory: removeOnce(
-      (advisoryView ?? []).map(collapseWhitespace),
-      claimsOfSeverity(findings, "advisory"),
-    ),
-  };
+  const remaining = (view: readonly string[] | undefined, severity: FindingSeverity) => removeOnce(
+    removeOnce(view ?? [], claimsOfSeverity(findings.filter((finding) => finding.protocolVersion === 2), severity))
+      .map(collapseWhitespace),
+    claimsOfSeverity(findings.filter((finding) => finding.protocolVersion !== 2), severity),
+  );
+  return { critical: remaining(criticalView, "critical"), advisory: remaining(advisoryView, "advisory") };
 }
 
 /**
@@ -1255,7 +1390,8 @@ function sameFindingContent(left: DraftFinding, right: DraftFinding): boolean {
 /**
  * Attribute each expected agent's genuinely-new findings onto the active list.
  *
- * "Genuinely new" is judged against `priorFindings` — the list as it stood
+ * Current evidence retains every emitted entry, including explicit duplicates.
+ * For v1 only, "genuinely new" is judged against `priorFindings` — the list as it stood
  * BEFORE this run — not against the accumulating result, so two agents
  * reporting the same defect each get their own attributed finding rather than
  * the second silently vanishing into the first. Ordinals continue from the
@@ -1281,7 +1417,7 @@ function appendAttributedNewFindings(
       if (requireEvidence) throw new Error(`review run for task ${task.id} is missing evidence from ${agent}`);
       continue;
     }
-    const genuinelyNew = evidence.new_findings.filter((draft) =>
+    const genuinelyNew = evidence.protocolVersion === 2 ? evidence.new_findings : evidence.new_findings.filter((draft) =>
       !priorFindings.some((finding) => sameFindingContent(finding, draft))
     );
     next = [...next, ...attributeFindings(
@@ -1391,6 +1527,7 @@ function finalizeReviewRun(task: Task, run: ReviewRun): Task {
         scope: run.workspace_scope,
         run_id: run.wave_gate_run_id,
         authority_digest: run.wave_gate_authority_digest,
+        ...(run.reviewer_protocol === undefined ? {} : { reviewer_protocol: run.reviewer_protocol }),
       },
     }),
     ...activeFindingAggregate(active),
@@ -1465,7 +1602,22 @@ export function recordReviewRunEvidence(
       ),
     };
   }
-  const nextRun: ReviewRun = { ...run, evidence: [...run.evidence, evidence] };
+  let nextRun: ReviewRun;
+  if (run.reviewer_protocol !== undefined) {
+    const parsedEvidence = parseCurrentRunEvidence(evidence, run.packet_id, run.generation);
+    if (parsedEvidence === null) return { ok: false, error: "current review requires current evidence" };
+    const currentSlot = run.slot_authority.find((candidate) => candidate.agent === evidence.agent);
+    if (currentSlot === undefined || evidence.request_id !== currentSlot.request_id ||
+        evidence.context_digest !== currentSlot.context_digest) {
+      return { ok: false, error: "current evidence does not match issued request/context" };
+    }
+    nextRun = Object.freeze({ ...run, evidence: Object.freeze([...run.evidence, parsedEvidence]) });
+  } else {
+    if (evidence.protocolVersion !== undefined) return { ok: false, error: "legacy review cannot accept current evidence" };
+    nextRun = { ...run, evidence: [...run.evidence, evidence] };
+  }
+  const runError = reviewRunError(nextRun, task.review_generation, task.findings, "review_run");
+  if (runError !== null) return { ok: false, error: runError };
   const complete = nextRun.expected_agents.every((agent) =>
     nextRun.evidence.some((stored) => stored.agent === agent)
   );
@@ -1494,7 +1646,7 @@ export function recordReviewRunEvidence(
  */
 export function mergeFindings(
   task: Task,
-  findings: { readonly drafts: readonly DraftFinding[]; readonly criticalCount: number | null },
+  findings: { readonly drafts: readonly LegacyDraftFinding[]; readonly criticalCount: number | null },
   agent: string,
 ): Task {
   if (task.review_run !== undefined) {

@@ -15,6 +15,7 @@
  * suites build the same authority from one definition rather than two.
  */
 import { createHash } from "node:crypto";
+import { legacyStandaloneContext, legacyFixtureReviewerProtocols } from "./standalone-reviewer-protocol";
 import { expect } from "vitest";
 import { buildStandaloneFindingBrief, type ReviewLens, type WaveFindingId } from "../../src/core/review-panel";
 import {
@@ -92,7 +93,7 @@ const reviewerBindings = {
   },
 } as const;
 
-function rawStandaloneAuthority(role: keyof typeof reviewerBindings, slot: number, attempt: 1 | 2) {
+function rawStandaloneAuthority(role: keyof typeof reviewerBindings, slot: number, attempt: 1 | 2, scope: readonly string[]) {
   const binding = reviewerBindings[role];
   return {
     runId: "run.remediation-1",
@@ -104,15 +105,15 @@ function rawStandaloneAuthority(role: keyof typeof reviewerBindings, slot: numbe
     modelProfile: binding.profile,
     harnessBinding: { pi: binding.pi, claude: binding.claude },
     requiredSkill: null,
-    contextDigest: (slot * 10 + attempt).toString(16).padStart(64, "0"),
+    contextDigest: legacyStandaloneContext({ runId: "run.remediation-1", requestId: `request:remediation:${slot}:${attempt}`, role, attempt, requiredSkill: null }, scope).digest,
     outputSlot: `transcripts/remediation-${slot}/attempt-${attempt}.raw`,
   };
 }
 
-function rawStandaloneRoster() {
+function rawStandaloneRoster(scope: readonly string[]) {
   return (["code-reviewer", "type-design-analyzer"] as const).map((role, index) => ({
     slotId: `slot:remediation:${index + 1}`,
-    attempts: ([1, 2] as const).map((attempt) => rawStandaloneAuthority(role, index + 1, attempt)),
+    attempts: ([1, 2] as const).map((attempt) => rawStandaloneAuthority(role, index + 1, attempt, scope)),
   }));
 }
 
@@ -312,7 +313,7 @@ export function standaloneFixture(
       new_structure: false, languages: ["TypeScript"],
     },
     scopeSafety: scope.map((path) => ({ path, status: "safe" as const })),
-    roster: rawStandaloneRoster(),
+    roster: rawStandaloneRoster(scope),
   });
   if (!prepared.ok) throw new Error(prepared.error.errors.join("; "));
   const authority = prepared.value.authority;
@@ -340,7 +341,7 @@ export function standaloneFixture(
     return result.value;
   });
   const registration = createPublicationAuthorityResolver(() => ({ ok: true, value: receiptBytes }));
-  const completion = proveStandaloneRosterCompletion(authority, registration, accepted);
+  const completion = proveStandaloneRosterCompletion(authority, registration, accepted, legacyFixtureReviewerProtocols(authority, registration, action.requests));
   if (!completion.ok) throw new Error(completion.error.violations.map(({ kind }) => kind).join(","));
   const aggregate = aggregateStandaloneReview({ authority, completion: completion.value });
   if (!aggregate.ok) throw new Error(aggregate.errors.join("; "));

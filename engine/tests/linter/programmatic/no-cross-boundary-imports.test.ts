@@ -17,6 +17,25 @@ describe("no-cross-boundary-imports", () => {
     // Exact package entry/subpath rejection is exercised by machine-purity's
     // executable closure gate; this older boundary policy matches prefixes.
   });
+  it.each([
+    ["engine/src/core/reviewer-contract.ts", "zod/v4"],
+    ["engine/src/core/reviewer-protocol.ts", "jsonc-parser"],
+  ])("grants only the exact consumed entrypoint to %s", (mod, entry) => {
+    for (const file of [mod, `/checkout/${mod}`]) {
+      expect(handler(`import { value } from "${entry}";`, file)).toEqual([]);
+      for (const denied of [entry + "/other", entry + ".js", entry + "-extra", "zod", "zod/v4/core", "jsonc-parser/lib/umd/main.js", "node:fs", "node:crypto"]) {
+        expect(handler(`import { value } from "${denied}";`, file), denied).toHaveLength(1);
+      }
+    }
+    for (const sibling of ["engine/src/core/findings.ts", "engine/src/core/context-packets.ts", mod.replace(".ts", "-other.ts")]) {
+      expect(handler(`import { value } from "${entry}";`, sibling)).toHaveLength(1);
+    }
+  });
+  it("exact per-file grants cannot override explicit denials", () => {
+    expect(checkBoundaryViolation("src/domain/a.ts", "pkg", [{
+      module: "src/domain/", allow: [], deny: ["pkg"], perFileExactAllow: { "src/domain/a.ts": ["pkg"] },
+    }])).toContain("must not import");
+  });
   describe("underPrefix", () => {
     it("matches directory prefixes (trailing slash) by containment", () => {
       expect(underPrefix("engine/src/core/x.ts", "engine/src/core/")).toBe(true);

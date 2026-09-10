@@ -9,6 +9,7 @@
  * Replaces: state-file-write.sh, resolve-task-graph.sh, loom-config.sh
  */
 
+import { parseReviewerProtocolDescriptor } from "./core/reviewer-contract";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { KNOWN_AGENTS, PHASE_ORDER, REVIEW_SUB_AGENTS, pathExistsFailClosed, taskGraphPath } from "./config";
@@ -1350,7 +1351,12 @@ function taskPacketError(
     }
     const authority = t.accepted_review_authority as Record<string, unknown>;
     const fields = Object.keys(authority).sort();
-    const allowed = ["generation", "packet_id", "head_sha", "scope", "run_id", "authority_digest"];
+    const allowed = ["generation", "packet_id", "head_sha", "scope", "run_id", "authority_digest", "reviewer_protocol"];
+    if (Object.hasOwn(authority, "reviewer_protocol") &&
+        (!parseReviewerProtocolDescriptor(authority.reviewer_protocol).ok || authority.run_id === undefined ||
+          authority.authority_digest === undefined)) {
+      return `tasks[${index}] ("${id}"): current accepted_review_authority requires supported descriptor and run authority`;
+    }
     if (fields.some((field) => !allowed.includes(field)) ||
         !["generation", "packet_id", "head_sha", "scope"].every((field) => fields.includes(field))) {
       return `tasks[${index}] ("${id}"): accepted_review_authority has an invalid field set`;
@@ -1367,6 +1373,10 @@ function taskPacketError(
     const scopeError = scope.find((parsed) => !parsed.ok);
     if (scopeError !== undefined && !scopeError.ok) return scopeError.errors.join("; ");
     const scopePaths = scope.map((parsed) => parsed.ok ? parsed.value : "");
+    if (Object.hasOwn(authority, "reviewer_protocol") && (authority.generation !== t.review_generation ||
+        scopePaths.some((path, pathIndex) => path !== (authority.scope as unknown[])[pathIndex]))) {
+      return `tasks[${index}] ("${id}"): current accepted_review_authority must match exact generation and canonical scope`;
+    }
     const sortedScopePaths = [...scopePaths].sort();
     if (new Set(scopePaths).size !== scopePaths.length || scopePaths.some((path, pathIndex) => path !== sortedScopePaths[pathIndex])) {
       return `tasks[${index}] ("${id}"): accepted_review_authority.scope must be sorted and unique`;
@@ -1644,7 +1654,8 @@ function taskFindingsError(
         if (typeof rawSlot !== "object" || rawSlot === null || Array.isArray(rawSlot)) return `${label} must be an object`;
         const slot = rawSlot as Record<string, unknown>;
         const fields = Object.keys(slot).sort();
-        const expectedFields = ["agent", "attempted", "slot_id"].sort();
+        const expectedFields = (run.reviewer_protocol === undefined
+          ? ["agent", "attempted", "slot_id"] : ["agent", "attempted", "slot_id", "request_id", "context_digest"]).sort();
         if (fields.length !== expectedFields.length || fields.some((field, fieldIndex) => field !== expectedFields[fieldIndex])) {
           return `${label} must contain exactly agent/slot_id/attempted`;
         }

@@ -14,6 +14,8 @@ import { resolveAgentType } from "../../utils/agent-transcript-path";
 import { parseSessionId, readEvidence } from "../../machine";
 import { parseSubagentStopStdin } from "../../parsers/parse-subagent-stop-input";
 import { RUN_DIR_ENV, RUNS_ROOT_ENV } from "../../orchestration/harness-capture-runtime";
+import { openRunDirectory } from "../../orchestration/run-directory-handle";
+import { parseRegisteredFacadeProgram, reviewerProtocolResolver } from "../helpers/programs";
 
 import captureOrchestrationResult, { resolveClaudeRequestAuthority } from "./capture-orchestration-result";
 import cleanupSubagentFlag from "./cleanup-subagent-flag";
@@ -201,6 +203,26 @@ export const runDispatch = async (
       return errorAfterCleanup(message);
     }
     category = authorityCategory;
+    if (category === "review") {
+      const opened = openRunDirectory(process.env[RUNS_ROOT_ENV] ?? "", process.env[RUN_DIR_ENV] ?? "");
+      if (!opened.ok) return errorAfterCleanup(opened.error.message);
+      const raw = opened.value.readProgramRegistration();
+      if (!raw.ok) return errorAfterCleanup(raw.error.message);
+      const registered = parseRegisteredFacadeProgram(raw.value);
+      if (registered.kind !== "registered" || registered.program.kind !== "wave-gate") {
+        return errorAfterCleanup("registered Wave reviewer authority unavailable; legacy settlement refused");
+      }
+      const protocol = reviewerProtocolResolver(opened.value, registered.program)(requestAuthority);
+      if (!protocol.ok) return errorAfterCleanup(protocol.error.message);
+      if (protocol.value.protocolVersion === 2) {
+        // Capture is complete. Registered resume owns admission, bounded retry,
+        // and locked Task settlement; never also merge/count-poll these bytes.
+        const cleanupFailure = await runCleanup();
+        return cleanupFailure === null
+          ? { kind: "passthrough" }
+          : { kind: "error", message: cleanupFailure };
+      }
+    }
   } else {
     // A valid sidecar is engine-issued implementation routing authority. Claude
     // may omit or corrupt agent_type metadata, so routing cannot be conditional

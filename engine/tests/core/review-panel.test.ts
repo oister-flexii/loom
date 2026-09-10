@@ -34,7 +34,7 @@ import {
 } from "../../src/core/review-panel";
 import { REVIEW_LAYOUT } from "../../src/core/panel-kernel";
 
-const finding = (over: Partial<Finding> = {}): Finding => ({
+const finding = (over: Partial<Extract<Finding, { protocolVersion?: never; review_generation?: never }>> = {}): Finding => ({
   id: "code-reviewer-1",
   agent: "code-reviewer",
   severity: "critical",
@@ -59,7 +59,7 @@ const task = (over: Partial<TaskCommonMetadata> = {}): Task => taskFixture({
  *  assert the shape by hand, which is what a test fixture is for. */
 const waveId = (raw: string): WaveFindingId => raw as WaveFindingId;
 
-const brief = (over: Partial<BriefFinding> = {}): BriefFinding => ({
+const brief = (over: Partial<Extract<BriefFinding, { protocolVersion?: never }>> = {}): BriefFinding => ({
   id: waveId("T1:code-reviewer-1"),
   taskId: "T1",
   agent: "code-reviewer",

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { parseReviewerProtocolDescriptor } from "./reviewer-contract";
 import { compareStrings } from "./ordering";
 import { frozenSet } from "./frozen";
 import {
@@ -630,8 +631,11 @@ function parsedCanonicalStandaloneResult(
   const record = exactRecord(raw, [
     "schema_version", "run_id", "subject_id", "scope", "reviewer_evidence",
     "surviving_critical_findings", "advisory_findings", "refuted_critical_findings", "panel",
+    ...(typeof raw === "object" && raw !== null && "schema_version" in raw && raw.schema_version === 2 ? ["reviewer_protocol"] : []),
   ], "standaloneResult");
-  if (!record.ok || record.value.schema_version !== 1 || record.value.subject_id !== "standalone-review") {
+  if (!record.ok || (record.value.schema_version !== 1 && record.value.schema_version !== 2) ||
+      (record.value.schema_version === 2 && !parseReviewerProtocolDescriptor(record.value.reviewer_protocol).ok) ||
+      record.value.subject_id !== "standalone-review") {
     return fail(canonicalRecord({
       kind: "invalid-path-authority",
       field: "standaloneResult",

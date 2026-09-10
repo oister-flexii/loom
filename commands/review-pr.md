@@ -54,6 +54,29 @@ review/adjudication.
 Do not use this command to feed one Wave Task. `/wave-gate` owns packet-bound
 per-Task review and Wave-wide adjudication.
 
+## Reviewer wire and judgment
+
+Fresh registrations use Reviewer Protocol v2: exactly one JSON final payload,
+no Machine Summary, markers, numeric tallies, or reviewer-chosen new IDs.
+The issued Context Packet freezes `reviewer-payload-schema` and
+`reviewer-impact-rubric`; payload contents never select the decoder.
+A critical has six fields: claim plus basis evidence, violatedContract,
+consequence, truthConfidence, and severityRationale. An advisory needs a concise
+reason; its optional basis must be complete. Structure is not proof of truth,
+impact, reachability, execution, or test adequacy. A missing test or factual
+error alone does not establish a blocking consequence.
+
+Malformed current output fails evidence admission, creates no synthetic Finding,
+and uses only the existing one retry. The same Refutation Panel/strict majority
+assesses the assertion including its stated basis; a true assertion is not refuted
+merely because repair seems unimportant. A surviving critical stays blocking;
+there is no standalone severity override.
+
+Completed and unfinished issued v1 reviews retain their original protocol.
+Read the issued packet first, then the archived role and shared contract under
+`references/reviewer-protocol-v1/` when instructed; do not apply current guidance
+to those requests. See [operations](../docs/operations.md#reviewer-protocol-v2).
+
 ## 3. Start one fresh run
 
 Create a fresh direct child beneath the runs root, for example:
@@ -108,8 +131,18 @@ engine-reserved slots. Never copy Agent output into files yourself.
 
 ## 5. Report only canonical results
 
-Read the authoritative `artifacts/result.json` from the Run Directory named by
-the completion receipt. Report:
+Use the existing read-only inspection command against the completed Run:
+
+```bash
+bun "$LOOM_DIR/engine/src/cli.ts" helper orchestration inspect \
+  --runs-root "$RUNS_ROOT" --run "$RUN_DIR"
+```
+
+Inspection re-proves registered protocol/publication authority and reads canonical
+`result.json` at the Run Directory root. Its human summary derives emitted/admitted
+and after-refutation counts and Finding details from that published result;
+`--json` retains the existing inspection shape. Never author replacement tallies
+or a summary authority artifact. Report:
 
 - exact frozen scope and selected reviewer roster;
 - surviving critical Findings;

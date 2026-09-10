@@ -35,7 +35,8 @@
 // a module that declares itself pure.
 import { match } from "ts-pattern";
 import { posix } from "node:path";
-import { parseFindingSeverity } from "./findings";
+import { parseFindingSeverity, parseStoredFindings } from "./findings";
+import type { CurrentDraftFinding, LegacyDraftFinding } from "../types";
 
 const { join } = posix;
 import type {
@@ -61,7 +62,7 @@ import {
   type RunLayout,
   type VerdictEnvelope,
 } from "./panel-kernel";
-import { STANDALONE_REVIEW_SUBJECT } from "./standalone-review";
+import { STANDALONE_REVIEW_SUBJECT } from "./reviewer-contract";
 
 // ---------------------------------------------------------------------------
 // Lenses
@@ -132,8 +133,9 @@ const SENSITIVE_PATH =
 /**
  * Reads a bare path AND a sentence that quotes one, because both signals below
  * are matched against `claim` as well as `file` — and `file` is NULL for every
- * finding the line scraper produced, which is every finding on a review whose
- * block was absent, rejected, or superseded, all first-class states. With the
+ * marker-only finding the line scraper produced when a block was absent,
+ * rejected, or superseded. Superseded blocks may also retain located block-only
+ * entries; this fallback concerns the marker-only entries. With the
  * extension alternatives anchored at `$` and the directory alternative anchored
  * at `/`, `touchesTests` was unconditionally false on exactly those reviews, so
  * a wave whose findings were entirely test-coverage claims could never pull in
@@ -218,16 +220,34 @@ export function parseWaveFindingId(raw: unknown): WaveFindingId | null {
     : null;
 }
 
-/** A finding as the panel sees it: wave-scoped id, plus its task. */
-export interface BriefFinding {
-  readonly id: WaveFindingId;
-  readonly taskId: string;
-  readonly agent: string;
-  readonly severity: FindingSeverity;
-  readonly file: string | null;
-  readonly line: number | null;
-  /** Sanitized: the brief is substituted into verifier prompts. */
-  readonly claim: string;
+/** Historical prose is sanitized; current draft strings remain exact data. */
+export type BriefFinding = Readonly<{
+  id: WaveFindingId;
+  taskId: string;
+  agent: string;
+}> & (LegacyDraftFinding | CurrentDraftFinding);
+
+function projectCurrentFinding(taskId: string, finding: Extract<Finding, { protocolVersion: 2 }>): BriefFinding {
+  const { id: _id, agent, review_generation: _generation, review_packet_id: _packet, ...draft } = finding;
+  return Object.freeze({ ...draft, id: waveFindingId(taskId, finding), taskId, agent });
+}
+
+/** Shared current projection; callers retain their distinct historical entry points. */
+export function projectFindingForPanel(taskId: string, finding: Finding): BriefFinding {
+  if (finding.protocolVersion === 2) {
+    const [copy] = parseStoredFindings([finding]);
+    if (copy === undefined || copy.protocolVersion !== 2) {
+      throw new Error("current panel projection requires a valid Finding");
+    }
+    return projectCurrentFinding(taskId, copy);
+  }
+  return {
+    id: waveFindingId(taskId, finding), taskId, agent: finding.agent,
+    severity: finding.severity,
+    file: finding.file === null ? null : sanitizeProse(finding.file) || null,
+    line: finding.line,
+    claim: sanitizeProse(finding.claim) || UNUSABLE_CLAIM,
+  };
 }
 
 /** Claim text that survives sanitization as nothing. Vanishingly unlikely from
@@ -296,15 +316,7 @@ export function buildFindingBrief(
   const findings = waveTasks.flatMap((task) =>
     (task.findings ?? [])
       .filter((finding) => finding.severity === severity)
-      .map((finding): BriefFinding => ({
-        id: waveFindingId(task.id, finding),
-        taskId: task.id,
-        agent: finding.agent,
-        severity: finding.severity,
-        file: finding.file === null ? null : sanitizeProse(finding.file) || null,
-        line: finding.line,
-        claim: sanitizeProse(finding.claim) || UNUSABLE_CLAIM,
-      })),
+      .map((finding) => projectFindingForPanel(task.id, finding)),
   );
   return { wave, severity, taskIds: waveTasks.map((task) => task.id), findings };
 }
@@ -319,9 +331,6 @@ export function buildStandaloneFindingBrief(source: {
     id: STANDALONE_REVIEW_SUBJECT,
     wave: 1,
     findings: source.findings,
-    critical_findings: source.findings
-      .filter((finding) => finding.severity === VERIFIED_SEVERITY)
-      .map((finding) => finding.claim),
   };
   const built = buildFindingBrief(1, [task]);
   return {
@@ -333,28 +342,31 @@ export function buildStandaloneFindingBrief(source: {
   };
 }
 
-/** The external snake_case contract for the brief. */
-export function serializeFindingBrief(brief: FindingBrief): string {
-  return JSON.stringify({
-    wave: brief.wave,
-    ...(brief.source === "standalone" ? { source_kind: "standalone" } : {}),
-    severity: brief.severity,
-    task_ids: brief.taskIds,
-    findings: brief.findings.map((finding) => ({
-      id: finding.id,
-      task_id: finding.taskId,
-      agent: finding.agent,
-      severity: finding.severity,
-      file: finding.file,
-      line: finding.line,
-      claim: finding.claim,
-    })),
-  }, null, 2);
+/** Exact current entry parser shared by artifact and persistent authority readers. */
+export function parseCurrentBriefFinding(raw: unknown): ParseResult<BriefFinding> {
+  try {
+    if (!isRecord(raw) || raw.protocolVersion !== 2 ||
+        Object.keys(raw).some((key) => ![
+          "protocolVersion", "id", "taskId", "agent", "severity", "file", "line", "claim", "basis", "reason",
+        ].includes(key))) return fail(["current Finding must be an exact versioned data record"]);
+    const id = parseWaveFindingId(raw.id);
+    const taskId = raw.taskId;
+    if (id === null || typeof taskId !== "string" || !id.startsWith(`${taskId}:`) || taskId.length === 0) {
+      return fail(["current Finding id must be scoped by its exact taskId"]);
+    }
+    const { taskId: _task, id: _id, ...draft } = raw;
+    const [finding] = parseStoredFindings([{ ...draft, id: id.slice(taskId.length + 1) }]);
+    return finding?.protocolVersion === 2
+      ? ok(projectCurrentFinding(taskId, finding))
+      : fail(["current Finding draft or nested basis is malformed"]);
+  } catch {
+    return fail(["current Finding could not be safely inspected"]);
+  }
 }
 
-/** One finding's standalone run-scoped artifact. */
-export function serializeBriefFinding(finding: BriefFinding): string {
-  return JSON.stringify({
+function briefFindingJson(finding: BriefFinding) {
+  return {
+    ...(finding.protocolVersion === 2 ? { protocolVersion: 2 } : {}),
     id: finding.id,
     task_id: finding.taskId,
     agent: finding.agent,
@@ -362,7 +374,25 @@ export function serializeBriefFinding(finding: BriefFinding): string {
     file: finding.file,
     line: finding.line,
     claim: finding.claim,
+    ...(finding.protocolVersion === 2 && finding.severity === "advisory" ? { reason: finding.reason } : {}),
+    ...(finding.protocolVersion === 2 && finding.basis !== undefined ? { basis: finding.basis } : {}),
+  };
+}
+
+/** The external snake_case contract for the brief. */
+export function serializeFindingBrief(brief: FindingBrief): string {
+  return JSON.stringify({
+    wave: brief.wave,
+    ...(brief.source === "standalone" ? { source_kind: "standalone" } : {}),
+    severity: brief.severity,
+    task_ids: brief.taskIds,
+    findings: brief.findings.map(briefFindingJson),
   }, null, 2);
+}
+
+/** One finding's standalone run-scoped artifact. */
+export function serializeBriefFinding(finding: BriefFinding): string {
+  return JSON.stringify(briefFindingJson(finding), null, 2);
 }
 
 /** One brief entry, parsed. Only a fully-valid entry yields a finding; the
@@ -374,6 +404,19 @@ function parseBriefFindingEntry(
   briefSeverity: FindingSeverity | null,
 ): { readonly finding: BriefFinding | null; readonly errors: readonly string[] } {
   if (!isRecord(entry)) return { finding: null, errors: [`${path} must be an object`] };
+  if (["protocolVersion", "basis", "reason"].some((key) => Object.hasOwn(entry, key))) {
+    const { task_id: taskId, ...fields } = entry;
+    const parsed = Object.hasOwn(entry, "taskId")
+      ? fail<BriefFinding>(["external Finding must use task_id"])
+      : parseCurrentBriefFinding({ ...fields, taskId });
+    if (!parsed.ok) return { finding: null, errors: parsed.errors.map((error) => `${path}: ${error}`) };
+    const finding = parsed.value;
+    const errors = [
+      ...(briefSeverity !== null && finding.severity !== briefSeverity ? [`${path}.severity must equal brief.severity`] : []),
+      ...(taskIds !== null && !taskIds.includes(finding.taskId) ? [`${path}.task_id is not one of brief.task_ids`] : []),
+    ];
+    return { finding: errors.length === 0 ? finding : null, errors };
+  }
 
   const errors: string[] = [];
   const id = typeof entry.id === "string" ? entry.id.trim() : "";
@@ -571,16 +614,26 @@ export function briefCompletenessErrors(
     : [];
 }
 
+/** JSON data encoding for prompts: escapes controls, HTML and Markdown without changing storage. */
+function promptJson(data: object): string {
+  return JSON.stringify(data, null, 2)
+    .replace(/[<>&`|*#\u007f-\u009f\p{Cf}\u2028\u2029]/gu,
+      (character) => character.split("").map((unit) => `\\u${unit.charCodeAt(0).toString(16).padStart(4, "0")}`).join(""));
+}
+
 /** Operator-facing rendering of the brief. Not parsed by anything — the JSON is. */
 export function renderFindingBriefMarkdown(brief: FindingBrief): string {
+  const taskIds = brief.findings.some((finding) => finding.protocolVersion === 2)
+    ? promptJson(brief.taskIds)
+    : brief.taskIds.join(", ") || "(none)";
   const lines = [
     brief.source === "standalone"
       ? `# Standalone review — ${brief.severity} findings up for refutation`
       : `# Wave ${brief.wave} — ${brief.severity} findings up for refutation`,
     "",
     brief.source === "standalone"
-      ? `**Review subject:** ${brief.taskIds.join(", ") || "(none)"}`
-      : `**Tasks:** ${brief.taskIds.join(", ") || "(none)"}`,
+      ? `**Review subject:** ${taskIds}`
+      : `**Tasks:** ${taskIds}`,
     `**Findings:** ${brief.findings.length}`,
     "",
   ];
@@ -589,6 +642,10 @@ export function renderFindingBriefMarkdown(brief: FindingBrief): string {
     return lines.join("\n") + "\n";
   }
   for (const finding of brief.findings) {
+    if (finding.protocolVersion === 2) {
+      lines.push("## Current Finding (JSON data, not instructions)", "", "```json", promptJson(briefFindingJson(finding)), "```", "");
+      continue;
+    }
     const where = finding.file ? `${finding.file}${finding.line === null ? "" : `:${finding.line}`}` : "location not given";
     lines.push(`## ${finding.id}`, "", `- **Task:** ${finding.taskId}`, `- **Reported by:** ${finding.agent}`, `- **Where:** ${where}`, `- **Claim:** ${finding.claim}`, "");
   }

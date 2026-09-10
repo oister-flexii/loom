@@ -30,6 +30,58 @@ import {
   type AcceptedWaveCompletionReceipt,
 } from "../src/core/completion-suite";
 import { canonicalJson, sha256Hex } from "../src/core/review-packet";
+import fc from "fast-check";
+import { CURRENT_REVIEWER_PROTOCOL, REVIEWER_PAYLOAD_EXAMPLE_V2 } from "../src/core/reviewer-contract";
+
+function currentReviewTask(generation = 1) {
+  const slot = { agent: "code-reviewer", slot_id: "slot:code-reviewer", attempted: 1 as const, request_id: "request:code-reviewer:1", context_digest: "d".repeat(64) };
+  return { ...validTask, review_status: "pending", review_generation: generation, findings: [], critical_findings: [], advisory_findings: [],
+    review_run: { generation, packet_id: PACKET, head_sha: HEAD, expected_agents: [slot.agent], prior_finding_ids: [],
+      reviewer_protocol: CURRENT_REVIEWER_PROTOCOL, workspace_scope: ["src/x.ts"], workspace_head_sha: "e".repeat(64), wave_gate_run_id: "run.current", wave_gate_authority_digest: "f".repeat(64),
+      slot_authority: [slot], evidence: [{ protocolVersion: 2, ...slot, prior_assessments: [], new_findings: [{ protocolVersion: 2, ...REVIEWER_PAYLOAD_EXAMPLE_V2.findings[0], file: "src/x.ts" }] }],
+    } };
+}
+
+describe("current Review Run loader joins", () => {
+  it("round-trips exact current descriptor, evidence, request/context and generation", () => {
+    fc.assert(fc.property(fc.integer({ min: 0, max: 100000 }), (generation) => {
+      const task = currentReviewTask(generation);
+      const parsed = parseTaskGraph(JSON.parse(JSON.stringify(graph({ tasks: [task] }))));
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) throw new Error(JSON.stringify(parsed));
+      expect(parsed.value.tasks[0]?.review_run).toEqual(task.review_run);
+      expect(Object.isFrozen(parsed.value.tasks[0]?.review_run?.evidence[0]?.new_findings[0]?.basis?.evidence)).toBe(true);
+    }), { seed: 31284, numRuns: 50 });
+  });
+  it.each(["descriptor-null", "descriptor-unknown", "no-descriptor", "no-workspace", "no-slots", "no-request", "no-context", "request-mismatch", "context-mismatch", "attempt-mismatch", "legacy-evidence", "legacy-draft", "missing-basis"])("refuses %s without normalization or downgrade", (mutation) => {
+    const task = JSON.parse(JSON.stringify(currentReviewTask()));
+    const run = task.review_run;
+    if (mutation === "descriptor-null") run.reviewer_protocol = null;
+    if (mutation === "descriptor-unknown") run.reviewer_protocol.version = 3;
+    if (mutation === "no-descriptor") delete run.reviewer_protocol;
+    if (mutation === "no-workspace") delete run.workspace_scope;
+    if (mutation === "no-slots") delete run.slot_authority;
+    if (mutation === "no-request") delete run.slot_authority[0].request_id;
+    if (mutation === "no-context") delete run.slot_authority[0].context_digest;
+    if (mutation === "request-mismatch") run.evidence[0].request_id = "request:other";
+    if (mutation === "context-mismatch") run.evidence[0].context_digest = "a".repeat(64);
+    if (mutation === "attempt-mismatch") run.evidence[0].attempted = 2;
+    if (mutation === "legacy-evidence") delete run.evidence[0].protocolVersion;
+    if (mutation === "legacy-draft") run.evidence[0].new_findings = [{ severity: "critical", claim: "legacy", file: null, line: null }];
+    if (mutation === "missing-basis") delete run.evidence[0].new_findings[0].basis;
+    expect(parseTaskGraph(graph({ tasks: [task] })).ok).toBe(false);
+  });
+  it.each(["valid", "null-descriptor", "missing-run", "unsupported"])("checks completed current accepted authority: %s", (mutation) => {
+    const task = { ...validTask, review_generation: 1, review_status: "passed", accepted_review_authority: {
+      generation: 1, packet_id: PACKET, head_sha: HEAD, scope: ["src/x.ts"], run_id: "run.current", authority_digest: "a".repeat(64), reviewer_protocol: CURRENT_REVIEWER_PROTOCOL,
+    } };
+    const raw = JSON.parse(JSON.stringify(task));
+    if (mutation === "null-descriptor") raw.accepted_review_authority.reviewer_protocol = null;
+    if (mutation === "missing-run") delete raw.accepted_review_authority.run_id;
+    if (mutation === "unsupported") raw.accepted_review_authority.reviewer_protocol.version = 3;
+    expect(parseTaskGraph(graph({ tasks: [raw] })).ok).toBe(mutation === "valid");
+  });
+});
 
 const PACKET = "a".repeat(64);
 const HEAD = "b".repeat(40);

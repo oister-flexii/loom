@@ -11,7 +11,79 @@
 import { describe, expect, it } from "vitest";
 import { findingIdCollisionError, startReviewRun, type Finding } from "../../src/core/findings";
 import type { HeadSha, PacketId } from "../../src/core/review-packet";
-import type { Task } from "../../src/types";
+import type { CurrentDraftFinding, Task } from "../../src/types";
+import fc from "fast-check";
+import { REVIEWER_PAYLOAD_EXAMPLE_V2, reviewerDraftV2Schema } from "../../src/core/reviewer-contract";
+import { attributeFindings, parseStoredFindings, parseStoredRefutations, parseStoredResolutions, currentFindingAuthorityError, salvageMalformedFindings, recoverViewOnlyClaims, claimsOfSeverity, applyFindingOutcomes } from "../../src/core/findings";
+import { fixFull } from "../../src/handlers/helpers/validate-task-graph";
+import { updateTaskFindings } from "../../src/handlers/helpers/store-review-findings";
+
+function currentDraft(claim = "  preserved\n  claim "): CurrentDraftFinding {
+  return { protocolVersion: 2, ...reviewerDraftV2Schema.parse({ ...REVIEWER_PAYLOAD_EXAMPLE_V2.findings[0], file: "src/x.ts", claim }) };
+}
+
+describe("current Finding stored authority", () => {
+  it.each([
+    ["missing discriminator", (raw: Record<string, unknown>) => { delete raw.protocolVersion; }],
+    ["unsupported discriminator", (raw: Record<string, unknown>) => { raw.protocolVersion = 3; }],
+    ["null discriminator", (raw: Record<string, unknown>) => { raw.protocolVersion = null; }],
+    ["missing basis", (raw: Record<string, unknown>) => { delete raw.basis; }],
+    ["unknown basis field", (raw: Record<string, unknown>) => { raw.basis = { ...(raw.basis as object), unknown: true }; }],
+    ["unknown evidence field", (raw: Record<string, unknown>) => { const basis = raw.basis as Record<string, unknown>; basis.evidence = { ...(basis.evidence as object), unknown: true }; }],
+    ["advisory reason without discriminator", (raw: Record<string, unknown>) => { delete raw.protocolVersion; delete raw.basis; raw.severity = "advisory"; raw.reason = "useful"; }],
+  ] as const)("refuses %s in active, refuted and resolved records before repair", (_name, mutate) => {
+    const raw: Record<string, unknown> = JSON.parse(JSON.stringify(attributeFindings([currentDraft()], "code-reviewer")[0]));
+    mutate(raw);
+    for (const field of ["findings", "refuted_findings", "resolved_findings"]) {
+      const task = { ...readyTask(), [field]: field === "findings" ? [raw] : [{ finding: raw }] };
+      expect(currentFindingAuthorityError(task)).not.toBeNull();
+      expect(JSON.parse(fixFull({ tasks: [task] }).json).tasks[0]).toEqual(task);
+    }
+    expect(parseStoredFindings([raw])).toEqual([]);
+    expect(salvageMalformedFindings([raw])).toEqual([]);
+  });
+
+  it("keeps unrelated historical unknown-field salvage unchanged", () => {
+    const old = { severity: "critical", claim: "  old\n claim  ", file: null, line: null, arbitraryOldKey: 1 };
+    expect(salvageMalformedFindings([old])).toEqual([{ severity: "critical", claim: "old claim", file: null, line: null }]);
+  });
+
+  it("conserves exact multiplicity, basis and identities through repair/refutation/resolution", () => {
+    fc.assert(fc.property(fc.integer({ min: 1, max: 12 }), fc.integer({ min: 0, max: 100 }), (count, confidence) => {
+      const source = currentDraft();
+      if (source.severity !== "critical") throw new Error("critical fixture expected");
+      const draft = { ...source, basis: { ...source.basis, truthConfidence: confidence } };
+      const findings = attributeFindings(Array.from({ length: count }, () => draft), "code-reviewer");
+      const task: Task = { ...readyTask(), review_status: "blocked", findings, critical_findings: claimsOfSeverity(findings, "critical") };
+      const fixed = JSON.parse(fixFull({ tasks: [task] }).json).tasks[0];
+      expect(fixed.findings).toEqual(findings);
+      expect(fixed.critical_findings).toEqual(task.critical_findings);
+      const override = updateTaskFindings(task, [], [], false);
+      expect(override.findings).toEqual([]);
+      expect(parseStoredRefutations(override.refuted_findings).map(({ finding }) => finding)).toEqual(findings);
+      expect(recoverViewOnlyClaims(findings, [], { critical: task.critical_findings, advisory: [] })).toEqual([]);
+      const retired = applyFindingOutcomes(task, findings.map(({ id }) => ({ finding: { id, taskId: task.id }, survives: false as const, refutations: [{ lens: "intent", reason: "contract permits it" }] as const })));
+      expect(parseStoredRefutations(JSON.parse(JSON.stringify(retired.refuted_findings))).map(({ finding }) => finding)).toEqual(findings);
+      const resolved = findings.map((finding) => ({ finding, resolution: { kind: "resolved_by_remediation", generation: 2, packet_id: PACKET, head_sha: HEAD,
+        expected_agents: ["code-reviewer"], assessments: [{ agent: "code-reviewer", finding_id: finding.id, verdict: "resolved_by_remediation", reason: "verified" }] } }));
+      expect(parseStoredResolutions(JSON.parse(JSON.stringify(resolved))).map(({ finding }) => finding)).toEqual(findings);
+      expect(Object.isFrozen(parseStoredFindings(findings)[0]?.basis?.consequence)).toBe(true);
+    }), { seed: 99184, numRuns: 80 });
+  });
+
+  it("repairs duplicate current identities without losing generation, basis or exact claims", () => {
+    const [finding] = attributeFindings([currentDraft()], "code-reviewer", 1, { generation: 1, packetId: PACKET });
+    if (finding === undefined) throw new Error("finding fixture missing");
+    const task = { ...readyTask(), findings: [finding, finding], critical_findings: [finding.claim, finding.claim] };
+    const repaired = JSON.parse(fixFull({ tasks: [task] }).json).tasks[0];
+    expect(repaired.findings).toEqual([finding, { ...finding, id: "code-reviewer-2" }]);
+  });
+
+  it("consumes current exact occurrences before normalized legacy multiset recovery", () => {
+    const findings = attributeFindings([currentDraft(" a  b "), { severity: "critical", file: null, line: null, claim: "a b" }], "reviewer");
+    expect(recoverViewOnlyClaims(findings, [], { critical: [" a  b ", "a b", "a   b"], advisory: [] }).map(({ claim }) => claim)).toEqual(["a b"]);
+  });
+});
 
 // Branded as the smart constructors would mint them. The malformed cases below
 // cast deliberately: they exercise startReviewRun's fail-closed checks against a

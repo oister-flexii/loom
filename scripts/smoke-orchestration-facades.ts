@@ -5,9 +5,14 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { evaluateTaskProof } from "../engine/src/core/proof-obligations";
+import { parseContextPacket } from "../engine/src/core/context-packets";
+import { readWaveReviewContext } from "../engine/src/core/wave-review-authority";
+import type { ReviewerDraftV2 } from "../engine/src/core/reviewer-contract";
+import { captureLoomRuntimeIdentity, PI_EXTENSION_RUNTIME_ROOT_ENV, PI_EXTENSION_RUNTIME_REVISION_ENV } from "../engine/src/runtime-compatibility";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const CLI = join(ROOT, "engine", "src", "cli.ts");
+const runtimeIdentity = captureLoomRuntimeIdentity(ROOT);
 const PASSING_SPEC_CHECK_FOOTER = [
   "SPEC_CHECK_WAVE: 1",
   "SPEC_CHECK_CRITICAL_COUNT: 0",
@@ -15,6 +20,8 @@ const PASSING_SPEC_CHECK_FOOTER = [
   "SPEC_CHECK_VERDICT: PASSED",
 ].join("\n");
 const temporaryRoots: string[] = [];
+const transportRoot = realpathSync.native(mkdtempSync(join(tmpdir(), "loom-facade-smoke-transport-")));
+temporaryRoots.push(transportRoot);
 
 process.on("exit", () => {
   for (const path of temporaryRoots) rmSync(path, { recursive: true, force: true });
@@ -65,7 +72,15 @@ function invokeOrchestrationCli(cwd: string, args: readonly string[], stdin: str
     input: stdin,
     encoding: "utf8",
     maxBuffer: 16 * 1024 * 1024,
-    env: { ...process.env, LOOM_STATE_PATH: join(cwd, ".claude", "state", "active_task_graph.json") },
+    env: {
+      ...process.env,
+      PI_CODING_AGENT: "true",
+      PI_SESSION_ID: "facade-smoke-fixture",
+      LOOM_SUBAGENT_DIR: transportRoot,
+      [PI_EXTENSION_RUNTIME_ROOT_ENV]: runtimeIdentity.packageRoot,
+      [PI_EXTENSION_RUNTIME_REVISION_ENV]: runtimeIdentity.revision,
+      LOOM_STATE_PATH: join(cwd, ".claude", "state", "active_task_graph.json"),
+    },
   }) as CliResult;
 }
 
@@ -167,29 +182,65 @@ function submit(cwd: string, runsRoot: string, runDir: string, request: SpawnReq
   ], output);
 }
 
+function scriptedFindings(severity: "clean" | "critical" | "advisory", path: string): readonly ReviewerDraftV2[] {
+  if (severity === "clean") return [];
+  if (severity === "advisory") return [{
+    severity, file: path, line: 1, claim: "prefer a narrower public name",
+    reason: "A narrower name would clarify the fixture's public surface; this is nonblocking.",
+  }];
+  return [{
+    severity, file: path, line: 1, claim: "the guarded failure remains reachable",
+    basis: {
+      evidence: {
+        kind: "execution-trace",
+        preconditions: ["Scripted smoke assertion, not a discovered product defect."],
+        steps: ["Assume the fixture caller reaches the guarded branch.", "Predict that the branch returns the rejected value."],
+        observed: "Predicted guarded failure; no reproduction was executed.",
+        expected: "The supported caller receives the accepted value.",
+        reference: "scripts/smoke-orchestration-facades.ts",
+      },
+      violatedContract: { reference: "scripted smoke contract", statement: "The guarded branch must reject the invalid value." },
+      consequence: {
+        affected: "Scripted supported caller", preconditions: "The assumed branch is reachable.",
+        impact: "The caller receives an invalid value, blocking this hypothetical delivery.",
+        evidenceLimits: "Scripted lifecycle data only; neither reachability nor impact was observed or proved.",
+      },
+      truthConfidence: 80,
+      severityRationale: "The assumed supported-behavior failure would block delivery; confidence is not an impact score.",
+    },
+  }];
+}
+
 function reviewerOutput(
+  runDir: string,
+  request: SpawnRequest,
   severity: "clean" | "critical" | "advisory",
   path: string,
-  binding: Readonly<{ packetId: string; generation: number }> | null = null,
 ): string {
-  const findings = severity === "clean" ? [] : [{
-    severity,
-    file: path,
-    line: 1,
-    claim: severity === "critical" ? "the guarded failure remains reachable" : "prefer a narrower public name",
-  }];
-  return [
-    "### Machine Summary",
-    ...(binding === null ? [] : [`REVIEW_GENERATION: ${binding.generation}`, `REVIEW_PACKET_ID: ${binding.packetId}`]),
-    `CRITICAL_COUNT: ${severity === "critical" ? 1 : 0}`,
-    `ADVISORY_COUNT: ${severity === "advisory" ? 1 : 0}`,
-    ...(severity === "critical" ? ["CRITICAL: the guarded failure remains reachable"] : []),
-    ...(severity === "advisory" ? ["ADVISORY: prefer a narrower public name"] : []),
-    "```findings",
-    JSON.stringify(findings),
-    "```",
-    ...(binding === null ? [] : ["```review_lifecycle", JSON.stringify({ prior_findings: [] }), "```"]),
-  ].join("\n");
+  const parsed = parseContextPacket(JSON.parse(readFileSync(
+    join(runDir, "contexts", `${request.authority.contextDigest}.json`), "utf8")));
+  check(parsed.ok, "reviewer Context Packet failed parsing");
+  const packet = parsed.value;
+  check(packet.schemaVersion === 2 && packet.digest === request.authority.contextDigest &&
+    packet.requestId === request.authority.requestId && packet.role === request.authority.role,
+  "fresh reviewer issuance must carry its matching current wire");
+  const findings = scriptedFindings(severity, path);
+  const wave = readWaveReviewContext([packet], packet.digest);
+  check(wave.kind !== "corrupt", "published Wave reviewer authority is corrupt");
+  if (wave.kind === "absent") {
+    check(packet.fixedContext.some(({ label }) => label === "standalone-review-authority"),
+      "reviewer packet lacks standalone authority");
+    return JSON.stringify({ schemaVersion: 2, kind: "standalone-review", findings });
+  }
+  check(wave.value.taskRun !== null && wave.value.task !== null, "reviewer packet cannot use spec-check authority");
+  return JSON.stringify({
+    schemaVersion: 2, kind: "wave-review", packetId: wave.value.taskRun.packetId,
+    generation: wave.value.taskRun.generation,
+    prior_findings: wave.value.task.priorFindings.map(({ id: finding_id }) => ({
+      finding_id, verdict: "still_present", reason: "Scripted smoke does not claim prior remediation.",
+    })),
+    findings,
+  });
 }
 
 function refutationOutput(runDir: string, request: SpawnRequest): string {
@@ -238,7 +289,7 @@ function standaloneAndRemediationSmoke(): void {
 
   let next: unknown = initial;
   for (const request of initial.requests) {
-    next = submit(cwd, runsRoot, reviewRun, request, reviewerOutput("critical", changedPath));
+    next = submit(cwd, runsRoot, reviewRun, request, reviewerOutput(reviewRun, request, "critical", changedPath));
   }
   const panel = asSpawnBatch(next, "automatic standalone refutation");
   check(panel.requests.every(({ authority }) => authority.role === "review-verifier-agent"), "standalone criticals did not route to verifier agents");
@@ -291,7 +342,7 @@ function standaloneReviewerRetrySmoke(): void {
   // the run at aggregation with no recovery path.
   const first = initial.requests[0]!;
   const retryBatch = asSpawnBatch(
-    submit(cwd, runsRoot, reviewRun, first, reviewerOutput("advisory", "src/outside.ts")),
+    submit(cwd, runsRoot, reviewRun, first, reviewerOutput(reviewRun, first, "advisory", "src/outside.ts")),
     "standalone retry batch after out-of-scope finding",
   );
   const retry = retryBatch.requests.find(({ authority }) => authority.slotId === first.authority.slotId);
@@ -299,7 +350,7 @@ function standaloneReviewerRetrySmoke(): void {
   check(retry.authority.attempt === 2, "rejected reviewer slot did not advance to attempt 2");
   check(retry.task.includes("rejected by the engine's admission check"),
     "retry task lacks the rejection diagnostic");
-  check(retry.task.includes("outside the frozen review scope") || retry.task.includes("src/outside.ts"),
+  check(retry.task.includes("finding location is outside the frozen scope"),
     "retry task must quote the engine's own diagnostic, not a generic reminder");
 
   // Regression: the diagnostic used to live only in the pass-local rejected set,
@@ -321,7 +372,7 @@ function standaloneReviewerRetrySmoke(): void {
   // with clean, in-scope reviewer output and require the run to reach done.
   let next: unknown = retryBatch;
   for (const request of retryBatch.requests) {
-    next = submit(cwd, runsRoot, reviewRun, request, reviewerOutput("clean", changedPath));
+    next = submit(cwd, runsRoot, reviewRun, request, reviewerOutput(reviewRun, request, "clean", changedPath));
   }
   asDone(next, "standalone retry adjudication");
   asDone(run(cwd, ["resume", "--runs-root", runsRoot, "--run", reviewRun]), "standalone retry terminal replay");
@@ -350,7 +401,7 @@ function standaloneRetryTerminalBlockSmoke(): void {
 
   const first = initial.requests[0]!;
   const retryBatch = asSpawnBatch(
-    submit(cwd, runsRoot, reviewRun, first, reviewerOutput("advisory", "src/outside.ts")),
+    submit(cwd, runsRoot, reviewRun, first, reviewerOutput(reviewRun, first, "advisory", "src/outside.ts")),
     "retry-block attempt-1 rejection",
   );
   const retry = retryBatch.requests.find(({ authority }) => authority.slotId === first.authority.slotId);
@@ -359,7 +410,7 @@ function standaloneRetryTerminalBlockSmoke(): void {
   // The retry repeats the same scope violation: the second and final attempt
   // must terminal-block the run.
   const blocked = record(
-    submit(cwd, runsRoot, reviewRun, retry!, reviewerOutput("advisory", "src/outside.ts")),
+    submit(cwd, runsRoot, reviewRun, retry!, reviewerOutput(reviewRun, retry!, "advisory", "src/outside.ts")),
     "retry-block final outcome",
   );
   check(blocked.kind === "blocked", `retry-block must block, got ${blocked.kind}`);
@@ -473,16 +524,12 @@ function waveGateCriticalRefutationSmoke(): void {
   const reviewRun = record(record(registeredState.tasks[0], "critical Wave task").review_run, "critical Wave review run");
   check(typeof reviewRun.packet_id === "string" && typeof reviewRun.generation === "number",
     "critical Wave review binding is incomplete");
-  const reviewBinding = { packetId: reviewRun.packet_id, generation: reviewRun.generation } as {
-    packetId: string;
-    generation: number;
-  };
 
   let next: unknown = initial;
   for (const request of initial.requests) {
     const output = request.authority.role === "spec-check-invoker"
       ? PASSING_SPEC_CHECK_FOOTER
-      : reviewerOutput("critical", "src/x.ts", reviewBinding);
+      : reviewerOutput(runDir, request, "critical", "src/x.ts");
     next = submit(cwd, runsRoot, runDir, request, output);
   }
 
@@ -514,13 +561,12 @@ function waveGateSmoke(): void {
   const reviewRun = record(registeredTask.review_run, "registered Wave review run");
   check(typeof reviewRun.packet_id === "string", "registered Wave packet id is missing");
   check(typeof reviewRun.generation === "number", "registered Wave generation is missing");
-  const reviewBinding = { packetId: reviewRun.packet_id, generation: reviewRun.generation };
 
   let next: unknown = initial;
   for (const request of initial.requests) {
     const output = request.authority.role === "spec-check-invoker"
       ? PASSING_SPEC_CHECK_FOOTER
-      : reviewerOutput("advisory", "src/x.ts", reviewBinding);
+      : reviewerOutput(runDir, request, "advisory", "src/x.ts");
     next = submit(cwd, runsRoot, runDir, request, output);
   }
 

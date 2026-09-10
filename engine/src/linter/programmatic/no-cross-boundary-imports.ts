@@ -38,6 +38,8 @@ export interface BoundaryRule {
    * fails the lint gate until it earns an entry.
    */
   readonly perFileAllow?: Readonly<Record<string, readonly string[]>>;
+  /** Audited package entrypoints: exact specifier equality, never a prefix grant. */
+  readonly perFileExactAllow?: Readonly<Record<string, readonly string[]>>;
 }
 
 /**
@@ -107,6 +109,10 @@ export const DEFAULT_BOUNDARIES: readonly BoundaryRule[] = [
     // fail-closed on ADDING capability, so nothing catches a grant going unused.
     // `identity.ts` sat here for `node:crypto`/`node:path` after it had lost
     // every import statement; it is now off the list.
+    perFileExactAllow: {
+      "engine/src/core/reviewer-contract.ts": ["zod/v4"],
+      "engine/src/core/reviewer-protocol.ts": ["jsonc-parser"],
+    },
     perFileAllow: {
       "engine/src/core/harness-capture.ts": ["node:crypto"],
       "engine/src/core/harness-resources.ts": ["node:crypto", "node:path"],
@@ -346,6 +352,7 @@ export function checkBoundaryViolation(
   // Additive per-file capability allowlist, checked before the directory allow.
   // This is how `node:` hardware is granted to named core modules without
   // removing their ordinary directory-level imports.
+  if (boundary.perFileExactAllow?.[normalizedFile]?.includes(resolvedImport)) return null;
   const perFile = boundary.perFileAllow?.[normalizedFile];
   if (perFile !== undefined) {
     if (perFile.some((allowed) => underPrefix(resolvedImport, allowed))) {

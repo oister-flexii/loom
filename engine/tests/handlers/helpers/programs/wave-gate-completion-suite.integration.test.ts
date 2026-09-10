@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -12,6 +12,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { canonicalTempDir } from "../../../fixtures/canonical-temp-dir";
 import { afterEach, describe, expect, it } from "vitest";
+import { captureLoomRuntimeIdentity, PI_EXTENSION_RUNTIME_ROOT_ENV, PI_EXTENSION_RUNTIME_REVISION_ENV } from "../../../../src/runtime-compatibility";
 import { evaluateTaskProof } from "../../../../src/core/proof-obligations";
 import { defaultVerificationManifest, freezeVerificationManifest, type FrozenVerificationManifest } from "../../../../src/core/verification-manifest";
 import { parseNewTestEvidence, type TaskGraph } from "../../../../src/types";
@@ -19,6 +20,15 @@ import { parseNewTestEvidence, type TaskGraph } from "../../../../src/types";
 const ENGINE = fileURLToPath(new URL("../../../../", import.meta.url));
 const CLI = join(ENGINE, "src/cli.ts");
 const roots: string[] = [];
+const sessionDirectories = new Map<string, string>();
+function sessionDirectory(root: string): string {
+  const existing = sessionDirectories.get(root);
+  if (existing !== undefined) return existing;
+  const directory = canonicalTempDir("loom-completion-session-");
+  roots.push(directory);
+  sessionDirectories.set(root, directory);
+  return directory;
+}
 
 function git(root: string, ...args: string[]): void {
   const result = spawnSync("git", ["-C", root, ...args], { encoding: "utf8" });
@@ -134,53 +144,59 @@ if (outcome === "nonzero") process.exit(7);
   return root;
 }
 
-function invokeCli(
+async function invokeCli(
   root: string,
   args: readonly string[],
   stdin = "",
   cwd = root,
   statePath = join(root, ".claude/state/active_task_graph.json"),
 ) {
+  const runtime = captureLoomRuntimeIdentity(fileURLToPath(new URL("../../../../../", import.meta.url)));
   const env: NodeJS.ProcessEnv = {
-    ...process.env,
+    ...process.env, PI_CODING_AGENT: "true", PI_SESSION_ID: "fixture-wave-completion",
+    LOOM_SUBAGENT_DIR: sessionDirectory(root),
+    [PI_EXTENSION_RUNTIME_ROOT_ENV]: runtime.packageRoot,
+    [PI_EXTENSION_RUNTIME_REVISION_ENV]: runtime.revision,
     LOOM_STATE_PATH: statePath,
   };
-  delete env.PI_CODING_AGENT;
-  delete env.PI_CODING_AGENT_DIR;
-  const result = spawnSync("bun", [CLI, "helper", "orchestration", ...args], {
-    cwd,
-    env,
-    input: stdin,
-    encoding: "utf8",
+  const result = await new Promise<Readonly<{ status: number | null; stdout: string; stderr: string }>>((resolve, reject) => {
+    const child = spawn("bun", [CLI, "helper", "orchestration", ...args], { cwd, env });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (text: string) => { stdout += text; });
+    child.stderr.setEncoding("utf8").on("data", (text: string) => { stderr += text; });
+    child.on("error", reject);
+    child.on("close", (status) => resolve({ status, stdout, stderr }));
+    child.stdin.end(stdin);
   });
   if (result.status !== 0) throw new Error(`${result.stderr}\n${result.stdout}`);
   return result.stdout;
 }
 
-function cli(...args: Parameters<typeof invokeCli>) {
-  return JSON.parse(invokeCli(...args)) as Record<string, unknown>;
+async function cli(...args: Parameters<typeof invokeCli>) {
+  return JSON.parse((await invokeCli(...args))) as Record<string, unknown>;
 }
 
-function start(
+async function start(
   root: string,
   runId: string,
   cwd = root,
   runsRoot = join(root, ".claude/reviews/wave-gate-runs"),
   statePath = join(root, ".claude/state/active_task_graph.json"),
 ) {
-  return cli(root, [
+  return (await cli(root, [
     "start", "wave-gate",
     "--runs-root", runsRoot,
     "--run", runId,
-  ], JSON.stringify({ wave: 1 }), cwd, statePath);
+  ], JSON.stringify({ wave: 1 }), cwd, statePath));
 }
 
-function resume(root: string, runId: string, cwd = root) {
-  return cli(root, [
+async function resume(root: string, runId: string, cwd = root) {
+  return (await cli(root, [
     "resume",
     "--runs-root", join(root, ".claude/reviews/wave-gate-runs"),
     "--run", runId,
-  ], "", cwd);
+  ], "", cwd));
 }
 
 function graph(root: string): TaskGraph {
@@ -213,6 +229,7 @@ function completionResultArtifact(root: string, runId: string): string {
 
 afterEach(() => {
   while (roots.length > 0) rmSync(roots.pop()!, { recursive: true, force: true });
+  sessionDirectories.clear();
 });
 
 describe("Wave Gate façade completion-suite integration", () => {
@@ -220,25 +237,25 @@ describe("Wave Gate façade completion-suite integration", () => {
     [defaultVerificationManifest(), { kind: "not-configured", reason: "engine-default" }, 0],
     [operatorManifest("empty"), { kind: "not-configured", reason: "empty-operator-manifest" }, 0],
     [operatorManifest(), { kind: "configured", checkIds: ["project:sentinel"] }, 1],
-  ] as const)("registered façade reports coverage, not inferred project success: %j", (manifest, coverage, expectedCount) => {
+  ] as const)("registered façade reports coverage, not inferred project success: %j", async (manifest, coverage, expectedCount) => {
     const root = repository({ modern: true, manifest });
     const outside = canonicalTempDir("loom-coverage-status-outside-");
     roots.push(outside);
     const runId = "run.coverage";
     const diagnostic = coverage.kind === "configured" ? "checks configured: project:sentinel" : "NOT CONFIGURED";
-    const unstartedStatus = cli(root, ["status", "--json"], "", outside);
-    expect(start(root, runId, outside)).toMatchObject({ kind: "spawn-batch" });
+    const unstartedStatus = (await cli(root, ["status", "--json"], "", outside));
+    expect((await start(root, runId, outside))).toMatchObject({ kind: "spawn-batch" });
     const acceptedState = readFileSync(join(root, ".claude/state/active_task_graph.json"), "utf8");
-    expect(cli(root, ["status", "--json"], "", outside)).toMatchObject({
+    expect((await cli(root, ["status", "--json"], "", outside))).toMatchObject({
       facts: { waveCompletionSuiteReadiness: { value: { kind: "accepted", projectVerificationCoverage: coverage } } },
     });
-    expect(invokeCli(root, ["status"], "", outside)).toContain(diagnostic);
+    expect((await invokeCli(root, ["status"], "", outside))).toContain(diagnostic);
     expect(unstartedStatus).toMatchObject({
       facts: { waveCompletionSuiteReadiness: { value: { kind: "required", projectVerificationCoverage: coverage } } },
     });
     expect(readFileSync(join(root, ".claude/state/active_task_graph.json"), "utf8")).toBe(acceptedState);
     expect(sentinelCount(root)).toBe(expectedCount);
-    expect(resume(root, runId, outside)).toMatchObject({ kind: "spawn-batch" });
+    expect((await resume(root, runId, outside))).toMatchObject({ kind: "spawn-batch" });
     expect(sentinelCount(root)).toBe(expectedCount);
 
     // Source bytes are workspace evidence, never a new command roster after population.
@@ -246,10 +263,10 @@ describe("Wave Gate façade completion-suite integration", () => {
       schemaVersion: 1, kind: "loom-verification-manifest", checks: [],
     }));
     const beforeStatus = readFileSync(join(root, ".claude/state/active_task_graph.json"), "utf8");
-    expect(cli(root, ["status", "--json"], "", outside)).toMatchObject({
+    expect((await cli(root, ["status", "--json"], "", outside))).toMatchObject({
       facts: { waveCompletionSuiteReadiness: { value: { kind: "stale", projectVerificationCoverage: coverage } } },
     });
-    expect(invokeCli(root, ["status"], "", outside)).toContain(diagnostic);
+    expect((await invokeCli(root, ["status"], "", outside))).toContain(diagnostic);
     expect(graph(root).verification_manifest).toEqual(manifest);
     expect(readFileSync(join(root, ".claude/state/active_task_graph.json"), "utf8")).toBe(beforeStatus);
     expect(sentinelCount(root)).toBe(expectedCount);
@@ -274,21 +291,21 @@ describe("Wave Gate façade completion-suite integration", () => {
     expect(observed.cause).toMatchObject({ code: "EISDIR" });
   });
 
-  it("does not execute a modern suite while a current-Wave Task is active", () => {
+  it("does not execute a modern suite while a current-Wave Task is active", async () => {
     const root = repository({ modern: true, executing: true });
-    const action = start(root, "run.active-task");
+    const action = (await start(root, "run.active-task"));
     expect(action.kind).toBe("blocked");
     expect(JSON.stringify(action)).toContain("still executing");
     expect(sentinelCount(root)).toBe(0);
     expect(graph(root).active_wave_completion_suite).toBeUndefined();
   });
 
-  it("runs start, resume, and status from outside cwd against the authoritative target repository", () => {
+  it("runs start, resume, and status from outside cwd against the authoritative target repository", async () => {
     const root = repository({ modern: true });
     const outside = canonicalTempDir("loom-wave-facade-outside-");
     roots.push(outside);
     const runId = "run.quiescent";
-    const action = start(root, runId, outside);
+    const action = (await start(root, runId, outside));
     expect(action, JSON.stringify(action)).toMatchObject({ kind: "spawn-batch" });
     expect(sentinelCount(root)).toBe(1);
 
@@ -304,8 +321,8 @@ describe("Wave Gate façade completion-suite integration", () => {
     );
     expect(existsSync(artifact)).toBe(true);
 
-    expect(resume(root, runId, outside).kind).toBe("spawn-batch");
-    expect(cli(root, ["status", "--json"], "", outside)).toMatchObject({
+    expect((await resume(root, runId, outside)).kind).toBe("spawn-batch");
+    expect((await cli(root, ["status", "--json"], "", outside))).toMatchObject({
       facts: { waveCompletionSuiteReadiness: { kind: "known", value: { kind: "accepted" } } },
     });
     expect(sentinelCount(root)).toBe(1);
@@ -314,17 +331,17 @@ describe("Wave Gate façade completion-suite integration", () => {
   it.each([
     ["nonzero", "non-zero-exit", 1],
     ["missing-report", "missing-report", 0],
-  ] as const)("status exposes persisted %s rejection without rerunning commands", (suiteOutcome, failureKind, expectedCount) => {
+  ] as const)("status exposes persisted %s rejection without rerunning commands", async (suiteOutcome, failureKind, expectedCount) => {
     const root = repository({ modern: true, suiteOutcome });
     const runId = `run.status-${suiteOutcome}`;
-    const action = start(root, runId);
+    const action = (await start(root, runId));
     expect(action).toMatchObject({
       kind: "blocked",
       diagnostic: { categories: ["semantic"], checkIds: ["project:sentinel"] },
     });
     expect(sentinelCount(root)).toBe(expectedCount);
 
-    const status = cli(root, ["status", "--json"]);
+    const status = (await cli(root, ["status", "--json"]));
     expect(status).toMatchObject({
       facts: {
         waveCompletionSuiteReadiness: {
@@ -338,16 +355,16 @@ describe("Wave Gate façade completion-suite integration", () => {
         },
       },
     });
-    expect(invokeCli(root, ["status"])).toContain("checks configured: project:sentinel (configuration is not a pass)");
+    expect((await invokeCli(root, ["status"]))).toContain("checks configured: project:sentinel (configuration is not a pass)");
     expect(sentinelCount(root)).toBe(expectedCount);
   });
 
   it.each(["corrupt", "stale"] as const)(
     "reports a %s persisted result as required/unavailable, never semantic rejection",
-    (artifactState) => {
+    async (artifactState) => {
       const root = repository({ modern: true, suiteOutcome: "nonzero" });
       const runId = `run.status-${artifactState}`;
-      start(root, runId);
+      (await start(root, runId));
       const artifact = completionResultArtifact(root, runId);
       if (artifactState === "corrupt") {
         writeFileSync(artifact, "{broken\n");
@@ -356,7 +373,7 @@ describe("Wave Gate façade completion-suite integration", () => {
         writeFileSync(artifact, JSON.stringify({ ...result, authorityDigest: "d".repeat(64) }));
       }
 
-      const status = cli(root, ["status", "--json"]);
+      const status = (await cli(root, ["status", "--json"]));
       const readiness = (status.facts as {
         waveCompletionSuiteReadiness: { value: Record<string, unknown> };
       }).waveCompletionSuiteReadiness.value;
@@ -369,47 +386,47 @@ describe("Wave Gate façade completion-suite integration", () => {
     },
   );
 
-  it("preserves the legacy façade path without executing or installing a suite", () => {
+  it("preserves the legacy façade path without executing or installing a suite", async () => {
     const root = repository({ modern: false });
-    const action = start(root, "run.legacy");
+    const action = (await start(root, "run.legacy"));
     expect(action, JSON.stringify(action)).toMatchObject({ kind: "spawn-batch" });
     expect(sentinelCount(root)).toBe(0);
     expect(graph(root).active_wave_completion_suite).toBeUndefined();
   });
 
-  it("status observes accepted and stale target authority from outside cwd without rerunning commands", () => {
+  it("status observes accepted and stale target authority from outside cwd without rerunning commands", async () => {
     const root = repository({ modern: true });
     const outside = canonicalTempDir("loom-wave-status-outside-");
     roots.push(outside);
     const runId = "run.status-suite";
-    start(root, runId, outside);
+    (await start(root, runId, outside));
 
-    const accepted = cli(root, ["status", "--json"], "", outside);
+    const accepted = (await cli(root, ["status", "--json"], "", outside));
     expect(accepted).toMatchObject({
       facts: { waveCompletionSuiteReadiness: { kind: "known", value: { kind: "accepted" } } },
     });
     expect(sentinelCount(root)).toBe(1);
 
     write(root, "source.ts", "export const value = 2;\n");
-    const stale = cli(root, ["status", "--json"], "", outside);
+    const stale = (await cli(root, ["status", "--json"], "", outside));
     expect(stale).toMatchObject({
       facts: { waveCompletionSuiteReadiness: { kind: "known", value: { kind: "stale" } } },
     });
     expect(sentinelCount(root)).toBe(1);
   });
 
-  it("fails closed for a foreign Run Directory repository or a State File outside Git", () => {
+  it("fails closed for a foreign Run Directory repository or a State File outside Git", async () => {
     const root = repository({ modern: true });
     const foreign = repository({ modern: true });
     const outside = canonicalTempDir("loom-wave-authority-outside-");
     roots.push(outside);
 
-    const foreignRun = start(
+    const foreignRun = (await start(
       root,
       "run.foreign-repository",
       outside,
       join(foreign, ".claude/reviews/wave-gate-runs"),
-    );
+    ));
     expect(foreignRun).toMatchObject({
       kind: "blocked",
       diagnostic: { categories: ["authority"], message: expect.stringContaining("differs from protected TaskGraph repository") },
@@ -423,13 +440,13 @@ describe("Wave Gate façade completion-suite integration", () => {
     const stateOutsideGit = join(stateOutsideRoot, "active_task_graph.json");
     writeFileSync(stateOutsideGit, JSON.stringify(graph(foreign), null, 2));
     chmodSync(stateOutsideGit, 0o444);
-    const stateOutside = start(
+    const stateOutside = (await start(
       foreign,
       "run.state-outside-git",
       outside,
       join(foreign, ".claude/reviews/wave-gate-runs"),
       stateOutsideGit,
-    );
+    ));
     expect(stateOutside).toMatchObject({
       kind: "blocked",
       diagnostic: { categories: ["authority"], message: expect.stringContaining("TaskGraph repository authority is unavailable") },

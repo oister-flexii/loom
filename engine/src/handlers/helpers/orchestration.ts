@@ -70,7 +70,7 @@ import { match } from "ts-pattern";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { SUBAGENT_DIR, TASK_GRAPH_PATH } from "../../config";
+import { isReviewAgent, SUBAGENT_DIR, TASK_GRAPH_PATH } from "../../config";
 import { parseTaskGraph } from "../../state-manager";
 import { observeAnyActiveSubagent } from "../../machine";
 import type {
@@ -141,6 +141,7 @@ import {
 import {
   applyWaveFacadeSubmission,
   inspectRemediationFacade,
+  inspectStandaloneFacade,
   parseRegisteredFacadeProgram,
   parseRemediationStartInput,
   prepareRemediationFacadeStart,
@@ -163,6 +164,8 @@ import {
   type RegisteredStandaloneProgram,
   type RegisteredWaveGateProgram,
 } from "./programs";
+import { renderStandaloneReviewSummary } from "../../core/standalone-review";
+import { serializeStandaloneReviewMachineState } from "../../core/standalone-review-machine";
 import { argumentValue, hasFlag } from "./cli-args";
 import { REMEDIATION_EVENT_RESOURCE_POLICY } from "./programs/remediation-events";
 
@@ -607,6 +610,32 @@ const factOf = <T>(
   result: Readonly<{ ok: true; value: T }> | Readonly<{ ok: false; error: Readonly<{ message: string }> }>,
 ): ObservedFact<T> => result.ok ? observed(result.value) : unavailable(result.error.message);
 
+function observeCaptureRejections(
+  handle: RunDirHandle,
+  requests: ReturnType<RunDirHandle["readIssuedRequests"]>,
+): ObservedFact<ReadonlyMap<string, string>> {
+  if (!requests.ok) return unavailable(requests.error.message);
+  const markers = new Map<string, string>();
+  for (const authority of requests.value) {
+    const rejection = handle.readCaptureRejection(authority);
+    if (!rejection.ok) return unavailable(rejection.error.message);
+    if (rejection.value !== null) markers.set(authority.requestId, rejection.value);
+  }
+  return observed(markers);
+}
+
+async function observeStandaloneReview(
+  handle: RunDirHandle,
+  registration: RegisteredStandaloneProgram,
+): Promise<Readonly<{ checkpoint: ObservedFact<string | null>; reviewSummary: string | null }>> {
+  const inspected = await inspectStandaloneFacade(handle, registration);
+  if (!inspected.ok) return { checkpoint: unavailable(inspected.message), reviewSummary: null };
+  return {
+    checkpoint: observed(serializeStandaloneReviewMachineState(inspected.value)),
+    reviewSummary: inspected.value.kind === "done" ? renderStandaloneReviewSummary(inspected.value.result) : null,
+  };
+}
+
 /**
  * Read one run directory into the observation the projection folds.
  *
@@ -615,15 +644,23 @@ const factOf = <T>(
  * answer is exactly what an operator deciding "recoverable or stale?" needs,
  * and a single throw would have withheld all of it.
  */
-async function observeRun(handle: RunDirHandle): Promise<RunInspectionObservation> {
+async function observeRun(handle: RunDirHandle): Promise<RunInspectionObservation & Readonly<{ reviewSummary: string | null }>> {
   const authority = handle.readAuthority();
   const programRegistration = handle.readProgramRegistration();
   const requests = handle.readIssuedRequests();
   let remediationOutcome: ObservedFact<RemediationInspectionLabel | null> = observed(null);
+  let checkpoint = await observing(() => handle.readCheckpoint(), "checkpoint");
+  let reviewSummary: string | null = null;
   let eventPolicy: Parameters<RunDirHandle["readEvents"]>[0];
   if (programRegistration.ok && programRegistration.value !== null) {
     const parsed = parseRegisteredFacadeProgram(programRegistration.value);
-    if (parsed.kind === "invalid" &&
+    if (parsed.kind === "registered" && parsed.program.kind === "standalone-review") {
+      ({ checkpoint, reviewSummary } = await observeStandaloneReview(handle, parsed.program));
+    } else if (parsed.kind === "invalid" &&
+        typeof programRegistration.value === "object" && programRegistration.value !== null &&
+        (programRegistration.value as Record<string, unknown>)["kind"] === "standalone-review") {
+      checkpoint = unavailable(parsed.message);
+    } else if (parsed.kind === "invalid" &&
         typeof programRegistration.value === "object" && programRegistration.value !== null &&
         (programRegistration.value as Record<string, unknown>)["kind"] === "remediation") {
       remediationOutcome = unavailable(parsed.message);
@@ -634,17 +671,7 @@ async function observeRun(handle: RunDirHandle): Promise<RunInspectionObservatio
       remediationOutcome = projected.ok ? observed(projected.label) : unavailable(projected.message);
     }
   }
-  const markerRejections: ObservedFact<ReadonlyMap<string, string>> = requests.ok
-    ? ((): ObservedFact<ReadonlyMap<string, string>> => {
-        const markers = new Map<string, string>();
-        for (const authority of requests.value) {
-          const rejection = handle.readCaptureRejection(authority);
-          if (!rejection.ok) return unavailable(rejection.error.message);
-          if (rejection.value !== null) markers.set(authority.requestId, rejection.value);
-        }
-        return observed(markers);
-      })()
-    : unavailable(requests.error.message);
+  const markerRejections = observeCaptureRejections(handle, requests);
 
   return Object.freeze({
     runId: handle.runId,
@@ -654,7 +681,8 @@ async function observeRun(handle: RunDirHandle): Promise<RunInspectionObservatio
     // readability is news, so the fact's payload is deliberately empty.
     authority: authority.ok ? observed<null>(null) : unavailable<null>(authority.error.message),
     programRegistration: factOf(programRegistration),
-    checkpoint: await observing(() => handle.readCheckpoint(), "checkpoint"),
+    checkpoint,
+    reviewSummary,
     remediationOutcome,
     requests: factOf(requests),
     capturedAttempts: factOf(handle.readCapturedAttempts()),
@@ -667,10 +695,16 @@ async function observeRun(handle: RunDirHandle): Promise<RunInspectionObservatio
 async function inspectOperation(args: readonly string[]): Promise<HookResult> {
   const bound = bindRun(args);
   if (!isBound(bound)) return bound;
-  const inspection = deriveRunInspection(await observeRun(bound.value.handle));
-  process.stdout.write(`${hasFlag(args, "--json")
+  const observation = await observeRun(bound.value.handle);
+  const inspection = deriveRunInspection(observation);
+  const asJson = hasFlag(args, "--json");
+  const rendered = asJson
     ? renderRunInspectionJson(inspection)
-    : renderRunInspectionHuman(inspection)}\n`);
+    : renderRunInspectionHuman(inspection);
+  // Presentation is derived only after published-result replay, never from raw
+  // checkpoint partitions or model-authored counts. No summary artifact exists.
+  process.stdout.write(`${rendered}${!asJson && observation.reviewSummary !== null
+    ? `\n\n${observation.reviewSummary}` : ""}\n`);
   return { kind: "allow" };
 }
 
@@ -1293,6 +1327,18 @@ async function reconcileCapturedPanelResults(
  * be read is reported as such rather than restarted, because restarting would
  * discard the very evidence that explains the failure.
  */
+function unregisteredReviewerProblem(handle: RunDirHandle, requests: readonly AgentRequestAuthority[]): string | null {
+  for (const request of requests) {
+    if (!isReviewAgent(request.role)) continue;
+    const packet = handle.readContext(request.contextDigest);
+    if (!packet.ok) return `unregistered reviewer context authority unavailable: ${packet.error.message}`;
+    if (packet.value.schemaVersion === 2) {
+      return "current reviewer requires registered program authority; historical fallback refused";
+    }
+  }
+  return null;
+}
+
 async function resumeOperation(args: readonly string[]): Promise<HookResult> {
   const bound = bindLiveRun(args);
   if (!isBound(bound)) return bound;
@@ -1327,6 +1373,11 @@ async function resumeOperation(args: readonly string[]): Promise<HookResult> {
     if (!driven.ok) return { kind: "error", message: driven.message };
     return emitRunAction(bound.value.handle, driven.action);
   }
+
+  const issued = bound.value.handle.readIssuedRequests();
+  if (!issued.ok) return { kind: "error", message: issued.error.message };
+  const problem = unregisteredReviewerProblem(bound.value.handle, issued.value);
+  if (problem !== null) return { kind: "error", message: problem };
 
   // Historical run without a program registration: retain the read-only v1
   // compatibility response, but never manufacture lifecycle progress.
@@ -1437,6 +1488,10 @@ function bindSubmission(args: readonly string[]): SubmissionBindingResult {
   }
   const stored = bound.value.handle.readProgramRegistration();
   if (!stored.ok) return { ok: false, result: { kind: "error", message: stored.error.message } };
+  if (stored.value === null) {
+    const problem = unregisteredReviewerProblem(bound.value.handle, issued.value);
+    if (problem !== null) return { ok: false, result: { kind: "error", message: problem } };
+  }
   const facade = stored.value === null ? null : parseRegisteredFacadeProgram(stored.value);
   if (facade?.kind === "invalid") {
     return { ok: false, result: { kind: "error", message: `registered orchestration program is invalid: ${facade.message}` } };

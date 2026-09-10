@@ -15,7 +15,8 @@ import {
   type ProofTestResult,
   type TaskProof,
 } from "./proof-obligations";
-import { buildContextPacket, encodeByteSection, type ContextPacket } from "./context-packets";
+import { buildContextPacket, buildReviewerContextPacket, encodeByteSection, type ContextPacket } from "./context-packets";
+import { parseReviewerProtocolDescriptor, type ReviewerProtocolDescriptor } from "./reviewer-contract";
 import { lowerModelProfile, resolveAgentPolicy, resolveModelProfile, WAVE_REVIEW_AGENTS } from "./model-profiles";
 import {
   canonicalRecord,
@@ -62,14 +63,14 @@ export type WaveSpecCheckObservation = Readonly<{
 }>;
 
 export type WaveReviewRegistrationAuthority = Readonly<{
-  schemaVersion: 1;
   kind: "wave-gate";
   input: Readonly<{ wave: number }>;
   taskIds: readonly string[];
   authorityDigest: string;
   restart?: Readonly<{ previousRunId: string; exhaustedSlots: readonly string[] }>;
   orphanRecovery?: Readonly<{ previousRunId: string; previousAuthorityDigest: string }>;
-}>;
+}> & (Readonly<{ schemaVersion: 1; reviewerProtocol?: never }> |
+  Readonly<{ schemaVersion: 2; reviewerProtocol: ReviewerProtocolDescriptor }>);
 
 /** Exact protected snapshot identity used by publication and locked install. */
 export function waveGateAuthorityDigest(
@@ -588,6 +589,10 @@ export function prepareWaveReviewBatch(
   workspace: readonly ReviewedWorkspaceObservation[],
   specCheckObservation: WaveSpecCheckObservation,
 ): DomainResult<WaveRequestBatch, WaveReviewPreparationError> {
+  if (registration.schemaVersion === 2) {
+    const protocol = parseReviewerProtocolDescriptor(registration.reviewerProtocol);
+    if (!protocol.ok) return failure(protocol.error.message);
+  }
   const specCheckDocuments = specCheckObservation.authority;
   const currentWaveTasks = graph.tasks.filter((task) => task.wave === registration.input.wave);
   const tasks: Task[] = [];
@@ -688,7 +693,9 @@ export function prepareWaveReviewBatch(
     const identity = JSON.stringify({
       runId,
       registration: {
-        schemaVersion: registration.schemaVersion,
+        schemaVersion: subject.taskId === null ? 1 : registration.schemaVersion,
+        ...(subject.taskId !== null && registration.schemaVersion === 2
+          ? { reviewerProtocol: registration.reviewerProtocol } : {}),
         kind: registration.kind,
         wave: registration.input.wave,
         taskIds: registration.taskIds,
@@ -745,7 +752,7 @@ export function prepareWaveReviewBatch(
       ? encodeByteSection("requirement-coverage", renderRequirementCoverage(requirementCoverage))
       : null;
     if (coverageSection !== null && !coverageSection.ok) return failure(coverageSection.error.message);
-    const packet = buildContextPacket({
+    const packetInput = {
       requestId: requestId.value,
       role: subject.role,
       requiredSkill: policy.value.requiredSkill ?? "none",
@@ -756,7 +763,10 @@ export function prepareWaveReviewBatch(
         coverageSection === null ? [section.value] : [section.value, coverageSection.value],
       ),
       variableContext: Object.freeze([]),
-    });
+    };
+    const packet = subject.taskId !== null && registration.schemaVersion === 2
+      ? buildReviewerContextPacket(packetInput)
+      : buildContextPacket(packetInput);
     if (!packet.ok) return failure(packet.error.message);
     const authority = parseAgentRequestAuthority({
       runId,

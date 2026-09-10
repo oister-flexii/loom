@@ -1,0 +1,2 @@
+# Lossless historical evidence packs are binary, not prose to reformat.
+engine/tests/fixtures/reviewer-protocol-v1/*.json.gz binary

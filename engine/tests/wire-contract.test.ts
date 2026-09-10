@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { agentsOfKind } from "../src/core/model-profiles";
 import { extractWireContractRegion, stampWireContract } from "../src/core/wire-contract";
+import { renderReviewerWireContract } from "../src/core/reviewer-protocol";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const fragment = readFileSync(join(REPO_ROOT, "agents", "_shared", "wire-contract.md"), "utf-8");
@@ -37,13 +38,12 @@ describe("every reviewer carries the exact stamped Wire Contract", () => {
     if (stamped.ok) expect(stamped.value).toBe(markdown);
   });
 
-  it("the fragment itself carries every wire token the engine's parsers demand", () => {
-    for (const token of [
-      "CRITICAL_COUNT:", "ADVISORY_COUNT:", "CRITICAL: {", "ADVISORY: {",
-      "```findings", "REVIEW_GENERATION:", "REVIEW_PACKET_ID:", "review_lifecycle",
-      "resolved_by_remediation", "still_present", '"finding_id"', '"verdict"', '"prior_findings"',
-    ]) {
+  it("the shared fragment is generated from the actual executable contract", () => {
+    expect(fragment).toBe(renderReviewerWireContract());
+    for (const token of ['"schemaVersion"', '"basis"', '"reason"', '"finding_id"', '"verdict"', '"prior_findings"']) {
       expect(fragment, token).toContain(token);
     }
+    expect(fragment).not.toContain("CRITICAL_COUNT:");
+    expect(fragment).not.toContain("```findings");
   });
 });

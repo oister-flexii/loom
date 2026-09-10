@@ -51,6 +51,7 @@ export type TerminalCaptureRefusal = Readonly<{
 
 export type CaptureObservation =
   | Readonly<{ kind: "candidates"; candidates: readonly FinalPayloadCandidate[] }>
+  | Readonly<{ kind: "unavailable"; reason: string; message: string }>
   | TerminalCaptureRefusal;
 
 export type CaptureOutcome =
@@ -62,6 +63,9 @@ export type CaptureOutcome =
 
 export const terminalCaptureRefusal = (reason: string, message: string): TerminalCaptureRefusal =>
   Object.freeze({ kind: "terminal-refusal", reason, message });
+
+export const captureUnavailable = (reason: string, message: string): CaptureObservation =>
+  Object.freeze({ kind: "unavailable", reason, message });
 
 export const captureCandidates = (candidates: readonly FinalPayloadCandidate[]): CaptureObservation =>
   Object.freeze({ kind: "candidates", candidates });
@@ -305,6 +309,7 @@ export async function captureHarnessResult(args: CaptureHarnessInput): Promise<C
   const observation = args.observe === undefined
     ? captureCandidates(args.candidates)
     : args.observe();
+  if (observation.kind === "unavailable") return retriableFailure(observation.reason, observation.message);
   if (observation.kind === "terminal-refusal") {
     return terminalizeCaptureRejection(handle, request, observation);
   }
@@ -334,15 +339,24 @@ export async function captureHarnessResult(args: CaptureHarnessInput): Promise<C
       `native ${args.harness} result is bound as ${correlatorRole}, not ${request.role}`,
     );
   }
+  return persistBoundCapture(handle, request, bound.value, payload.value.bytes);
+}
+
+async function persistBoundCapture(
+  handle: RunDirHandle,
+  request: AgentRequestAuthority,
+  receipt: CaptureReceipt,
+  bytes: readonly number[],
+): Promise<CaptureOutcome> {
   const context = handle.readContext(request.contextDigest);
   if (!context.ok) return retriableFailure("context", context.error.message);
   if (context.value.requestId !== request.requestId || context.value.role !== request.role) {
-    return reject(
+    return terminalizeCaptureRejection(handle, request, terminalCaptureRefusal(
       "context-binding",
       `context ${request.contextDigest} does not describe request ${request.requestId}/${request.role}`,
-    );
+    ));
   }
-  const written = await handle.captureTranscript(request, payload.value.bytes);
+  const written = await handle.captureTranscript(request, bytes);
   if (!written.ok) {
     const rejection = handle.readCaptureRejection(request);
     return rejection.ok && rejection.value !== null
@@ -350,7 +364,7 @@ export async function captureHarnessResult(args: CaptureHarnessInput): Promise<C
       : retriableFailure("transcript", written.error.message);
   }
 
-  return { kind: "captured", receipt: bound.value };
+  return { kind: "captured", receipt };
 }
 
 /**

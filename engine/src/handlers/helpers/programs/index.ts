@@ -11,6 +11,7 @@ export {
   parseStandaloneStartInput,
   parseWaveGateStartInput,
   renderSpawnTask,
+  reviewerProtocolResolver,
   type FacadeDriveResult,
   type ProgramParse,
   type RegisteredRemediationProgram,
@@ -19,6 +20,7 @@ export {
   type RegisteredWaveGateProgram,
 } from './helpers';
 export {
+  inspectStandaloneFacade,
   readStandaloneReviewedSource,
   replayStandaloneResultFromEvidence,
   resumeStandaloneFacade,

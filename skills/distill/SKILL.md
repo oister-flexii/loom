@@ -71,7 +71,7 @@ Active when preloaded by the `code-simplifier` reviewer (standalone `/review-pr`
 - Report each opportunity as: **location**, **current shape**, **distilled shape**, **why the reader wins**.
 - Never edit files. The output is findings.
 
-**Severity discipline.** Simplification findings are almost always **advisory**. Reserve **critical** for simplification pressure that exposed *wrongness*: duplicated branches that have already diverged, a condition that cannot be reached, an abstraction whose callers disagree about its contract. "This could be tidier" is advisory, always. When the reviewer wire contract applies (Machine Summary), the agent shim defines it — the skill defines judgment, not wire format.
+**Severity discipline.** Simplification findings are almost always **advisory**. Reserve **critical** for simplification pressure that exposed *wrongness*: duplicated branches that have already diverged, a condition that cannot be reached, an abstraction whose callers disagree about its contract. "This could be tidier" is advisory, always. For engine-issued review, first follow the agent shim's Context Packet bootstrap: genuine issued v1 uses the archived baseline role and fragment, not current guidance. Current v2 uses only the issued JSON schema and impact rubric; actual wrongness alone is insufficient for critical without a concrete blocking consequence and complete basis. Truth confidence is not severity. Put findings in the issued JSON fields, with concise advisory reasons. The skill supplies judgment, never a competing wire format.
 
 ### Apply mode — edit, test-gated
 

@@ -10,6 +10,7 @@ import { PHASE_ORDER, KNOWN_AGENTS, REVIEW_SUB_AGENTS } from "../../config";
 import {
   attributeFindings,
   claimsOfSeverity,
+  currentFindingAuthorityError,
   deduplicateFindingIds,
   findingIdCollisionError,
   findingsLockstepError,
@@ -661,6 +662,11 @@ function appendFindingsRepairNotes(id: string, repair: FindingsRepair, notes: st
 function fixTaskRecord(rawTask: unknown, taskIndex: number, notes: string[], dataLoss: string[]): unknown {
   if (!isRecord(rawTask)) {
     notes.push(`tasks[${taskIndex}]: cannot repair non-object task entry ${JSON.stringify(rawTask)}; refusing unchanged input`);
+    return rawTask;
+  }
+  const currentAuthorityError = currentFindingAuthorityError(rawTask);
+  if (currentAuthorityError !== null) {
+    notes.push(`tasks[${taskIndex}]: ${currentAuthorityError}; refusing unchanged input`);
     return rawTask;
   }
   const repair = fixTaskFindings(rawTask);

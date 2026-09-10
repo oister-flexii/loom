@@ -3,9 +3,9 @@
  * Stamp the Wire Contract (see CONTEXT.md) into every finding-producing
  * reviewer agent file.
  *
- * The contract's single source is agents/_shared/wire-contract.md — the copy
- * in each reviewer file between the wire-contract markers is GENERATED, never
- * hand-edited. Edit the fragment, run this script, commit both. The reviewer
+ * The contract's single source is renderReviewerWireContract(). The shared
+ * fragment AND each reviewer region are generated from the executable codec;
+ * a schema/rubric change requires an explicit supported contract revision. The reviewer
  * roster is derived from the Agent Catalog (kind `reviewer`), so a new
  * reviewer is stamped the moment it is catalogued; a reviewer file missing
  * its markers fails loudly here and in engine/tests/wire-contract.test.ts.
@@ -18,13 +18,19 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { agentsOfKind } from "../engine/src/core/model-profiles";
+import { renderReviewerWireContract } from "../engine/src/core/reviewer-protocol";
 import { WIRE_CONTRACT_END, WIRE_CONTRACT_START, stampWireContract } from "../engine/src/core/wire-contract";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const check = process.argv.includes("--check");
-const fragment = readFileSync(join(ROOT, "agents", "_shared", "wire-contract.md"), "utf-8");
-
+const fragment = renderReviewerWireContract();
+const fragmentPath = join(ROOT, "agents", "_shared", "wire-contract.md");
 let drifted = 0;
+if (readFileSync(fragmentPath, "utf-8") !== fragment) {
+  drifted += 1;
+  if (check) console.error("shared wire fragment differs from executable reviewer contract");
+  else writeFileSync(fragmentPath, fragment);
+}
 for (const agent of agentsOfKind("reviewer")) {
   const path = join(ROOT, "agents", `${agent}.md`);
   const current = readFileSync(path, "utf-8");

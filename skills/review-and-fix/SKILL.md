@@ -1,6 +1,6 @@
 ---
 name: review-and-fix
-version: "4.0.0"
+version: "5.0.0"
 description: "Review a PR, adjudicate critical findings, remediate, validate, and install an exact verified Git index."
 ---
 
@@ -83,6 +83,49 @@ critical sets through its registered Refutation Panel and publishes canonical
 - `surviving_critical_findings` — mandatory fixes
 - `advisory_findings` — autonomous parent triage by default
 - `refuted_critical_findings` — report, never fix
+
+### Reviewer Protocol v2 and canonical presentation
+
+Fresh reviews issue exactly one JSON final payload under the frozen
+`reviewer-payload-schema` and `reviewer-impact-rubric`. No Machine Summary,
+markers, numeric tallies, or reviewer-chosen new Finding IDs. Criticals require
+six fields: claim plus basis evidence, violatedContract, consequence,
+truthConfidence, and severityRationale. Advisories require a concise reason;
+optional basis must be complete. Truth confidence is not an impact score.
+Blocking consequence must concern supported behavior, safety/authority, explicit
+acceptance/verification obligations, or safe operator use. Factual error, style,
+architectural shallowness, or a missing test alone is insufficient. Filled fields
+prove neither truth, impact, reachability, execution, nor semantic test adequacy.
+
+Malformed current output fails evidence admission and creates no synthetic
+Finding or P3 repair obligation. It receives only the existing bounded retry.
+The same panel lenses and strict majority assess the assertion including its
+basis; a true assertion is not refuted merely because repair seems unimportant.
+A surviving critical stays blocking, with no severity downgrade or standalone
+severity-dispute action. The old explicit Wave operator override remains separate
+and is never automatic fallback for reviewer failure.
+
+Use the engine's existing inspection renderer, not parent-authored arithmetic:
+
+```bash
+bun ${LOOM_DIR}/engine/src/cli.ts helper orchestration inspect \
+  --runs-root ".claude/reviews/review-and-fix-runs" \
+  --run "<same-review-run-id>"
+```
+
+It authenticates registered protocol, source contexts and publication, then renders
+emitted/admitted and after-refutation counts and full Finding details from the
+published root `result.json`. JSON output retains the existing inspection shape. No new
+summary artifact is authority. P3 retains every original source ID and full basis
+immutably, including refuted/advisory partitions and original result digest.
+Its selected operator checks, fresh required reports and verified-index policy
+are unchanged by this reviewer-wire major version.
+
+Completed and unfinished issued reviewer v1 runs keep their original protocol,
+including retries and replay. Read the issued packet first and follow archived
+role/shared-wire delivery under `references/reviewer-protocol-v1/`; do not apply
+current schema/rubric to v1. This is distinct from unfinished remediation v1,
+which ADR-0008 still refuses. See [protocol operations](../../docs/operations.md#reviewer-protocol-v2).
 
 ## Phase 2 — Plan
 
@@ -226,7 +269,7 @@ Recovery depends on the cause:
 - **failed/missing/malformed/zero-test check or candidate drift after
   registration** — correct the cause and start a fresh run; a failed check or
   changed candidate cannot reuse prior evidence;
-- **unfinished schema-v1 run** — start a fresh schema-v2 run. Completed v1 runs
+- **unfinished schema-v1 remediation run** — start a fresh schema-v2 run. Completed v1 runs
   remain read-only with `historical-unknown` assessment, returning the old
   receipt without reinstalling or minting current installation authority.
 - **missing/malformed completed-v2 checkpoint audit arrays** — retain the
@@ -316,12 +359,14 @@ adapter receipt) and `outcome.defectFamilyAssessment` (`repair-checked` or
 `not-required`). Commit the installed index and push unless `--no-push`. A push
 failure leaves the valid local commit intact and is reported with its SHA.
 
-**Installing this feature itself:** after external validation, the currently
-admitted CLI and loaded Skill 3.1 may review/install under their existing
-protocol. This is not a v2 repair-checked publication; its completed v1 run becomes
-read-only historical-unknown after reload. The immutable source review remains
-source authority and is not rewritten. The parent owns registered installation
-and publication; documentation edits neither advance a Run nor grant authority.
+**P4 source status:** Reviewer Protocol v2 is implemented in this feature checkout,
+not yet independently reviewed, merged, published, or cut over into the loaded
+runtime. The parent must use its actually admitted CLI/Skill for later registered
+review and installation. Reviewer v1 source history does not imply remediation
+v1: the existing P3 v2 installation/report policy remains unchanged. The earlier
+Skill 3.1 bootstrap belongs to P3 history (ADR-0008), not this wire migration.
+Documentation and development validation neither advance a Run nor mint an
+installation receipt.
 
 A newly installed/updated Pi package requires `/reload` or a full Pi restart
 before this schema-v2 live workflow can mutate anything. Never unset runtime
@@ -329,7 +374,8 @@ admission variables to force a fresh CLI through an older loaded extension.
 
 ## Phase 5 — Report
 
-Report found/refuted/surviving/repaired/advisory counts, every original critical
+Relay the inspection renderer's emitted/admitted and after-refutation counts;
+report repaired dispositions from actual P3 accounting, every original critical
 Finding ID and disposition, Declared Repair Groups, blockers, every advisory
 disposition/reason, both Run Directories, plan, changed files, validation
 evidence, Defect-Family Assessment with provenance, actual installation receipt,

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { captureLoomRuntimeIdentity, PI_EXTENSION_RUNTIME_ROOT_ENV, PI_EXTENSION_RUNTIME_REVISION_ENV } from "../../../../src/runtime-compatibility";
 import { recordInstalledRemediation } from "../../../../src/handlers/helpers/programs/remediation";
 import { openRunDirectory, type RunDirHandle } from "../../../../src/orchestration/run-directory-handle";
 import type { AgentRequestAuthority, VerifiedIndexInstalled } from "../../../../src/core/orchestration-contract";
@@ -24,11 +25,13 @@ function git(repository: string, args: readonly string[]): string {
 }
 
 function runCli(repository: string, args: readonly string[], input = "") {
+  const runtime = captureLoomRuntimeIdentity(join(ENGINE, ".."));
   return spawnSync("bun", [CLI, "helper", "orchestration", ...args], {
     cwd: repository,
     encoding: "utf8",
     input,
-    env: process.env,
+    env: { ...process.env, PI_CODING_AGENT: "true", [PI_EXTENSION_RUNTIME_ROOT_ENV]: runtime.packageRoot,
+      [PI_EXTENSION_RUNTIME_REVISION_ENV]: runtime.revision },
   });
 }
 
@@ -56,15 +59,7 @@ async function completedReviewFixture() {
   };
   const source = openRunDirectory(runsRoot, sourceRun);
   if (!source.ok) throw new Error(source.error.message);
-  const transcript = [
-    "### Machine Summary",
-    "CRITICAL_COUNT: 0",
-    "ADVISORY_COUNT: 0",
-    "",
-    "```findings",
-    "[]",
-    "```",
-  ].join("\n");
+  const transcript = JSON.stringify({ schemaVersion: 2, kind: "standalone-review", findings: [] });
   for (const { authority } of action.requests) {
     const captured = await source.value.captureTranscript(authority, [...Buffer.from(transcript)]);
     if (!captured.ok) throw new Error(captured.error.message);

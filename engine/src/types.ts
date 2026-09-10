@@ -2,6 +2,7 @@
  * Shared Loom schemas and Hook result/input types.
  */
 
+import type { ReviewerDraftV2, ReviewerProtocolDescriptor } from "./core/reviewer-contract";
 import type {
   FailedTaskProof,
   PendingTaskProof,
@@ -173,7 +174,10 @@ export type FindingSeverity = (typeof FINDING_SEVERITIES)[number];
  * optional locations are sanitized before this shape is constructed. It
  * deliberately carries NO identity — see core/findings.
  */
-export interface DraftFinding {
+export interface LegacyDraftFinding {
+  readonly protocolVersion?: never;
+  readonly basis?: never;
+  readonly reason?: never;
   readonly severity: FindingSeverity;
   /** Unverified reviewer-supplied single-line location hint, or null. */
   readonly file: string | null;
@@ -183,17 +187,15 @@ export interface DraftFinding {
   readonly claim: string;
 }
 
-/** A draft plus derived identity. `attributeFindings` mints new identities; parsers rehydrate persisted ones. */
-export interface Finding extends DraftFinding {
-  /** `${agent}-${ordinal}`, derived — never agent-chosen. */
-  readonly id: string;
-  /** The review agent that emitted the claim (namespace already stripped). */
-  readonly agent: string;
-  /** Implementation generation whose immutable Review Packet produced this finding. */
-  readonly review_generation?: number;
-  /** Canonical Review Packet identity; absent only on legacy findings. */
-  readonly review_packet_id?: string;
-}
+/** Exact current wire data plus its engine-owned durable discriminator. */
+export type CurrentDraftFinding = ReviewerDraftV2 & Readonly<{ protocolVersion: 2 }>;
+export type DraftFinding = LegacyDraftFinding | CurrentDraftFinding;
+export type FindingIdentity = Readonly<{ id: string; agent: string }> & (
+  | Readonly<{ review_generation?: never; review_packet_id?: never }>
+  | Readonly<{ review_generation: number; review_packet_id: string }>
+);
+/** `attributeFindings` mints identity; stored parsers rehydrate it without changing current evidence. */
+export type Finding = DraftFinding & FindingIdentity;
 
 export const PRIOR_FINDING_VERDICTS = ["resolved_by_remediation", "still_present"] as const;
 export type PriorFindingVerdict = (typeof PRIOR_FINDING_VERDICTS)[number];
@@ -208,32 +210,47 @@ export interface PriorFindingAssessment {
 interface ReviewRunEvidenceBase {
   readonly agent: string;
   readonly prior_assessments: readonly PriorFindingAssessment[];
-  readonly new_findings: readonly DraftFinding[];
 }
 
 /** Evidence from a legacy/non-Wave packet that has no engine-issued slot. */
 export type UnboundReviewRunEvidence = Readonly<ReviewRunEvidenceBase & {
+  readonly protocolVersion?: never;
+  readonly new_findings: readonly LegacyDraftFinding[];
+  readonly request_id?: never;
+  readonly context_digest?: never;
   readonly slot_id?: never;
   readonly attempted?: never;
 }>;
 
 /** Evidence whose transcript was accepted under one exact engine-issued slot attempt. */
 export type SlotBoundReviewRunEvidence = Readonly<ReviewRunEvidenceBase & {
+  readonly protocolVersion?: never;
+  readonly new_findings: readonly LegacyDraftFinding[];
+  readonly request_id?: never;
+  readonly context_digest?: never;
   readonly slot_id: string;
   readonly attempted: 1 | 2;
 }>;
 
 /** Evidence staged by one reviewer. It is not activated until the whole run completes. */
-export type ReviewRunEvidence = UnboundReviewRunEvidence | SlotBoundReviewRunEvidence;
+export type LegacyReviewRunEvidence = UnboundReviewRunEvidence | SlotBoundReviewRunEvidence;
+export type CurrentReviewRunEvidence = Readonly<ReviewRunEvidenceBase & {
+  protocolVersion: 2;
+  new_findings: readonly CurrentDraftFinding[];
+  slot_id: string;
+  attempted: 1 | 2;
+  request_id: string;
+  context_digest: string;
+}>;
+export type ReviewRunEvidence = LegacyReviewRunEvidence | CurrentReviewRunEvidence;
 
 /** Engine-issued semantic-slot authority for one member of an active Review
  * Run. Legacy runs may omit this field, but exact-slot Wave recovery refuses
  * such runs rather than accepting caller-authored attempt evidence. */
-export interface ReviewRunSlotAuthority {
-  readonly agent: string;
-  readonly slot_id: string;
-  readonly attempted: 1 | 2;
-}
+type ReviewRunSlotBase = Readonly<{ agent: string; slot_id: string; attempted: 1 | 2 }>;
+export type LegacyReviewRunSlotAuthority = ReviewRunSlotBase & Readonly<{ request_id?: never; context_digest?: never }>;
+export type CurrentReviewRunSlotAuthority = ReviewRunSlotBase & Readonly<{ request_id: string; context_digest: string }>;
+export type ReviewRunSlotAuthority = LegacyReviewRunSlotAuthority | CurrentReviewRunSlotAuthority;
 
 /**
  * In-progress, packet-bound review run. Every expected reviewer must cover every
@@ -245,9 +262,6 @@ type ReviewRunBase = Readonly<{
   head_sha: string;
   expected_agents: readonly [string, ...string[]];
   prior_finding_ids: readonly string[];
-  evidence: readonly ReviewRunEvidence[];
-  /** Present on engine-owned Wave runs; ordered exactly like expected_agents. */
-  slot_authority?: readonly [ReviewRunSlotAuthority, ...ReviewRunSlotAuthority[]];
 }>;
 
 type ReviewRunWorkspaceAuthority =
@@ -266,7 +280,17 @@ type ReviewRunWorkspaceAuthority =
     }>;
 
 /** Workspace authority is either wholly absent on an unbound/legacy run or complete. */
-export type ReviewRun = Readonly<ReviewRunBase & ReviewRunWorkspaceAuthority>;
+export type LegacyReviewRun = Readonly<ReviewRunBase & ReviewRunWorkspaceAuthority & {
+  reviewer_protocol?: never;
+  evidence: readonly LegacyReviewRunEvidence[];
+  slot_authority?: readonly [LegacyReviewRunSlotAuthority, ...LegacyReviewRunSlotAuthority[]];
+}>;
+export type CurrentReviewRun = Readonly<ReviewRunBase & Extract<ReviewRunWorkspaceAuthority, { workspace_scope: readonly string[] }> & {
+  reviewer_protocol: ReviewerProtocolDescriptor;
+  evidence: readonly CurrentReviewRunEvidence[];
+  slot_authority: readonly [CurrentReviewRunSlotAuthority, ...CurrentReviewRunSlotAuthority[]];
+}>;
+export type ReviewRun = LegacyReviewRun | CurrentReviewRun;
 
 type AcceptedReviewAuthorityBase = Readonly<{
   generation: number;
@@ -283,7 +307,13 @@ type AcceptedReviewRunAuthority =
  * for completion integrity and completed-Wave reopening; graph summaries are
  * never substituted for it. Run authority is either wholly absent for legacy
  * evidence or complete, so a partially bound accepted run is unrepresentable. */
-export type AcceptedReviewAuthority = Readonly<AcceptedReviewAuthorityBase & AcceptedReviewRunAuthority>;
+export type LegacyAcceptedReviewAuthority = Readonly<AcceptedReviewAuthorityBase & AcceptedReviewRunAuthority & { reviewer_protocol?: never }>;
+export type CurrentAcceptedReviewAuthority = Readonly<AcceptedReviewAuthorityBase & {
+  run_id: string;
+  authority_digest: string;
+  reviewer_protocol: ReviewerProtocolDescriptor;
+}>;
+export type AcceptedReviewAuthority = LegacyAcceptedReviewAuthority | CurrentAcceptedReviewAuthority;
 
 export interface FindingResolutionAssessment extends PriorFindingAssessment {
   readonly agent: string;

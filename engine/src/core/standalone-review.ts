@@ -40,13 +40,15 @@ import {
   type LlmProfileId,
   type LoomAgentName,
 } from "./model-profiles";
-import { attributeFindings, findingsUnionError, parseStoredFindings, type Finding, type RefutedFinding } from "./findings";
+import { reviewFindingCounts, attributeFindings, findingsUnionError, parseStoredFindings, type Finding, type RefutedFinding } from "./findings";
 import { fail, isRecord, ok, sanitizeProse, type ParseResult } from "./panel-kernel";
-import { resolveReviewFindings, type ParsedFindings } from "./review-output";
+import { resolveReviewFindings, parseReviewerEvidence as parseIssuedReviewerEvidence, type ParsedFindings, type IssuedStandaloneReviewerProtocol, type ReviewerProtocolAuthorityResolver } from "./review-output";
 import { parseReviewPath, type ReviewPath } from "./review-packet";
 import { compareStrings } from "./ordering";
+import { projectFindingForPanel, type BriefFinding } from "./review-panel";
 
-export const STANDALONE_REVIEW_SUBJECT = "standalone-review" as const;
+import { STANDALONE_REVIEW_SUBJECT, CURRENT_REVIEWER_PROTOCOL, parseReviewerProtocolDescriptor, type ReviewerProtocolDescriptor } from "./reviewer-contract";
+export { STANDALONE_REVIEW_SUBJECT } from "./reviewer-contract";
 
 export const STANDALONE_REVIEWER_ROLES = Object.freeze([
   "code-reviewer",
@@ -64,17 +66,17 @@ export const STANDALONE_REVIEW_KINDS = Object.freeze([
 ] as const);
 export type StandaloneReviewKind = (typeof STANDALONE_REVIEW_KINDS)[number];
 
-export interface StandaloneReviewMetadata {
-  readonly requestedKinds: NonEmpty<StandaloneReviewKind>;
-  readonly docsOnly: boolean;
-  readonly sourceOrTestChanged: boolean;
-  readonly typesChanged: boolean;
-  readonly commentsChanged: boolean;
+export type StandaloneReviewMetadata = (
+  | Readonly<{ docsOnly: true; sourceOrTestChanged: false; commentsChanged: true }>
+  | Readonly<{ docsOnly: false; sourceOrTestChanged: boolean; commentsChanged: boolean }>
+) & Readonly<{
+  requestedKinds: NonEmpty<StandaloneReviewKind>;
+  typesChanged: boolean;
   readonly additions: number;
   readonly fileCount: number;
   readonly newStructure: boolean;
   readonly languages: readonly string[];
-}
+}>;
 
 export interface StandaloneChangedPaths {
   /**
@@ -97,8 +99,11 @@ export type StandaloneScopeSafety = Readonly<{
 }>;
 
 /** Complete immutable authority produced before any reviewer is spawnable. */
-export interface FrozenStandaloneReviewAuthority {
-  readonly schemaVersion: 1;
+type StandaloneReviewProtocol =
+  | Readonly<{ schemaVersion: 1; reviewerProtocol?: never }>
+  | Readonly<{ schemaVersion: 2; reviewerProtocol: ReviewerProtocolDescriptor }>;
+
+export type FrozenStandaloneReviewAuthority = StandaloneReviewProtocol & Readonly<{
   readonly kind: "standalone-review-authority";
   readonly runId: OrchestrationRunId;
   readonly scopeSource: StandaloneScopeSource;
@@ -108,7 +113,7 @@ export interface FrozenStandaloneReviewAuthority {
   readonly reviewMetadata: StandaloneReviewMetadata;
   readonly reviewers: NonEmpty<StandaloneReviewerRole>;
   readonly roster: ExactRoster<AgentRosterSlot>;
-}
+}>;
 
 export interface PreparedStandaloneReview {
   readonly authority: FrozenStandaloneReviewAuthority;
@@ -289,10 +294,10 @@ function parseReviewMetadata(raw: unknown): ParseResult<StandaloneReviewMetadata
     ? fail(errors)
     : ok(Object.freeze({
         requestedKinds: nonEmptyKinds,
-        docsOnly,
-        sourceOrTestChanged,
+        ...(docsOnly
+          ? { docsOnly: true as const, sourceOrTestChanged: false as const, commentsChanged: true as const }
+          : { docsOnly: false as const, sourceOrTestChanged, commentsChanged }),
         typesChanged,
-        commentsChanged,
         additions,
         fileCount,
         newStructure,
@@ -514,15 +519,17 @@ export function prepareFreshStandaloneReview(
       ? authorityErrors
       : ["cannot resolve deterministic reviewer model/context authority"]);
   }
-  return prepareStandaloneReview({
-    ...input,
-    roster,
-  });
+  const prepared = prepareStandaloneReview({ ...input, roster });
+  return prepared.ok ? resultOk(Object.freeze({
+    authority: Object.freeze({ ...prepared.value.authority, schemaVersion: 2, reviewerProtocol: CURRENT_REVIEWER_PROTOCOL }),
+    initialRequests: prepared.value.initialRequests,
+  })) : prepared;
 }
 
 export function serializeStandaloneReviewAuthority(authority: FrozenStandaloneReviewAuthority): string {
   return JSON.stringify({
     schema_version: authority.schemaVersion,
+    ...(authority.schemaVersion === 2 ? { reviewer_protocol: authority.reviewerProtocol } : {}),
     kind: authority.kind,
     run_id: authority.runId,
     scope_source: authority.scopeSource,
@@ -557,8 +564,10 @@ export function parseStandaloneReviewAuthority(raw: unknown): ParseResult<Frozen
     "schema_version", "kind", "run_id", "scope_source", "scope", "scope_safety",
     "changed_paths", "review_metadata", "reviewers", "roster",
   ] as const;
-  const errors = exactKeys(raw, allowed, "standalone review authority");
-  if (raw.schema_version !== 1) errors.push("standalone review authority.schema_version must be 1");
+  const errors = exactKeys(raw, raw.schema_version === 2 ? [...allowed, "reviewer_protocol"] : allowed, "standalone review authority");
+  if (raw.schema_version !== 1 && raw.schema_version !== 2) errors.push("standalone review authority.schema_version must be 1 or 2");
+  const descriptor = raw.schema_version === 2 ? parseReviewerProtocolDescriptor(raw.reviewer_protocol) : null;
+  if (descriptor !== null && !descriptor.ok) errors.push(descriptor.error.message);
   if (raw.kind !== "standalone-review-authority") errors.push("standalone review authority.kind is invalid");
   if (raw.scope_source !== "explicit" && raw.scope_source !== "changed-path-union") {
     errors.push("standalone review authority.scope_source is invalid");
@@ -581,7 +590,10 @@ export function parseStandaloneReviewAuthority(raw: unknown): ParseResult<Frozen
       errors.push("standalone review authority reviewers do not match deterministic selection");
     }
   }
-  return errors.length > 0 || !prepared.ok ? fail(errors) : ok(prepared.value.authority);
+  if (errors.length > 0 || !prepared.ok) return fail(errors);
+  return descriptor !== null && descriptor.ok
+    ? ok(Object.freeze({ ...prepared.value.authority, schemaVersion: 2, reviewerProtocol: descriptor.value }))
+    : ok(prepared.value.authority);
 }
 
 export interface RawReviewerBytes {
@@ -744,8 +756,10 @@ export type StandaloneRosterCompletionProof = StandaloneRosterCompletionMembersh
 }>;
 
 const standaloneRosterCompletionCache = new WeakMap<object, Readonly<{
-  authorityRoster: ExactRoster<AgentRosterSlot>;
+  authority: FrozenStandaloneReviewAuthority;
+  authoritySerialization: string;
   roster: CompleteRoster<AcceptedAgentResult<CapturedReviewerResult>>;
+  findings: readonly ParsedFindings[];
 }>>();
 
 /** The sole T4 constructor for roster-completion authority. */
@@ -753,6 +767,7 @@ export function proveStandaloneRosterCompletion(
   authority: FrozenStandaloneReviewAuthority,
   resolver: PublicationAuthorityResolver,
   rawResults: unknown,
+  reviewerProtocols: ReviewerProtocolAuthorityResolver,
 ): DomainResult<StandaloneRosterCompletionProof, CompleteRosterError> {
   const reparsed = parseCompleteRoster(
     resolver,
@@ -761,6 +776,21 @@ export function proveStandaloneRosterCompletion(
     parseCapturedReviewerResult,
   );
   if (!reparsed.ok) return reparsed;
+  const findings: ParsedFindings[] = [];
+  for (const result of reparsed.value.ordered) {
+    const protocol = reviewerProtocols(result.authority);
+    if (!protocol.ok || protocol.value.subject.kind !== "standalone-review" ||
+        protocol.value.protocolVersion !== authority.schemaVersion ||
+        !sameAgentRequestAuthority(protocol.value.request, result.authority) ||
+        JSON.stringify(protocol.value.subject.scope) !== JSON.stringify(authority.scope) ||
+        protocol.value.subject.runId !== authority.runId ||
+        JSON.stringify(protocol.value.reviewerProtocol) !== JSON.stringify(authority.reviewerProtocol)) {
+      return completionProtocolFailure("reviewer protocol does not match the exact frozen standalone request", findings.length);
+    }
+    const admission = admitStandaloneTranscript(protocol.value as IssuedStandaloneReviewerProtocol, Buffer.from(result.value.rawBytes.data, "base64"));
+    if (!admission.ok) return completionProtocolFailure(admission.problems.join("; "), findings.length);
+    findings.push(admission.findings);
+  }
   const [firstResult, ...otherResults] = reparsed.value.ordered;
   const toEntry = (result: AcceptedAgentResult<CapturedReviewerResult>): ProvenStandaloneRosterEntry => Object.freeze({
     slotId: result.authority.slotId,
@@ -782,8 +812,10 @@ export function proveStandaloneRosterCompletion(
     results: Object.freeze([firstResult, ...otherResults]) as NonEmpty<AcceptedAgentResult<CapturedReviewerResult>>,
   }) as StandaloneRosterCompletionProof;
   standaloneRosterCompletionCache.set(proof, canonicalRecord({
-    authorityRoster: authority.roster,
+    authority,
+    authoritySerialization: serializeStandaloneReviewAuthority(authority),
     roster: reparsed.value,
+    findings: Object.freeze(findings),
   }));
   return resultOk(proof);
 }
@@ -796,6 +828,7 @@ export function parseStandaloneRosterCompletionProof(
   authority: FrozenStandaloneReviewAuthority,
   resolver: PublicationAuthorityResolver,
   raw: unknown,
+  reviewerProtocols: ReviewerProtocolAuthorityResolver,
 ): DomainResult<StandaloneRosterCompletionProof, CompleteRosterError> {
   const malformedPersistedCompletion = (message: string): DomainResult<never, CompleteRosterError> =>
     resultFail(canonicalRecord({
@@ -814,7 +847,7 @@ export function parseStandaloneRosterCompletionProof(
       "persisted standalone roster completion must contain the canonical schema, run authority, and durable result roster",
     );
   }
-  const reproved = proveStandaloneRosterCompletion(authority, resolver, raw.results);
+  const reproved = proveStandaloneRosterCompletion(authority, resolver, raw.results, reviewerProtocols);
   if (!reproved.ok) return reproved;
   if (raw.rosterDigest !== reproved.value.rosterDigest ||
       JSON.stringify(raw.accepted) !== JSON.stringify(reproved.value.accepted)) {
@@ -825,18 +858,25 @@ export function parseStandaloneRosterCompletionProof(
   return reproved;
 }
 
+function completionProtocolFailure(message: string, index: number): DomainResult<never, CompleteRosterError> {
+  return resultFail(canonicalRecord({ kind: "incomplete-or-invalid-roster", violations: Object.freeze([
+    canonicalRecord({ kind: "malformed-result-boundary", field: null, index, reason: "unsafe-inspection", message }),
+  ]) as CompleteRosterError["violations"] }));
+}
+
 function resolveStandaloneRosterCompletion(
   authority: FrozenStandaloneReviewAuthority,
   proof: StandaloneRosterCompletionProof,
-): DomainResult<CompleteRoster<AcceptedAgentResult<CapturedReviewerResult>>, SemanticPayloadParseError> {
+): DomainResult<Readonly<{ roster: CompleteRoster<AcceptedAgentResult<CapturedReviewerResult>>; findings: readonly ParsedFindings[] }>, SemanticPayloadParseError> {
   const cached = typeof proof === "object" && proof !== null
     ? standaloneRosterCompletionCache.get(proof)
     : undefined;
-  if (cached === undefined || cached.authorityRoster !== authority.roster || proof.runId !== authority.runId ||
+  if (cached === undefined || cached.authority !== authority || proof.runId !== authority.runId ||
+      cached.authoritySerialization !== serializeStandaloneReviewAuthority(authority) ||
       proof.rosterDigest !== canonicalDigest(proof.accepted) || !Array.isArray(proof.results)) {
     return resultFail({ message: "standalone aggregation requires the exact opaque roster-completion proof minted for this frozen authority" });
   }
-  return resultOk(cached.roster);
+  return resultOk(cached);
 }
 
 export type StandaloneCaptureError = Readonly<{
@@ -1015,14 +1055,13 @@ export function completeStandaloneReviewerCapture(
   return accepted.ok ? resultOk(accepted.value) : captureFailure(accepted.error.message);
 }
 
-export interface StandaloneReviewAggregate {
-  readonly schemaVersion: 1;
+export type StandaloneReviewAggregate = StandaloneReviewProtocol & Readonly<{
   readonly runId: string;
   readonly subjectId: typeof STANDALONE_REVIEW_SUBJECT;
   readonly scope: readonly string[];
   readonly reviewerEvidence: readonly StandaloneReviewerEvidence[];
   readonly findings: readonly Finding[];
-}
+}>;
 
 export type StandaloneReviewState =
   | Readonly<{ kind: "clean"; aggregate: StandaloneReviewAggregate }>
@@ -1079,7 +1118,10 @@ export function canonicalStandalonePanelOutcomes(panel: ParsedPanelOutcomes): Pa
       }));
 }
 
-export type StandalonePanelFindingAuthority = Readonly<{
+export type StandalonePanelFindingAuthority = Extract<BriefFinding, { protocolVersion: 2 }> | Readonly<{
+  protocolVersion?: never;
+  basis?: never;
+  reason?: never;
   id: string;
   taskId: typeof STANDALONE_REVIEW_SUBJECT;
   agent: string;
@@ -1095,7 +1137,7 @@ export type StandalonePanelFindingAuthority = Readonly<{
  * parser-produced completed panel receipt before it can leave refutation.
  */
 export type FrozenStandalonePanelAuthority = Readonly<{
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   kind: "frozen-standalone-panel-authority";
   standaloneRunId: OrchestrationRunId;
   panelRunId: OrchestrationRunId;
@@ -1121,8 +1163,7 @@ export interface FreezeStandalonePanelAuthorityInput {
   readonly threshold: unknown;
 }
 
-export interface AdjudicatedStandaloneReview {
-  readonly schemaVersion: 1;
+export type AdjudicatedStandaloneReview = StandaloneReviewProtocol & Readonly<{
   readonly runId: string;
   readonly scope: readonly string[];
   readonly reviewerEvidence: readonly StandaloneReviewerEvidence[];
@@ -1130,7 +1171,7 @@ export interface AdjudicatedStandaloneReview {
   readonly advisories: readonly Finding[];
   readonly refutedCriticals: readonly RefutedFinding[];
   readonly panel: ParsedPanelOutcomes | null;
-}
+}>;
 
 export function findingScopeErrors(scope: readonly string[], findings: readonly Pick<Finding, "file">[], label: string): readonly string[] {
   const allowed = new Set(scope);
@@ -1158,6 +1199,28 @@ export type StandaloneTranscriptAdmission =
  * notice (the parse it admitted and the parse it trusted are the same call).
  */
 export function admitStandaloneTranscript(
+  authority: IssuedStandaloneReviewerProtocol,
+  rawBytes: Uint8Array,
+): StandaloneTranscriptAdmission {
+  const parsed = parseIssuedReviewerEvidence(authority, rawBytes);
+  if ((!parsed.ok && parsed.error.code !== "authority-unavailable") || parsed.ok) {
+    if (authority.protocolVersion === 1 && authority.subject.kind === "standalone-review") {
+      let text: string;
+      try { text = new TextDecoder("utf-8", { fatal: true }).decode(rawBytes); }
+      catch { return Object.freeze({ ok: false, problems: Object.freeze([`${authority.request.role}: transcript is not valid UTF-8`]) }); }
+      // Preserve historical rejection diagnostics; admitted evidence is never parsed a second time.
+      if (!parsed.ok) {
+        const historical = admitLegacyStandaloneTranscript(authority.subject.scope, text, authority.request.role);
+        if (!historical.ok) return historical;
+      }
+    }
+  }
+  if (parsed.ok && parsed.value.kind === "standalone-review") return Object.freeze({ ok: true, findings: parsed.value.findings });
+  return Object.freeze({ ok: false, problems: Object.freeze([parsed.ok ? "standalone reviewer authority required" : parsed.error.message]) });
+}
+
+/** Historical archive only; registered completion always consumes issued protocol authority. */
+function admitLegacyStandaloneTranscript(
   scope: readonly string[],
   output: string,
   agent: string,
@@ -1180,7 +1243,7 @@ export function aggregateCanonicalTranscripts(
   const errors: string[] = [];
   const findings: Finding[] = [];
   for (const transcript of transcripts) {
-    const admission = admitStandaloneTranscript(scope, transcript.output, transcript.agent);
+    const admission = admitLegacyStandaloneTranscript(scope, transcript.output, transcript.agent);
     if (!admission.ok) {
       errors.push(...admission.problems);
       continue;
@@ -1209,18 +1272,10 @@ export function aggregateCanonicalTranscripts(
       }));
 }
 
-/**
- * Canonical aggregation accepts only T4's opaque completion proof, minted by
- * re-running T1 parsing with independent publication registration authority.
- */
-export function aggregateStandaloneReview(input: {
-  readonly authority: FrozenStandaloneReviewAuthority;
-  readonly completion: StandaloneRosterCompletionProof;
-}): ParseResult<StandaloneReviewState> {
-  const { authority } = input;
-  const resolved = resolveStandaloneRosterCompletion(authority, input.completion);
-  if (!resolved.ok) return fail([resolved.error.message]);
-  const roster = resolved.value;
+function standaloneReviewerEvidence(
+  authority: FrozenStandaloneReviewAuthority,
+  roster: CompleteRoster<AcceptedAgentResult<CapturedReviewerResult>>,
+): ParseResult<readonly Readonly<{ agent: StandaloneReviewerRole; evidence: StandaloneReviewerEvidence }>[]> {
   const errors: string[] = [];
   if (roster.ordered.length !== authority.roster.orderedSlots.length) {
     errors.push("complete reviewer roster length does not match frozen authority");
@@ -1253,11 +1308,6 @@ export function aggregateStandaloneReview(input: {
       errors.push(`reviewer result ${index}: ${parsed.error.message}`);
       return [];
     }
-    const output = decodeCapturedReviewerText(parsed.value);
-    if (!output.ok) {
-      errors.push(`reviewer result ${index}: ${output.error.message}`);
-      return [];
-    }
     const evidence: StandaloneReviewerEvidence = Object.freeze({
       authorityKind: "request-bound",
       agent: canonical.role as StandaloneReviewerRole,
@@ -1268,15 +1318,43 @@ export function aggregateStandaloneReview(input: {
       contextDigest: canonical.contextDigest,
       artifact: parsed.value.artifact,
     });
-    return [{ agent: canonical.role as StandaloneReviewerRole, output: output.value, evidence }];
+    return [{ agent: canonical.role as StandaloneReviewerRole, evidence }];
   });
-  if (errors.length > 0) return fail(errors);
-  return aggregateCanonicalTranscripts(authority.runId, authority.scope, transcripts);
+  return errors.length > 0 ? fail(errors) : ok(Object.freeze(transcripts));
+}
+
+/** Canonical aggregation consumes only the exact opaque completion proof and its cached admission. */
+export function aggregateStandaloneReview(input: {
+  readonly authority: FrozenStandaloneReviewAuthority;
+  readonly completion: StandaloneRosterCompletionProof;
+}): ParseResult<StandaloneReviewState> {
+  const { authority } = input;
+  const resolved = resolveStandaloneRosterCompletion(authority, input.completion);
+  if (!resolved.ok) return fail([resolved.error.message]);
+  const evidence = standaloneReviewerEvidence(authority, resolved.value.roster);
+  if (!evidence.ok) return evidence;
+  const transcripts = evidence.value;
+  const findings = Object.freeze(transcripts.flatMap(({ agent }, index) => attributeFindings(resolved.value.findings[index]!.drafts, agent)));
+  if (new Set(findings.map(({ id }) => id)).size !== findings.length) return fail(["attributed standalone finding ids must be distinct across review agents"]);
+  const aggregate: StandaloneReviewAggregate = Object.freeze({
+    ...standaloneProtocol(authority), runId: authority.runId, subjectId: STANDALONE_REVIEW_SUBJECT,
+    scope: authority.scope, reviewerEvidence: Object.freeze(transcripts.map(({ evidence }) => evidence)), findings,
+  });
+  const [head, ...tail] = findings.filter(({ severity }) => severity === "critical");
+  return head === undefined ? ok(Object.freeze({ kind: "clean", aggregate }))
+    : ok(Object.freeze({ kind: "requires-refutation", aggregate, criticals: Object.freeze([head, ...tail]) as NonEmpty<Finding> }));
+}
+
+function standaloneProtocol(value: StandaloneReviewProtocol): StandaloneReviewProtocol {
+  return value.schemaVersion === 2
+    ? Object.freeze({ schemaVersion: 2, reviewerProtocol: value.reviewerProtocol })
+    : Object.freeze({ schemaVersion: 1 });
 }
 
 export function serializeStandaloneAggregate(aggregate: StandaloneReviewAggregate): string {
   return JSON.stringify({
     schema_version: aggregate.schemaVersion,
+    ...(aggregate.schemaVersion === 2 ? { reviewer_protocol: aggregate.reviewerProtocol } : {}),
     run_id: aggregate.runId,
     subject_id: aggregate.subjectId,
     scope: aggregate.scope,
@@ -1355,10 +1433,12 @@ export function parseStandaloneAggregate(raw: unknown): ParseResult<StandaloneRe
   // against the correct list anyway.
   const errors = exactKeys(
     raw,
-    ["schema_version", "run_id", "subject_id", "scope", "reviewer_evidence", "findings"],
+    ["schema_version", "run_id", "subject_id", "scope", "reviewer_evidence", "findings", ...(raw.schema_version === 2 ? ["reviewer_protocol"] : [])],
     "aggregate",
-  ).filter((error) => error !== "aggregate.reviewer_evidence is required");
-  if (raw.schema_version !== 1) errors.push("aggregate.schema_version must be 1");
+  ).filter((error) => raw.schema_version !== 1 || error !== "aggregate.reviewer_evidence is required");
+  if (raw.schema_version !== 1 && raw.schema_version !== 2) errors.push("aggregate.schema_version must be 1 or 2");
+  const descriptor = raw.schema_version === 2 ? parseReviewerProtocolDescriptor(raw.reviewer_protocol) : null;
+  if (descriptor !== null && !descriptor.ok) errors.push(descriptor.error.message);
   const runId = typeof raw.run_id === "string" ? raw.run_id.trim() : "";
   if (runId === "") errors.push("aggregate.run_id must be non-empty");
   if (raw.subject_id !== STANDALONE_REVIEW_SUBJECT) errors.push(`aggregate.subject_id must be '${STANDALONE_REVIEW_SUBJECT}'`);
@@ -1368,6 +1448,9 @@ export function parseStandaloneAggregate(raw: unknown): ParseResult<StandaloneRe
   const findingError = findingsUnionError(raw.findings, "aggregate.findings");
   if (findingError !== null) errors.push(findingError);
   const findings = parseStoredFindings(raw.findings);
+  if (findings.some((finding) => (finding.protocolVersion === 2) !== (raw.schema_version === 2))) {
+    errors.push("aggregate Finding protocol differs from aggregate authority");
+  }
   if (scope.ok) errors.push(...findingScopeErrors(scope.value, findings, "aggregate.findings"));
   const ids = findings.map(({ id }) => id);
   if (new Set(ids).size !== ids.length) errors.push("aggregate finding ids must be distinct");
@@ -1375,7 +1458,10 @@ export function parseStandaloneAggregate(raw: unknown): ParseResult<StandaloneRe
   if (!evidence.ok) errors.push(...evidence.errors);
   return errors.length > 0 || !scope.ok || !evidence.ok
     ? fail(errors)
-    : ok(Object.freeze({ schemaVersion: 1, runId, subjectId: STANDALONE_REVIEW_SUBJECT, scope: scope.value, reviewerEvidence: evidence.value, findings }));
+    : ok(Object.freeze({
+        ...(descriptor !== null && descriptor.ok ? { schemaVersion: 2 as const, reviewerProtocol: descriptor.value } : { schemaVersion: 1 as const }),
+        runId, subjectId: STANDALONE_REVIEW_SUBJECT, scope: scope.value, reviewerEvidence: evidence.value, findings,
+      }));
 }
 
 function parseStringArray(raw: unknown, path: string, errors: string[]): readonly string[] {
@@ -1391,7 +1477,13 @@ const UNUSABLE_PANEL_CLAIM = "(finding text was unusable after sanitization — 
 export function canonicalStandalonePanelFindingAuthority(
   criticals: readonly Finding[],
 ): readonly StandalonePanelFindingAuthority[] {
-  return Object.freeze(criticals.map((finding) => Object.freeze({
+  return Object.freeze(criticals.map((finding): StandalonePanelFindingAuthority => {
+    if (finding.protocolVersion === 2) {
+      const projected = projectFindingForPanel(STANDALONE_REVIEW_SUBJECT, finding);
+      if (projected.protocolVersion !== 2) throw new Error("current panel projection lost its protocol invariant");
+      return projected;
+    }
+    return Object.freeze({
     id: `${STANDALONE_REVIEW_SUBJECT}:${finding.id}`,
     taskId: STANDALONE_REVIEW_SUBJECT,
     agent: sanitizeProse(finding.agent),
@@ -1402,7 +1494,8 @@ export function canonicalStandalonePanelFindingAuthority(
     file: finding.file === null ? null : sanitizeProse(finding.file) || null,
     line: finding.line,
     claim: sanitizeProse(finding.claim) || UNUSABLE_PANEL_CLAIM,
-  })));
+    });
+  }));
 }
 
 export function canonicalStandalonePanelFindings(
@@ -1461,7 +1554,7 @@ export function freezeStandalonePanelAuthority(
     }));
   }
   const authority = canonicalRecord({
-    schemaVersion: 1 as const,
+    schemaVersion: input.aggregate.schemaVersion,
     kind: "frozen-standalone-panel-authority" as const,
     standaloneRunId: standaloneRunId.value,
     panelRunId: panelRunId.value,
@@ -1479,7 +1572,7 @@ export function parseFrozenStandalonePanelAuthority(
   raw: unknown,
   aggregate: StandaloneReviewAggregate,
 ): DomainResult<FrozenStandalonePanelAuthority, StandalonePanelAuthorityError> {
-  if (!isRecord(raw) || raw.schemaVersion !== 1 || raw.kind !== "frozen-standalone-panel-authority") {
+  if (!isRecord(raw) || raw.schemaVersion !== aggregate.schemaVersion || raw.kind !== "frozen-standalone-panel-authority") {
     return resultFail(canonicalRecord({
       kind: "standalone-panel-authority-rejected" as const,
       message: "persisted standalone panel authority is malformed",
@@ -1548,7 +1641,8 @@ export function parseStandalonePanelOutcomes(
     const finding = expected.get(findingId);
     if (entry.task_id !== STANDALONE_REVIEW_SUBJECT) errors.push(`${path}.task_id must be '${STANDALONE_REVIEW_SUBJECT}'`);
     if (!finding) errors.push(`${path}.finding_id is not an expected critical: ${findingId || "<empty>"}`);
-    const claim = typeof entry.claim === "string" ? entry.claim.trim() : "";
+    let claim = typeof entry.claim === "string" ? entry.claim : "";
+    if (finding?.protocolVersion !== 2) claim = claim.trim();
     const expectedPanelClaim = expectedPanelClaims.get(findingId);
     if (finding && expectedPanelClaim !== undefined && claim !== expectedPanelClaim) errors.push(`${path}.claim does not match canonical panel finding ${findingId}`);
     if (typeof entry.survives !== "boolean") errors.push(`${path}.survives must be boolean`);
@@ -1592,7 +1686,7 @@ export function finalizeStandaloneReview(
   if (criticals.length === 0) {
     return panel === null
       ? ok(Object.freeze({
-          schemaVersion: 1,
+          ...standaloneProtocol(aggregate),
           runId: aggregate.runId,
           scope: Object.freeze([...aggregate.scope]),
           reviewerEvidence: Object.freeze([...aggregate.reviewerEvidence]),
@@ -1619,7 +1713,7 @@ export function finalizeStandaloneReview(
     }));
   }
   return ok(Object.freeze({
-    schemaVersion: 1,
+    ...standaloneProtocol(aggregate),
     runId: aggregate.runId,
     scope: Object.freeze([...aggregate.scope]),
     reviewerEvidence: Object.freeze([...aggregate.reviewerEvidence]),
@@ -1633,6 +1727,7 @@ export function finalizeStandaloneReview(
 export function serializeAdjudicatedStandaloneReview(result: AdjudicatedStandaloneReview): string {
   return JSON.stringify({
     schema_version: result.schemaVersion,
+    ...(result.schemaVersion === 2 ? { reviewer_protocol: result.reviewerProtocol } : {}),
     run_id: result.runId,
     subject_id: STANDALONE_REVIEW_SUBJECT,
     scope: result.scope,
@@ -1669,7 +1764,7 @@ export function serializeAdjudicatedStandaloneReview(result: AdjudicatedStandalo
 }
 
 /** Legacy helper output stays explicitly unversioned and never claims v1 authority. */
-export function serializeHistoricalAdjudicatedStandaloneReview(result: AdjudicatedStandaloneReview): string {
+export function serializeHistoricalAdjudicatedStandaloneReview(result: Extract<AdjudicatedStandaloneReview, { schemaVersion: 1 }>): string {
   const versioned = JSON.parse(serializeAdjudicatedStandaloneReview(result)) as Record<string, unknown>;
   const {
     schema_version: _schemaVersion,
@@ -1678,6 +1773,34 @@ export function serializeHistoricalAdjudicatedStandaloneReview(result: Adjudicat
     ...historical
   } = versioned;
   return JSON.stringify(historical, null, 2);
+}
+
+function summaryData(value: unknown): string {
+  return JSON.stringify(value).replace(/[&<>|`]/g, (character) => `&#${character.codePointAt(0)};`)
+    .replace(/[\p{Cc}\p{Cf}]/gu, (character) => `\\u{${character.codePointAt(0)!.toString(16)}}`)
+    .replace(/([*_\[\]\\])/g, "\\$1");
+}
+
+/** Human read model only: emitted and surviving counts have distinct, derived meanings. */
+export function renderStandaloneReviewSummary(result: AdjudicatedStandaloneReview): string {
+  const rows = [
+    ...result.survivingCriticals.map((finding) => ({ disposition: "surviving", finding })),
+    ...result.refutedCriticals.map(({ finding }) => ({ disposition: "refuted", finding })),
+    ...result.advisories.map((finding) => ({ disposition: "advisory", finding })),
+  ];
+  const counts = reviewFindingCounts(rows.map(({ finding }) => finding));
+  return [
+    `Emitted/admitted: ${counts.critical} critical; ${counts.advisory} advisory.`,
+    `After refutation: ${result.survivingCriticals.length} surviving critical; ${result.refutedCriticals.length} refuted critical; ${result.advisories.length} advisory.`,
+    "", "| Disposition | ID | Reviewer | Severity | Location | Claim |", "| --- | --- | --- | --- | --- | --- |",
+    ...rows.map(({ disposition, finding }) =>
+      `| ${disposition} | ${summaryData(finding.id)} | ${summaryData(finding.agent)} | ${finding.severity} | ${summaryData({ file: finding.file, line: finding.line })} | ${summaryData(finding.claim)} |`),
+    "",
+    ...rows.flatMap(({ finding }) => finding.protocolVersion !== 2 ? [] : [
+      `${summaryData(finding.id)} detail: ${summaryData(finding.severity === "critical"
+        ? { basis: finding.basis } : { reason: finding.reason, ...(finding.basis === undefined ? {} : { basis: finding.basis }) })}`,
+    ]),
+  ].join("\n");
 }
 
 export const STANDALONE_RESULT_SLOT = "result.json" as const;

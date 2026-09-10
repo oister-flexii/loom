@@ -16,6 +16,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { canonicalTempDir } from "../../fixtures/canonical-temp-dir";
 import { afterEach, describe, expect, it } from "vitest";
+import { captureLoomRuntimeIdentity, PI_EXTENSION_RUNTIME_ROOT_ENV, PI_EXTENSION_RUNTIME_REVISION_ENV } from "../../../src/runtime-compatibility";
 import { readReviewPacketPostimage } from "../../../src/handlers/helpers/review-packet";
 
 const ENGINE = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -31,12 +32,38 @@ const productionTypeScriptFiles = (root: string): readonly string[] => readdirSy
   return entry.endsWith(".ts") || entry.endsWith(".tsx") ? [path] : [];
 });
 
-function cli(args: string[], stdin = "", env: Record<string, string> = {}): string {
-  return execFileSync("bun", [CLI, ...args], {
-    cwd: ROOT,
+const runtime = captureLoomRuntimeIdentity(ROOT);
+function admittedEnv(): NodeJS.ProcessEnv {
+  return { ...process.env, PI_CODING_AGENT: "true", [PI_EXTENSION_RUNTIME_ROOT_ENV]: runtime.packageRoot,
+    [PI_EXTENSION_RUNTIME_REVISION_ENV]: runtime.revision };
+}
+function disposableDirectory(): string {
+  const root = canonicalTempDir("loom-quality-cli-");
+  cleanup.push(root);
+  return root;
+}
+function historicalCorpusRepository(): string {
+  const root = disposableDirectory();
+  execFileSync("git", ["clone", "--quiet", "--shared", "--no-checkout", ROOT, root]);
+  return root;
+}
+function reviewPacketRepository(): string {
+  const root = disposableDirectory();
+  for (const path of ["engine/src/core/model-profiles.ts", "engine/src/types.ts"]) {
+    mkdirSync(dirname(join(root, path)), { recursive: true });
+    writeFileSync(join(root, path), readFileSync(join(ROOT, path)));
+  }
+  for (const args of [["init", "-q"], ["add", "."], ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture"]]) {
+    execFileSync("git", args, { cwd: root });
+  }
+  return root;
+}
+function cli(args: string[], stdin = "", env: Record<string, string> = {}, cwd = disposableDirectory()): string {
+  return execFileSync("bun", [CLI, ...args.map((arg) => arg === "agents" || arg === "calibration/corpus.json" ? join(ROOT, arg) : arg)], {
+    cwd,
     input: stdin,
     encoding: "utf-8",
-    env: { ...process.env, ...env },
+    env: { ...admittedEnv(), LOOM_STATE_PATH: join(cwd, "state.json"), ...env },
   });
 }
 
@@ -123,7 +150,7 @@ function hostileReviewPacketRepository(
   ], {
     cwd: root,
     encoding: "utf8",
-    env: { ...process.env, LOOM_STATE_PATH: state },
+    env: { ...admittedEnv(), LOOM_STATE_PATH: state },
   });
   return { root, marker, packet };
 }
@@ -136,6 +163,7 @@ describe("quality-program helper boundaries", () => {
       "applyWaveFacadeSubmission",
       "handleWaveReviewContext",
       "inspectRemediationFacade",
+      "inspectStandaloneFacade",
       "parseRegisteredFacadeProgram",
       "parseRemediationStartInput",
       "parseStandaloneStartInput",
@@ -149,6 +177,7 @@ describe("quality-program helper boundaries", () => {
       "resumeRemediationFacade",
       "resumeStandaloneFacade",
       "resumeWaveGateFacade",
+      "reviewerProtocolResolver",
       "startRemediationFacade",
       "startStandaloneFacade",
       "startWaveGateFacade",
@@ -205,7 +234,7 @@ describe("quality-program helper boundaries", () => {
     cleanup.push(piRoot);
     execFileSync("bash", [join(ROOT, "scripts", "sync-pi-agents.sh")], {
       cwd: ROOT,
-      env: { ...process.env, PI_CODING_AGENT_DIR: piRoot, ...routingIsolatedEnv(piRoot) },
+      env: { ...admittedEnv(), PI_CODING_AGENT_DIR: piRoot, ...routingIsolatedEnv(piRoot) },
       encoding: "utf-8",
     });
     const reviewer = readFileSync(join(piRoot, "agents", "code-reviewer.md"), "utf-8");
@@ -216,7 +245,7 @@ describe("quality-program helper boundaries", () => {
   });
 
   it("validates the committed historical corpus and refuses to call missing history green", () => {
-    expect(cli(["helper", "model-calibration", "validate", "--corpus", "calibration/corpus.json"]))
+    expect(cli(["helper", "model-calibration", "validate", "--corpus", "calibration/corpus.json"], "", {}, historicalCorpusRepository()))
       .toContain("Validated 8 calibration cases");
     const corpus = JSON.parse(readFileSync(join(ROOT, "calibration/corpus.json"), "utf-8")) as { cases: Array<{ id: string }> };
     const predictions = {
@@ -246,7 +275,7 @@ describe("quality-program helper boundaries", () => {
       "helper", "model-calibration", "prompt",
       "--corpus", "calibration/corpus.json",
       "--case", selected.id,
-    ]);
+    ], "", {}, historicalCorpusRepository());
 
     expect(prompt).toContain(`Review historical revision ${selected.revision} for critical correctness defects.`);
     expect(prompt).toContain("complete revision-derived changed-path scope");
@@ -305,9 +334,10 @@ describe("quality-program helper boundaries", () => {
   });
 
   it("creates and verifies a task-scoped review packet through the real CLI", () => {
-    const dir = mkdtempSync(join(ROOT, ".tmp-review-packet-test-"));
+    const root = reviewPacketRepository();
+    const dir = mkdtempSync(join(root, ".tmp-review-packet-test-"));
     cleanup.push(dir);
-    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf-8" }).trim();
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf-8" }).trim();
     const state = join(dir, "state.json");
     const packet = join(dir, "packet.json");
     writeReviewPacketTaskGraph(state, {
@@ -316,7 +346,7 @@ describe("quality-program helper boundaries", () => {
       // Pi and Claude tool APIs commonly record this as an absolute path.
       // The packet boundary must canonicalize it to the same repo-relative
       // identity as file_list instead of rejecting valid in-repo evidence.
-      files_modified: [join(ROOT, "engine/src/core/model-profiles.ts")],
+      files_modified: [join(root, "engine/src/core/model-profiles.ts")],
       review_status: "pending",
       review_generation: 1,
       // A pre-identity graph may carry only the derived views. Packet
@@ -330,7 +360,7 @@ describe("quality-program helper boundaries", () => {
     const id = cli(
       ["helper", "review-packet", "create", "--task", "T1", "--output", packet],
       "",
-      { LOOM_STATE_PATH: state },
+      { LOOM_STATE_PATH: state }, root,
     ).trim();
     expect(id).toMatch(/^[0-9a-f]{64}$/);
     const written = JSON.parse(readFileSync(packet, "utf-8"));
@@ -350,7 +380,7 @@ describe("quality-program helper boundaries", () => {
     expect(started.tasks[0].issued_review_packets).toEqual([{
       task_id: "T1",
       packet_id: id,
-      packet_path: relative(ROOT, packet),
+      packet_path: relative(root, packet),
       base_sha: head,
       head_sha: head,
       scope: ["engine/src/core/model-profiles.ts"],
@@ -365,7 +395,7 @@ describe("quality-program helper boundaries", () => {
       "type-design-analyzer",
       "comment-analyzer",
     ]);
-    expect(cli(["helper", "review-packet", "verify", "--packet", packet]).trim()).toBe(id);
+    expect(cli(["helper", "review-packet", "verify", "--packet", packet], "", {}, root).trim()).toBe(id);
   });
 
   it.each(["textconv", "external", "clean"] as const)(
@@ -405,7 +435,7 @@ describe("quality-program helper boundaries", () => {
 
     execFileSync("bun", [
       CLI, "helper", "review-packet", "create", "--task", "T1", "--output", ".claude/reviews/packet.json",
-    ], { cwd: root, encoding: "utf8", env: { ...process.env, LOOM_STATE_PATH: state } });
+    ], { cwd: root, encoding: "utf8", env: { ...admittedEnv(), LOOM_STATE_PATH: state } });
 
     expect(existsSync(marker)).toBe(false);
     const written = JSON.parse(readFileSync(packet, "utf8"));
@@ -443,7 +473,7 @@ describe("quality-program helper boundaries", () => {
     ], {
       cwd: root,
       encoding: "utf8",
-      env: { ...process.env, LOOM_STATE_PATH: state },
+      env: { ...admittedEnv(), LOOM_STATE_PATH: state },
     });
 
     expect(existsSync(sideEffect)).toBe(false);
@@ -485,7 +515,7 @@ describe("quality-program helper boundaries", () => {
     ], {
       cwd: root,
       encoding: "utf-8",
-      env: { ...process.env, LOOM_STATE_PATH: state },
+      env: { ...admittedEnv(), LOOM_STATE_PATH: state },
     }).trim();
     expect(id).toMatch(/^[0-9a-f]{64}$/);
     const written = JSON.parse(readFileSync(packet, "utf-8"));
@@ -497,13 +527,14 @@ describe("quality-program helper boundaries", () => {
   });
 
   it("preserves and byte-hashes a binary postimage through the real CLI", () => {
-    const dir = mkdtempSync(join(ROOT, ".tmp-review-packet-binary-test-"));
+    const root = reviewPacketRepository();
+    const dir = mkdtempSync(join(root, ".tmp-review-packet-binary-test-"));
     cleanup.push(dir);
-    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf-8" }).trim();
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf-8" }).trim();
     const state = join(dir, "state.json");
     const packet = join(dir, "packet.json");
     const image = join(dir, "icon.png");
-    const imagePath = relative(ROOT, image);
+    const imagePath = relative(root, image);
     const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0x00, 0x80]);
     writeFileSync(image, png);
     writeReviewPacketTaskGraph(state, {
@@ -516,7 +547,7 @@ describe("quality-program helper boundaries", () => {
     const id = cli(
       ["helper", "review-packet", "create", "--task", "T1", "--output", packet],
       "",
-      { LOOM_STATE_PATH: state },
+      { LOOM_STATE_PATH: state }, root,
     ).trim();
     const written = JSON.parse(readFileSync(packet, "utf-8"));
     const postimage = written.artifacts[0].postimage;
@@ -524,7 +555,7 @@ describe("quality-program helper boundaries", () => {
     expect(postimage.encoding).toBe("base64");
     expect(Buffer.from(postimage.content, "base64")).toEqual(png);
     expect(postimage.sha256).toBe(createHash("sha256").update(png).digest("hex"));
-    expect(cli(["helper", "review-packet", "verify", "--packet", packet]).trim()).toBe(id);
+    expect(cli(["helper", "review-packet", "verify", "--packet", packet], "", {}, root).trim()).toBe(id);
   });
 
   it("propagates a post-inspection artifact read fault instead of recording a deletion", () => {
@@ -541,18 +572,19 @@ describe("quality-program helper boundaries", () => {
   });
 
   it("rejects a scoped path that is neither tracked nor present", () => {
-    const dir = mkdtempSync(join(ROOT, ".tmp-review-packet-absent-test-"));
+    const root = reviewPacketRepository();
+    const dir = mkdtempSync(join(root, ".tmp-review-packet-absent-test-"));
     cleanup.push(dir);
     const state = join(dir, "state.json");
     const packet = join(dir, "packet.json");
     writeReviewPacketTaskGraph(state, {
-      start_sha: execFileSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf-8" }).trim(),
+      start_sha: execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf-8" }).trim(),
       file_list: ["definitely-not-present-review-packet.ts"],
       files_modified: [],
     });
 
     const run = spawnSync("bun", [CLI, "helper", "review-packet", "create", "--task", "T1", "--output", packet], {
-      cwd: ROOT, encoding: "utf-8", env: { ...process.env, LOOM_STATE_PATH: state },
+      cwd: root, encoding: "utf-8", env: { ...admittedEnv(), LOOM_STATE_PATH: state },
     });
     expect(run.status).not.toBe(0);
     expect(run.stderr).toContain("neither tracked nor present");
@@ -577,7 +609,7 @@ describe("quality-program helper boundaries", () => {
 
     const run = spawnSync("bun", [
       CLI, "helper", "review-packet", "create", "--task", "T1", "--output", ".claude/reviews/packet.json",
-    ], { cwd: root, encoding: "utf8", env: { ...process.env, LOOM_STATE_PATH: state } });
+    ], { cwd: root, encoding: "utf8", env: { ...admittedEnv(), LOOM_STATE_PATH: state } });
 
     expect(run.status).not.toBe(0);
     expect(run.stderr).toContain("no task start_sha or remote default branch");
@@ -601,7 +633,7 @@ describe("quality-program helper boundaries", () => {
 
     const run = spawnSync("bun", [
       CLI, "helper", "review-packet", "create", "--task", "T1", "--output", ".claude/reviews/packet.json",
-    ], { cwd: root, encoding: "utf8", env: { ...process.env, LOOM_STATE_PATH: state } });
+    ], { cwd: root, encoding: "utf8", env: { ...admittedEnv(), LOOM_STATE_PATH: state } });
 
     expect(run.status).not.toBe(0);
     expect(run.stderr).toContain("no task start_sha or remote default branch");
@@ -609,9 +641,10 @@ describe("quality-program helper boundaries", () => {
   });
 
   it("fails review-packet creation on an unexpected git probe error", () => {
-    const dir = mkdtempSync(join(ROOT, ".tmp-review-packet-git-failure-test-"));
+    const root = reviewPacketRepository();
+    const dir = mkdtempSync(join(root, ".tmp-review-packet-git-failure-test-"));
     cleanup.push(dir);
-    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf-8" }).trim();
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf-8" }).trim();
     const state = join(dir, "state.json");
     const packet = join(dir, "packet.json");
     writeReviewPacketTaskGraph(state, {
@@ -635,10 +668,10 @@ describe("quality-program helper boundaries", () => {
     ].join("\n"), { mode: 0o755 });
 
     const run = spawnSync("bun", [CLI, "helper", "review-packet", "create", "--task", "T1", "--output", packet], {
-      cwd: ROOT,
+      cwd: root,
       encoding: "utf-8",
       env: {
-        ...process.env,
+        ...admittedEnv(),
         LOOM_STATE_PATH: state,
         PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
       },
@@ -693,7 +726,7 @@ describe("quality-program helper boundaries", () => {
       cwd: root,
       encoding: "utf8",
       env: {
-        ...process.env,
+        ...admittedEnv(),
         LOOM_STATE_PATH: state,
         PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
       },
@@ -706,7 +739,8 @@ describe("quality-program helper boundaries", () => {
   });
 
   it("rejects external task paths instead of reading them into a review packet", () => {
-    const dir = mkdtempSync(join(ROOT, ".tmp-review-packet-outside-test-"));
+    const root = reviewPacketRepository();
+    const dir = mkdtempSync(join(root, ".tmp-review-packet-outside-test-"));
     const outside = canonicalTempDir("loom-review-packet-outside-");
     cleanup.push(dir, outside);
     const state = join(dir, "state.json");
@@ -714,13 +748,13 @@ describe("quality-program helper boundaries", () => {
     const external = join(outside, "secret.ts");
     writeFileSync(external, "secret\n");
     writeReviewPacketTaskGraph(state, {
-      start_sha: execFileSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf-8" }).trim(),
+      start_sha: execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf-8" }).trim(),
       file_list: ["engine/src/types.ts"],
       files_modified: [external],
     });
 
     const run = spawnSync("bun", [CLI, "helper", "review-packet", "create", "--task", "T1", "--output", packet], {
-      cwd: ROOT, encoding: "utf-8", env: { ...process.env, LOOM_STATE_PATH: state },
+      cwd: root, encoding: "utf-8", env: { ...admittedEnv(), LOOM_STATE_PATH: state },
     });
     expect(run.status).not.toBe(0);
     expect(run.stderr).toContain("must identify a file inside the repository");
@@ -728,20 +762,21 @@ describe("quality-program helper boundaries", () => {
   });
 
   it("rejects a review-packet output path with a symlinked parent", () => {
-    const dir = mkdtempSync(join(ROOT, ".tmp-review-packet-symlink-test-"));
+    const root = reviewPacketRepository();
+    const dir = mkdtempSync(join(root, ".tmp-review-packet-symlink-test-"));
     const outside = canonicalTempDir("loom-review-packet-output-");
     cleanup.push(dir, outside);
     const state = join(dir, "state.json");
     const linked = join(dir, "linked-output");
     symlinkSync(outside, linked);
     writeReviewPacketTaskGraph(state, {
-      start_sha: execFileSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf-8" }).trim(),
+      start_sha: execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf-8" }).trim(),
       file_list: ["engine/src/types.ts"],
       files_modified: ["engine/src/types.ts"],
     });
 
     const run = spawnSync("bun", [CLI, "helper", "review-packet", "create", "--task", "T1", "--output", join(linked, "packet.json")], {
-      cwd: ROOT, encoding: "utf-8", env: { ...process.env, LOOM_STATE_PATH: state },
+      cwd: root, encoding: "utf-8", env: { ...admittedEnv(), LOOM_STATE_PATH: state },
     });
     expect(run.status).not.toBe(0);
     expect(run.stderr).toContain("must not traverse a symlink");
@@ -750,7 +785,8 @@ describe("quality-program helper boundaries", () => {
 
   it("rejects an unknown refutation lens at the CLI boundary", () => {
     const run = spawnSync("bun", [CLI, "helper", "panel-program", "refutation"], {
-      cwd: ROOT,
+      cwd: disposableDirectory(),
+      env: admittedEnv(),
       input: JSON.stringify({ input: { criticalFindingIds: ["T1:F1"], lenses: ["invented"] }, events: [] }),
       encoding: "utf-8",
     });
@@ -760,7 +796,8 @@ describe("quality-program helper boundaries", () => {
 
   it("rejects a task-local finding id before constructing a refutation program", () => {
     const run = spawnSync("bun", [CLI, "helper", "panel-program", "refutation"], {
-      cwd: ROOT,
+      cwd: disposableDirectory(),
+      env: admittedEnv(),
       input: JSON.stringify({ input: { criticalFindingIds: ["code-reviewer-1"], lenses: ["intent"] }, events: [] }),
       encoding: "utf-8",
     });

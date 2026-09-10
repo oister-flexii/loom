@@ -7,11 +7,17 @@
 import { createHash } from 'node:crypto';
 import { devNull } from 'node:os';
 import { extname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { createAtomicInitialPublicationClaimPort, createInitialBatchPublicationReconciler, createInitialPublicationEffectPort, createPublicationAuthorityResolver, parseBatchPublishedReceipt, parseEffectId, parseIssuedSpawnRequest, prepareInitialBatchPublicationIntent, spawnBatchAction, AGENT_REQUIRED_SKILLS, type AgentRequestAuthority, type EffectId, type InitialSpawnRequestInput, type PublicationAuthorityResolver, type SpawnRequest } from '../../../core/orchestration-contract';
-import { parseStandaloneReviewAuthority, selectStandaloneReviewers, type FrozenStandaloneReviewAuthority, type StandaloneReviewKind, type StandaloneReviewMetadata } from '../../../core/standalone-review';
-import { buildContextPacket, encodeByteSection, type ContextPacket } from '../../../orchestration/context-packets';
-import { readRunBytesNoFollow } from '../../../orchestration/no-follow-fs';
+import { canonicalStructuralEquals, sameAgentRequestAuthority, parseAgentRequestAuthority, type DomainResult, createAtomicInitialPublicationClaimPort, createInitialBatchPublicationReconciler, createInitialPublicationEffectPort, createPublicationAuthorityResolver, parseBatchPublishedReceipt, parseEffectId, parseIssuedSpawnRequest, prepareInitialBatchPublicationIntent, spawnBatchAction, AGENT_REQUIRED_SKILLS, type AgentRequestAuthority, type EffectId, type InitialSpawnRequestInput, type PublicationAuthorityResolver, type SpawnRequest } from '../../../core/orchestration-contract';
+import { serializeAdjudicatedStandaloneReview, STANDALONE_REVIEWER_ROLES, serializeStandaloneReviewAuthority, parseStandaloneReviewAuthority, selectStandaloneReviewers, type FrozenStandaloneReviewAuthority, type StandaloneReviewKind, type StandaloneReviewMetadata } from '../../../core/standalone-review';
+import { safeIoCause } from '../../../core/safe-io-cause';
+import { buildContextPacket, buildReviewerContextPacket, encodeByteSection, type ContextPacket } from '../../../core/context-packets';
+import { readRunBytesNoFollow, openDirectoryNoFollow, closeAnchoredDirectory, listDirectoryNamesNoFollow, readDirectoryFileNoFollow } from '../../../orchestration/no-follow-fs';
+import { parseReviewerProtocolDescriptor, type ReviewerProtocolDescriptor, type ReviewerProtocolFailure } from '../../../core/reviewer-contract';
+import { parseIssuedReviewerProtocol, type ReviewerProtocolAuthorityResolver, type ReviewerProtocolRegistration, type ReviewerSubjectBinding } from '../../../core/review-output';
+import { readWaveReviewContext } from '../../../core/wave-review-authority';
+import type { StandaloneDoneState } from '../../../core/standalone-review-machine';
 import { parseRunDirectoryReference, type RunDirHandle } from '../../../orchestration/run-directory-handle';
 import { isExcludedRemediationPath, parseCanonicalRepositoryRelativePath } from '../../../core/remediation-machine';
 import type { PersistentRefutationPanelEvent } from '../../../core/panel-program';
@@ -26,8 +32,11 @@ export type {
   RemediationStartInputV2,
 } from './remediation-registration';
 
-export type RegisteredStandaloneProgram = Readonly<{
-  schemaVersion: 1;
+type RegisteredReviewerProtocol =
+  | Readonly<{ schemaVersion: 1; reviewerProtocol?: never }>
+  | Readonly<{ schemaVersion: 2; reviewerProtocol: ReviewerProtocolDescriptor }>;
+
+export type RegisteredStandaloneProgram = RegisteredReviewerProtocol & Readonly<{
   kind: "standalone-review";
   input: Readonly<{ kind: StandaloneReviewKind; files: readonly string[] | null; dryRun: boolean }>;
   authority: unknown;
@@ -43,8 +52,7 @@ export type OrphanedWaveGateRecoveryAudit = Readonly<{
   previousAuthorityDigest: string;
 }>;
 
-export type RegisteredWaveGateProgram = Readonly<{
-  schemaVersion: 1;
+export type RegisteredWaveGateProgram = RegisteredReviewerProtocol & Readonly<{
   kind: "wave-gate";
   input: Readonly<{ wave: number | null }>;
   taskIds: readonly string[];
@@ -72,7 +80,10 @@ export const failed = (message: string): FacadeDriveResult => ({ ok: false, mess
 
 export function exactObject(raw: unknown, keys: readonly string[]): raw is Record<string, unknown> {
   return typeof raw === "object" && raw !== null && !Array.isArray(raw) &&
-    Object.keys(raw).length === keys.length && keys.every((key) => Object.hasOwn(raw, key));
+    Reflect.ownKeys(raw).length === keys.length && keys.every((key) => {
+      const descriptor = Object.getOwnPropertyDescriptor(raw, key);
+      return descriptor !== undefined && "value" in descriptor && descriptor.enumerable === true;
+    });
 }
 
 export function parseStandaloneStartInput(raw: unknown): ProgramParse<RegisteredStandaloneProgram["input"]> {
@@ -227,10 +238,10 @@ export function classifyScope(
     && scope.every((path) => /(^|\/)(docs?|README)(\/|\.|$)|\.(md|mdx|txt)$/.test(path));
   return Object.freeze({
     requestedKinds: Object.freeze([kind]) as readonly [StandaloneReviewKind],
-    docsOnly,
-    sourceOrTestChanged,
+    ...(docsOnly
+      ? { docsOnly: true as const, sourceOrTestChanged: false as const, commentsChanged: true as const }
+      : { docsOnly: false as const, sourceOrTestChanged, commentsChanged: scope.some((path) => /\.(md|mdx)$/.test(path)) }),
     typesChanged: scope.some((_, index) => TYPE_EXTENSIONS.has(extensions[index]!)),
-    commentsChanged: docsOnly || scope.some((path) => /\.(md|mdx)$/.test(path)),
     additions,
     fileCount: scope.length,
     // "New structure" means a genuinely NEW deep path (a fresh service,
@@ -317,11 +328,10 @@ export function standalonePackets(
       const requestId = standaloneRequestId(runId, role, attempt);
       const section = encodeByteSection("standalone-review-authority", JSON.stringify({ runId, scope, role, attempt }));
       if (!section.ok) throw new Error(section.error.message);
-      const packet = buildContextPacket({
+      const packet = buildReviewerContextPacket({
         requestId: requestId as never,
         role,
         requiredSkill: AGENT_REQUIRED_SKILLS[role] ?? "none",
-        outputContract: "Review the exact frozen scope. Return the Loom Machine Summary and findings contract for your reviewer role.",
         fixedContext: Object.freeze([section.value, sourceSection]),
         variableContext: Object.freeze([]),
       });
@@ -351,6 +361,113 @@ export function publicationResolver(handle: RunDirHandle): PublicationAuthorityR
       } };
     }
   });
+}
+
+const protocolUnavailable = (message: string): DomainResult<never, ReviewerProtocolFailure> => ({
+  ok: false, error: Object.freeze({ kind: "reviewer-protocol-failed", code: "authority-unavailable", path: "/registration", message }),
+});
+
+/** Read the exact durable publication; reservation or packet hashes alone do not issue a request. */
+function publishedReviewerRequest(handle: RunDirHandle, request: AgentRequestAuthority): ProgramParse<SpawnRequest> {
+  const reserved = handle.readIssuedRequests();
+  if (!reserved.ok) return { ok: false, message: "reviewer request reservations are unavailable" };
+  const matching = reserved.value.filter((entry) => entry.requestId === request.requestId);
+  if (matching.length !== 1 || !sameAgentRequestAuthority(matching[0]!, request)) {
+    return { ok: false, message: "reviewer request does not match its exact durable reservation" };
+  }
+  const directory = openDirectoryNoFollow(join(handle.runDirectory, "artifacts", "publications"));
+  try {
+    const candidates: SpawnRequest[] = [];
+    for (const name of listDirectoryNamesNoFollow(directory)) {
+      if (!name.endsWith(".json")) continue;
+      const raw: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(readDirectoryFileNoFollow(directory, name)));
+      const receipt = parseBatchPublishedReceipt(raw);
+      if (!receipt.ok || receipt.value.runId !== handle.runId || publicationFile(receipt.value.effectId) !== `publications/${name}`) {
+        return { ok: false, message: "reviewer publication receipt is malformed or belongs to another run/effect" };
+      }
+      const batchIndex = receipt.value.issuedRequests.findIndex((entry) => entry.authority.requestId === request.requestId);
+      if (batchIndex < 0) continue;
+      const entry = receipt.value.issuedRequests[batchIndex]!;
+      if (!sameAgentRequestAuthority(entry.authority, request)) {
+        return { ok: false, message: "reviewer publication differs from the exact requested authority" };
+      }
+      const issued = parseIssuedSpawnRequest(publicationResolver(handle), {
+        ...entry, issuance: { schemaVersion: 1, kind: "issued-spawn-request-proof", runId: handle.runId,
+          effectId: receipt.value.effectId, publicationDigest: receipt.value.publicationDigest, batchIndex },
+      });
+      if (!issued.ok) return { ok: false, message: "reviewer publication cannot prove request issuance" };
+      candidates.push(issued.value);
+    }
+    return candidates.length === 1
+      ? { ok: true, value: candidates[0]! }
+      : { ok: false, message: "reviewer request must have exactly one durable publication" };
+  } finally {
+    closeAnchoredDirectory(directory);
+  }
+}
+
+function registeredReviewerSubject(
+  handle: RunDirHandle,
+  registration: RegisteredStandaloneProgram | RegisteredWaveGateProgram,
+  request: AgentRequestAuthority,
+  packet: ContextPacket,
+): ProgramParse<ReviewerSubjectBinding> {
+  if (registration.kind === "standalone-review") {
+    const authority = parsedAuthority(registration);
+    if (!authority.ok) return authority;
+    const expected = authority.value.roster.orderedSlots.flatMap(({ attempts }) => attempts)
+      .find((entry) => entry.requestId === request.requestId);
+    if (authority.value.runId !== handle.runId || expected === undefined || !sameAgentRequestAuthority(expected, request)) {
+      return { ok: false, message: "reviewer request differs from the registered standalone roster" };
+    }
+    return { ok: true, value: Object.freeze({ kind: "standalone-review", runId: handle.runId, scope: authority.value.scope }) };
+  }
+  const context = readWaveReviewContext([packet], packet.digest);
+  if (context.kind !== "loaded" || context.value.task === null || context.value.taskRun === null || context.value.packetId === null) {
+    return { ok: false, message: "published Wave reviewer context authority is unavailable" };
+  }
+  const { task, taskRun } = context.value;
+  if (context.value.runId !== handle.runId || context.value.wave !== registration.input.wave ||
+      context.value.authorityDigest !== registration.authorityDigest || !registration.taskIds.includes(task.id)) {
+    return { ok: false, message: "published Wave context differs from its complete program registration" };
+  }
+  return { ok: true, value: Object.freeze({ kind: "wave-review", runId: handle.runId, taskId: task.id,
+    packetId: context.value.packetId, generation: taskRun.generation,
+    priorFindingIds: Object.freeze(task.priorFindings.map(({ id }) => id)),
+    scope: Object.freeze([...new Set([...task.declaredFiles, ...task.modifiedFiles])].sort()),
+  }) };
+}
+
+/** Independently reread the whole program, publication, reservation and packet on every resolution. */
+export function reviewerProtocolResolver(
+  handle: RunDirHandle,
+  registration: RegisteredStandaloneProgram | RegisteredWaveGateProgram,
+): ReviewerProtocolAuthorityResolver {
+  return (request) => {
+    try {
+      const stored = handle.readProgramRegistration();
+      if (!stored.ok) return protocolUnavailable("reviewer program registration is unavailable");
+      const parsed = parseRegisteredFacadeProgram(stored.value);
+      const expected = parseRegisteredFacadeProgram(registration);
+      if (parsed.kind !== "registered" || parsed.program.kind === "remediation" || expected.kind !== "registered" ||
+          !canonicalStructuralEquals(parsed.program, expected.program) || request.runId !== handle.runId ||
+          request.program !== parsed.program.kind) {
+        return protocolUnavailable("reviewer registration or request differs from independently parsed durable authority");
+      }
+      const published = publishedReviewerRequest(handle, request);
+      if (!published.ok) return protocolUnavailable(published.message);
+      const packet = handle.readContext(request.contextDigest);
+      if (!packet.ok) return protocolUnavailable("published reviewer Context Packet is unavailable");
+      const subject = registeredReviewerSubject(handle, parsed.program, request, packet.value);
+      if (!subject.ok) return protocolUnavailable(subject.message);
+      const protocol: ReviewerProtocolRegistration = parsed.program.schemaVersion === 2
+        ? { schemaVersion: 2, runId: handle.runId, program: parsed.program.kind, reviewerProtocol: parsed.program.reviewerProtocol }
+        : { schemaVersion: 1, runId: handle.runId, program: parsed.program.kind };
+      return parseIssuedReviewerProtocol({ request: published.value, packet: packet.value, registration: protocol, subject: subject.value });
+    } catch (cause) {
+      return protocolUnavailable(`reviewer registration/publication/context cannot be read safely (${safeIoCause(cause)})`);
+    }
+  };
 }
 
 export async function publishInitialBatch(
@@ -431,7 +548,7 @@ export function requiredSkillMarker(requiredSkill: string | null): string {
  */
 export function renderSpawnTask(
   handle: RunDirHandle,
-  authority: Pick<AgentRequestAuthority, "requestId" | "contextDigest" | "requiredSkill">,
+  authority: AgentRequestAuthority,
   instruction: string,
   options: { standalone?: boolean } = {},
 ): string {
@@ -440,17 +557,96 @@ export function renderSpawnTask(
     `LOOM_CONTEXT_DIGEST: ${authority.contextDigest}\n` +
     `LOOM_CONTEXT_PATH: ${join(handle.runDirectory, "contexts", `${authority.contextDigest}.json`)}\n` +
     requiredSkillMarker(authority.requiredSkill) +
-    instruction;
+    reviewerCompatibilityBootstrap(handle, authority) + instruction;
+}
+
+function reviewerCompatibilityBootstrap(handle: RunDirHandle, request: AgentRequestAuthority): string {
+  if (!(STANDALONE_REVIEWER_ROLES as readonly string[]).includes(request.role) ||
+      (request.program !== "standalone-review" && request.program !== "wave-gate")) return "";
+  const stored = handle.readProgramRegistration();
+  if (!stored.ok) throw new Error("reviewer bootstrap registration is unavailable");
+  const parsed = parseRegisteredFacadeProgram(stored.value);
+  if (parsed.kind !== "registered" || parsed.program.kind === "remediation") throw new Error("reviewer bootstrap requires parsed program registration");
+  const protocol = reviewerProtocolResolver(handle, parsed.program)(request);
+  if (!protocol.ok) throw new Error(protocol.error.message);
+  const packageRoot = fileURLToPath(new URL("../../../../../", import.meta.url));
+  const quote = (text: string): string => "'" + text.replaceAll("'", "'\\''") + "'";
+  const reader = join(packageRoot, "scripts", "read-context-packet.ts");
+  if (readRunBytesNoFollow(reader, 64 * 1024).length === 0) throw new Error("Context Packet reader is unavailable");
+  const command = ["bun", reader, "--packet", join(handle.runDirectory, "contexts", `${request.contextDigest}.json`),
+    "--request", request.requestId, "--digest", request.contextDigest, "--role", request.role,
+    "--skill", request.requiredSkill ?? "none"].map(quote).join(" ");
+  const delivery = `LOOM_CONTEXT_READ_COMMAND: ${command}\n` +
+    "Run that exact command using Claude Bash or Pi bash FIRST, then append --section LABEL or --file EXACT_SOURCE_PATH and --offset N --limit 4096 to page through the indexed context. Do not dump raw packet byte arrays. A failed command means context unavailable: stop, never infer a protocol from payload. This read-only projection checks supplied identity/integrity; independent publication was proved by engine delivery, not by the helper.\n";
+  if (protocol.value.protocolVersion === 2) return delivery + "Read the issued Context Packet FIRST; its frozen schema and rubric govern your final output.\n";
+  const role = join(packageRoot, "references", "reviewer-protocol-v1", "agents", `${request.role}.md`);
+  const wire = join(packageRoot, "references", "reviewer-protocol-v1", "agents", "_shared", "wire-contract.md");
+  if (readRunBytesNoFollow(role).length === 0 || readRunBytesNoFollow(wire).length === 0) {
+    throw new Error("historical reviewer instructions are unavailable; refusing current-contract fallback");
+  }
+  return delivery + `Read the issued Context Packet FIRST. This is an issued schema-1 reviewer request.\n` +
+    `Load the archived role instructions at ${JSON.stringify(role)} and shared wire contract at ${JSON.stringify(wire)}.\n` +
+    "Those archived instructions govern this request; current v2 wire, severity and rubric guidance is inapplicable. Missing archive reads must fail visibly, never fall back to v2.\n";
+}
+
+function registrationProtocol(raw: unknown): ProgramParse<RegisteredReviewerProtocol> {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    return { ok: false, message: "reviewer registration must be an object" };
+  }
+  const version = Object.getOwnPropertyDescriptor(raw, "schemaVersion");
+  if (version === undefined || !("value" in version)) {
+    return { ok: false, message: "reviewer registration version must be own data" };
+  }
+  if (version.value === 1 && !Object.hasOwn(raw, "reviewerProtocol")) {
+    return { ok: true, value: Object.freeze({ schemaVersion: 1 }) };
+  }
+  if (version.value === 2) {
+    const descriptor = Object.getOwnPropertyDescriptor(raw, "reviewerProtocol");
+    const parsed = parseReviewerProtocolDescriptor(descriptor !== undefined && "value" in descriptor ? descriptor.value : undefined);
+    return parsed.ok
+      ? { ok: true, value: Object.freeze({ schemaVersion: 2, reviewerProtocol: parsed.value }) }
+      : { ok: false, message: parsed.error.message };
+  }
+  return { ok: false, message: "reviewer registration version or descriptor is invalid" };
 }
 
 export function parseRegistration(raw: unknown): ProgramParse<RegisteredStandaloneProgram> {
-  if (!exactObject(raw, ["schemaVersion", "kind", "input", "authority"]) || raw.schemaVersion !== 1) {
-    return { ok: false, message: "standalone-review registration must contain exactly schemaVersion 1, kind, input, and authority" };
+  try {
+    const protocol = registrationProtocol(raw);
+    if (!protocol.ok) return protocol;
+    const keys = ["schemaVersion", "kind", "input", "authority"];
+    if (protocol.value.schemaVersion === 2) keys.push("reviewerProtocol");
+    if (!exactObject(raw, keys) || raw.kind !== "standalone-review") {
+      return { ok: false, message: "standalone-review registration fields or kind are invalid" };
+    }
+    const input = parseStandaloneStartInput(raw.input);
+    if (!input.ok) return input;
+    const authority = parseStandaloneReviewAuthority(raw.authority);
+    if (!authority.ok) return { ok: false, message: authority.errors.join("; ") };
+    if (authority.value.schemaVersion !== protocol.value.schemaVersion ||
+        !canonicalStructuralEquals(authority.value.reviewerProtocol, protocol.value.reviewerProtocol)) {
+      return { ok: false, message: "standalone-review registration protocol differs from frozen authority" };
+    }
+    if (!canonicalStructuralEquals(authority.value.reviewMetadata.requestedKinds, [input.value.kind]) ||
+        (input.value.files === null) !== (authority.value.scopeSource === "changed-path-union") ||
+        (input.value.files !== null && !canonicalStructuralEquals(input.value.files, authority.value.scope))) {
+      return { ok: false, message: "standalone-review registration input differs from its frozen kind or complete scope" };
+    }
+    return { ok: true, value: Object.freeze({
+      ...protocol.value, kind: "standalone-review", input: input.value,
+      authority: freezeRegistrationAuthority(JSON.parse(serializeStandaloneReviewAuthority(authority.value))),
+    }) };
+  } catch {
+    return { ok: false, message: "standalone-review registration cannot be inspected safely" };
   }
-  const input = parseStandaloneStartInput(raw.input);
-  return input.ok
-    ? { ok: true, value: Object.freeze({ schemaVersion: 1, kind: "standalone-review", input: input.value, authority: raw.authority }) }
-    : input;
+}
+
+function freezeRegistrationAuthority(value: unknown): unknown {
+  if (typeof value === "object" && value !== null) {
+    Object.values(value).forEach(freezeRegistrationAuthority);
+    Object.freeze(value);
+  }
+  return value;
 }
 
 export function parseWaveGateStartInput(raw: unknown): ProgramParse<RegisteredWaveGateProgram["input"]> {
@@ -492,10 +688,45 @@ const invalidRegistration = (message: string): FacadeRegistrationParse => Object
 const registeredProgram = (program: RegisteredFacadeProgram): FacadeRegistrationParse => Object.freeze({ kind: "registered", program });
 
 export function parseRegisteredFacadeProgram(raw: unknown): FacadeRegistrationParse {
+  try {
+    return parseFacadeRegistration(raw);
+  } catch {
+    return invalidRegistration("program registration cannot be inspected safely");
+  }
+}
+
+function parseWaveRegistrationAudit(raw: Readonly<Record<string, unknown>>): ProgramParse<Pick<RegisteredWaveGateProgram, "restart" | "orphanRecovery">> {
+  let restart: WaveGateRestartAudit | undefined;
+  if (Object.hasOwn(raw, "restart")) {
+    if (!exactObject(raw.restart, ["previousRunId", "exhaustedSlots"]) ||
+        typeof raw.restart.previousRunId !== "string" || !Array.isArray(raw.restart.exhaustedSlots) ||
+        raw.restart.exhaustedSlots.length === 0 || raw.restart.exhaustedSlots.some((slot) => typeof slot !== "string" || slot.length === 0)) {
+      return { ok: false, message: "wave-gate registration restart audit must contain previousRunId and non-empty exhaustedSlots" };
+    }
+    restart = Object.freeze({ previousRunId: raw.restart.previousRunId,
+      exhaustedSlots: Object.freeze([...(raw.restart.exhaustedSlots as string[])]) });
+  }
+  let orphanRecovery: OrphanedWaveGateRecoveryAudit | undefined;
+  if (Object.hasOwn(raw, "orphanRecovery")) {
+    if (!exactObject(raw.orphanRecovery, ["previousRunId", "previousAuthorityDigest"]) ||
+        typeof raw.orphanRecovery.previousRunId !== "string" || typeof raw.orphanRecovery.previousAuthorityDigest !== "string") {
+      return { ok: false, message: "wave-gate registration orphanRecovery audit must contain previousRunId and previousAuthorityDigest" };
+    }
+    orphanRecovery = Object.freeze({ previousRunId: raw.orphanRecovery.previousRunId,
+      previousAuthorityDigest: raw.orphanRecovery.previousAuthorityDigest });
+  }
+  return { ok: true, value: Object.freeze({
+    ...(restart === undefined ? {} : { restart }), ...(orphanRecovery === undefined ? {} : { orphanRecovery }),
+  }) };
+}
+
+function parseFacadeRegistration(raw: unknown): FacadeRegistrationParse {
   const record = typeof raw === "object" && raw !== null && !Array.isArray(raw)
     ? raw as Readonly<Record<string, unknown>>
     : null;
-  const kind = record?.kind;
+  const kindDescriptor = record === null ? undefined : Object.getOwnPropertyDescriptor(record, "kind");
+  if (kindDescriptor !== undefined && !("value" in kindDescriptor)) return invalidRegistration("program kind must be own data");
+  const kind: unknown = kindDescriptor?.value;
   if (kind !== "standalone-review" && kind !== "remediation" && kind !== "wave-gate") {
     return Object.freeze({ kind: "unclaimed" });
   }
@@ -512,15 +743,18 @@ export function parseRegisteredFacadeProgram(raw: unknown): FacadeRegistrationPa
       : invalidRegistration(remediation.error.message);
   }
 
-  const waveBaseKeys = ["schemaVersion", "kind", "input", "taskIds", "authorityDigest"] as const;
+  const protocol = registrationProtocol(raw);
+  if (!protocol.ok) return invalidRegistration(protocol.message);
+  const waveBaseKeys = ["schemaVersion", "kind", "input", "taskIds", "authorityDigest",
+    ...(protocol.value.schemaVersion === 2 ? ["reviewerProtocol"] : [])];
   let waveKeys: readonly string[] = waveBaseKeys;
   if (Object.hasOwn(raw as object, "restart")) {
     waveKeys = [...waveBaseKeys, "restart"];
   } else if (Object.hasOwn(raw as object, "orphanRecovery")) {
     waveKeys = [...waveBaseKeys, "orphanRecovery"];
   }
-  if (!exactObject(raw, waveKeys) || raw.schemaVersion !== 1) {
-    return invalidRegistration(`wave-gate registration must contain exactly schemaVersion 1, ${waveKeys.slice(1).join(", ")}`);
+  if (!exactObject(raw, waveKeys)) {
+    return invalidRegistration(`wave-gate registration must contain exactly ${waveKeys.join(", ")}`);
   }
   if (!Array.isArray(raw.taskIds) || raw.taskIds.some((id) => typeof id !== "string")) {
     return invalidRegistration("wave-gate registration taskIds must be a string array");
@@ -528,44 +762,58 @@ export function parseRegisteredFacadeProgram(raw: unknown): FacadeRegistrationPa
   if (typeof raw.authorityDigest !== "string") {
     return invalidRegistration("wave-gate registration authorityDigest must be a string");
   }
-  let restart: WaveGateRestartAudit | undefined;
-  if (Object.hasOwn(raw, "restart")) {
-    if (!exactObject(raw.restart, ["previousRunId", "exhaustedSlots"]) ||
-        typeof raw.restart.previousRunId !== "string" || !Array.isArray(raw.restart.exhaustedSlots) ||
-        raw.restart.exhaustedSlots.length === 0 || raw.restart.exhaustedSlots.some((slot) => typeof slot !== "string" || slot.length === 0)) {
-      return invalidRegistration("wave-gate registration restart audit must contain previousRunId and non-empty exhaustedSlots");
-    }
-    restart = Object.freeze({
-      previousRunId: raw.restart.previousRunId,
-      exhaustedSlots: Object.freeze([...(raw.restart.exhaustedSlots as string[])]),
-    });
+  if (protocol.value.schemaVersion === 2 && (!/^[0-9a-f]{64}$/.test(raw.authorityDigest) ||
+      raw.taskIds.length === 0 || new Set(raw.taskIds).size !== raw.taskIds.length ||
+      raw.taskIds.some((id) => id.trim() === ""))) {
+    return invalidRegistration("current wave-gate registration requires a SHA-256 authorityDigest and distinct non-empty Task IDs");
   }
-  let orphanRecovery: OrphanedWaveGateRecoveryAudit | undefined;
-  if (Object.hasOwn(raw, "orphanRecovery")) {
-    if (!exactObject(raw.orphanRecovery, ["previousRunId", "previousAuthorityDigest"]) ||
-        typeof raw.orphanRecovery.previousRunId !== "string" ||
-        typeof raw.orphanRecovery.previousAuthorityDigest !== "string") {
-      return invalidRegistration("wave-gate registration orphanRecovery audit must contain previousRunId and previousAuthorityDigest");
-    }
-    orphanRecovery = Object.freeze({
-      previousRunId: raw.orphanRecovery.previousRunId,
-      previousAuthorityDigest: raw.orphanRecovery.previousAuthorityDigest,
-    });
-  }
+  const audit = parseWaveRegistrationAudit(raw);
+  if (!audit.ok) return invalidRegistration(audit.message);
   const input = parseWaveGateStartInput(raw.input);
   return input.ok
     ? registeredProgram(Object.freeze({
-        schemaVersion: 1, kind: "wave-gate", input: input.value,
+        ...protocol.value, kind: "wave-gate", input: input.value,
         taskIds: Object.freeze([...(raw.taskIds as string[])]), authorityDigest: raw.authorityDigest,
-        ...(restart === undefined ? {} : { restart }),
-        ...(orphanRecovery === undefined ? {} : { orphanRecovery }),
+        ...audit.value,
       }))
     : invalidRegistration(input.message);
 }
 
 export function parsedAuthority(registration: RegisteredStandaloneProgram): ProgramParse<FrozenStandaloneReviewAuthority> {
-  const result = parseStandaloneReviewAuthority(registration.authority);
+  const parsed = parseRegistration(registration);
+  if (!parsed.ok) return parsed;
+  const result = parseStandaloneReviewAuthority(parsed.value.authority);
   return result.ok ? { ok: true, value: result.value } : { ok: false, message: result.errors.join("; ") };
+}
+
+export function readRegisteredStandaloneAuthority(
+  handle: RunDirHandle,
+  expected: RegisteredStandaloneProgram,
+): ProgramParse<FrozenStandaloneReviewAuthority> {
+  const raw = handle.readProgramRegistration();
+  if (!raw.ok) return { ok: false, message: "standalone program registration is unavailable" };
+  const registered = parseRegistration(raw.value);
+  const supplied = parseRegistration(expected);
+  if (!registered.ok || !supplied.ok || !canonicalStructuralEquals(registered.value, supplied.value)) {
+    return { ok: false, message: "standalone registration differs from independently parsed durable program authority" };
+  }
+  return parsedAuthority(registered.value);
+}
+
+export function readPublishedStandaloneResult(handle: RunDirHandle, state: StandaloneDoneState): ProgramParse<StandaloneDoneState> {
+  try {
+    const receipt = handle.readReceipt(state.publicationReceipt.effectId);
+    if (!receipt.ok || !canonicalStructuralEquals(receipt.value, state.publicationReceipt)) {
+      return { ok: false, message: "standalone result publication receipt is missing or differs from replay" };
+    }
+    const bytes = readRunBytesNoFollow(join(handle.runDirectory, "result.json"));
+    if (!bytes.equals(Buffer.from(serializeAdjudicatedStandaloneReview(state.result)))) {
+      return { ok: false, message: "published standalone result bytes differ from replay" };
+    }
+    return { ok: true, value: state };
+  } catch (cause) {
+    return { ok: false, message: `published standalone result is unavailable (${safeIoCause(cause)})` };
+  }
 }
 
 export function standalonePublicationEffectId(authority: FrozenStandaloneReviewAuthority) {
@@ -692,14 +940,14 @@ export async function recoverOrPublishStandaloneRetry(
       attempt: 2,
     }));
     if (!authoritySection.ok) return { ok: false, message: authoritySection.error.message };
-    const rebuilt = buildContextPacket({
-      requestId: retryAuthority.requestId as never,
-      role: retryAuthority.role,
+    if (attemptOne.value.schemaVersion !== authority.schemaVersion) {
+      return { ok: false, message: "retry predecessor protocol differs from frozen registration" };
+    }
+    const input = { requestId: retryAuthority.requestId, role: retryAuthority.role,
       requiredSkill: attemptOne.value.requiredSkill,
-      outputContract: attemptOne.value.outputContract,
-      fixedContext: Object.freeze([authoritySection.value, frozenSource]),
-      variableContext: Object.freeze([]),
-    });
+      fixedContext: Object.freeze([authoritySection.value, frozenSource]), variableContext: Object.freeze([]) };
+    const rebuilt = authority.schemaVersion === 2 ? buildReviewerContextPacket(input)
+      : buildContextPacket({ ...input, outputContract: attemptOne.value.outputContract });
     if (!rebuilt.ok) return { ok: false, message: rebuilt.error.message };
     if (rebuilt.value.digest !== retryAuthority.contextDigest) {
       return {
@@ -770,7 +1018,12 @@ export function refutationRetryTask(task: string, diagnostic: string | null): st
  * failure classes are now stated, with the engine's own diagnostic first
  * whenever one survived to here.
  */
-export function standaloneRetryTask(task: string, diagnostic: string | null): string {
+export function standaloneRetryTask(task: string, diagnostic: string | null, authority: FrozenStandaloneReviewAuthority): string {
+  if (authority.schemaVersion === 2) {
+    return [task, "", "Your previous attempt was rejected by the engine's admission check.",
+      ...(diagnostic === null ? [] : [JSON.stringify(diagnostic)]), "",
+      "This is your final attempt. Emit exactly one JSON object conforming to the unchanged reviewer-payload-schema and reviewer-impact-rubric sections."].join("\n");
+  }
   const marker = diagnostic === null
     ? ["Your previous attempt was rejected by the engine's admission check."]
     : ["Your previous attempt was rejected by the engine's admission check:", "", diagnostic];
@@ -902,7 +1155,8 @@ export async function recoverOrPublishRefutationRetry(
       message: `refutation attempt 2 exhausted after capture rejection: ${rejection}`,
     };
   }
-  if (prepared === undefined || JSON.stringify(prepared.input.authority) !== JSON.stringify(authority)) {
+  const preparedAuthority = prepared === undefined ? null : parseAgentRequestAuthority(prepared.input.authority);
+  if (prepared === undefined || !preparedAuthority?.ok || !sameAgentRequestAuthority(preparedAuthority.value, authority)) {
     return { ok: false, kind: "unrecoverable" as const, message: `refutation retry ${authority.requestId} is not exact prepared attempt-2 authority` };
   }
   const recovered = durableRefutationRequests(handle, [prepared.input], resolver, retryLabel);
@@ -912,21 +1166,5 @@ export async function recoverOrPublishRefutationRetry(
   return published.ok
     ? { ok: true, request: published.requests[0]! }
     : { ok: false, kind: "unrecoverable" as const, message: published.message };
-}
-
-/**
- * Fatal UTF-8 decode like the engine's transcript boundary. A decode failure
- * is a typed failure naming the decoder's cause, never prose passed to the
- * semantic validator and misreported as a missing Machine Summary marker.
- */
-export function decodeReviewerTranscript(
-  bytes: Uint8Array,
-  role: string,
-): Readonly<{ ok: true; text: string }> | Readonly<{ ok: false; message: string }> {
-  try {
-    return { ok: true, text: new TextDecoder("utf-8", { fatal: true }).decode(bytes) };
-  } catch (error) {
-    return { ok: false, message: `${role}: transcript is not valid UTF-8 (${error instanceof Error ? error.message : String(error)})` };
-  }
 }
 

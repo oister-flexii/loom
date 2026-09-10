@@ -1,6 +1,6 @@
 # Loom documentation
 
-This directory documents the Loom 1.1 architecture and the explicitly marked P3 candidate contract. Defect-Family Accounting has one completed registered review and locally verified repairs; installation, publication, hosted CI, and merge are not claimed. Operational command files under `commands/` and `skills/` remain the executable runbooks; these documents explain the system around them.
+This directory documents Loom 1.1 and the implemented P4 Reviewer Protocol v2 source contract. P4 source review, merge, publication, hosted CI, and loaded-runtime cutover are not claimed. Existing P3 installation/report policy is unchanged. Operational command files under `commands/` and `skills/` remain the executable runbooks; these documents explain the system around them.
 
 ## Start here
 
@@ -16,9 +16,22 @@ This directory documents the Loom 1.1 architecture and the explicitly marked P3 
 | [Guarded skill machines](../machines/README.md) | Engine contributors | Per-agent phase machines and evidence attribution |
 | [Lint-rule authoring](../lint-rules/README.md) | Rule authors | Regex/programmatic rules and project configuration |
 
+## Reviewer protocol boundary
+
+Fresh reviewer registrations use one v2 JSON payload under independently issued
+schema/rubric authority; counts/IDs and human summaries are engine-derived.
+Critical basis is mandatory but not proof of truth or impact. Malformed current
+evidence never becomes a synthetic Finding; the same panel/majority cannot refute
+a true assertion merely because repair seems unimportant. Completed and unfinished
+issued reviewer v1 runs keep original protocol/retry history and packet-first
+archived instructions. Two lossless gzip goldens retain 90 exact logical files
+(20,250,407 bytes; 3,395,759 stored bytes), checked against the unchanged inventory.
+Semantic in-memory historical replay is separate from native disposable fixture
+admission/P3 installation evidence. See [operations](operations.md#reviewer-protocol-v2).
+
 ## P3 operating boundary
 
-Critical remediation requires a **new** exact report after the engine removes the old ignored/untracked regular file using Linux no-follow, descriptor-relative unlink. Darwin fails before critical-check launch; zero-critical remediation and Wave behavior are unchanged. Reports are limited to **8 MiB / XML depth 128**; v2 journal reads, append reconciliation/new appends, and inspection to **12 MiB per encoded event / 64 MiB per encoded journal / 1024 records**. An operator-owned fixed command can still fabricate a valid new report: fresh structured observations are not semantic proof. See [Operations](operations.md#remediation-and-git-safety) for historical read-only receipts, checkpoint diagnostics, and admitted Skill 3.1 bootstrap versus reloaded live P3 operation. The user-approved 2026-09-09 idle follow-up now enrolls the unchanged root `project:verify` command with required report `.loom/completion-reports/verify.junit.xml`. The Git-ignored, untracked report contains only Vitest facts; whole-command normal zero exit additionally proves compiler and all six smoke success. Enrollment is not a completed live v2 run. See the [enrollment follow-up](../.claude/plans/2026-09-09-junit-verification-enrollment.md); historical P3 evidence is unchanged.
+Critical remediation requires a **new** exact report after the engine removes the old ignored/untracked regular file using Linux no-follow, descriptor-relative unlink. Darwin fails before critical-check launch; zero-critical remediation and Wave behavior are unchanged. Reports are limited to **8 MiB / XML depth 128**; v2 journal reads, append reconciliation/new appends, and inspection to **12 MiB per encoded event / 64 MiB per encoded journal / 1024 records**. An operator-owned fixed command can still fabricate a valid new report: fresh structured observations are not semantic proof. See [Operations](operations.md#remediation-and-git-safety) for historical read-only receipts, checkpoint diagnostics, and runtime publication requirements. The earlier Skill 3.1 bootstrap is historical P3 context, not a P4 recipe. The user-approved 2026-09-09 idle follow-up now enrolls the unchanged root `project:verify` command with required report `.loom/completion-reports/verify.junit.xml`. The Git-ignored, untracked report contains only Vitest facts; whole-command normal zero exit additionally proves compiler and all six smoke success. Enrollment is not a completed live v2 run. See the [enrollment follow-up](../.claude/plans/2026-09-09-junit-verification-enrollment.md); historical P3 evidence is unchanged.
 
 ## Decisions
 
@@ -32,6 +45,7 @@ Architecture Decision Records preserve why the system has its current shape:
 - [ADR-0006: LC-1 reaches production by projection](adr/ADR-0006-lc1-reaches-production-by-projection.md)
 - [ADR-0007: Curated Public Surface](adr/ADR-0007-curated-public-surface.md)
 - [ADR-0008: Versioned Defect-Family installation authority](adr/ADR-0008-versioned-defect-family-installation-authority.md)
+- [ADR-0009: Versioned reviewer protocol](adr/ADR-0009-versioned-reviewer-protocol.md)
 
 ## Harness and migration notes
 

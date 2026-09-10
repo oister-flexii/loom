@@ -1,7 +1,7 @@
 import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { canonicalTempDir } from "../../fixtures/canonical-temp-dir";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import upgradeSpecTrace from "../../../src/handlers/helpers/upgrade-spec-trace";
 import { prepareSpecTraceUpgrade } from "../../../src/core/spec-trace-migration";
 import { createRunDirectory } from "../../../src/orchestration/run-directory-handle";
@@ -11,10 +11,17 @@ import { pendingTaskProof } from "../../fixtures/task-lifecycle";
 import { capturedSpecCheck } from "../../../src/core/spec-check";
 
 const cleanup: string[] = [];
+let inheritedEnvironment: readonly (readonly [string, string | undefined])[] = [];
+beforeEach(() => {
+  inheritedEnvironment = ["LOOM_STATE_PATH", "LOOM_SUBAGENT_DIR"]
+    .map((key) => [key, process.env[key]] as const);
+});
 afterEach(() => {
+  for (const [key, value] of inheritedEnvironment) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   for (const path of cleanup.splice(0)) rmSync(path, { recursive: true, force: true });
-  delete process.env.LOOM_STATE_PATH;
-  delete process.env.LOOM_SUBAGENT_DIR;
 });
 
 const finding = {
@@ -149,6 +156,12 @@ describe("upgrade-spec-trace helper", () => {
     writeFileSync(statePath, JSON.stringify(legacyGraph()));
     chmodSync(statePath, 0o444);
     process.env.LOOM_STATE_PATH = statePath;
+    // Private empty roster dir inside the fixture's own canonical root: every
+    // shell case observes THIS dir (never a shared ambient one), so the
+    // fail-closed `unavailable` path stays deterministic per test.
+    const subagents = join(root, "subagents");
+    mkdirSync(subagents);
+    process.env.LOOM_SUBAGENT_DIR = subagents;
     return { root, statePath };
   }
 
@@ -335,11 +348,70 @@ describe("upgrade-spec-trace helper", () => {
     expect(new StateManager(statePath).load().spec_check).toEqual(unrelatedSpecCheck);
   });
 
+  /** Ambient roster in its own owned temp dir: non-empty .active plus an
+   *  empty (malformed) .task_graph pointer, so observeAnyActiveSubagent
+   *  returns `unavailable` and the adapter fails closed. */
+  function malformedAmbientRoster(): string {
+    const ambient = canonicalTempDir("loom-upgrade-spec-trace-ambient-");
+    cleanup.push(ambient);
+    writeFileSync(join(ambient, "ambient.active"), "not-empty");
+    writeFileSync(join(ambient, "ambient.task_graph"), "");
+    return ambient;
+  }
+
+  it("fails closed when the guard deliberately observes an owned malformed ambient roster", async () => {
+    const { statePath } = fixture();
+    const ambient = malformedAmbientRoster();
+    process.env.LOOM_SUBAGENT_DIR = ambient;
+
+    const before = readFileSync(statePath, "utf8");
+    const result = await upgradeSpecTrace(JSON.stringify(input), ["--retire-abandoned-run"]);
+    expect(result.kind).toBe("error");
+    if (result.kind === "error") expect(result.message).toContain("subagent is active");
+    expect(readFileSync(statePath, "utf8")).toBe(before);
+    expect(readFileSync(join(ambient, "ambient.task_graph"), "utf8")).toBe("");
+  });
+
+  it("isolates the helper from a malformed ambient roster so the missing-abandonment refusal still fires", async () => {
+    process.env.LOOM_SUBAGENT_DIR = malformedAmbientRoster();
+    const { statePath } = await activeFixture();
+
+    const before = readFileSync(statePath, "utf8");
+    const result = await upgradeSpecTrace(JSON.stringify(input), ["--retire-abandoned-run"]);
+    expect(result.kind, result.kind === "error" ? result.message : "").toBe("error");
+    if (result.kind === "error") expect(result.message).toContain("is not abandoned");
+    expect(readFileSync(statePath, "utf8")).toBe(before);
+  });
+
+  it("isolates the helper from a malformed ambient roster so a valid abandoned run passes through unchanged", async () => {
+    const ambient = malformedAmbientRoster();
+    process.env.LOOM_SUBAGENT_DIR = ambient;
+    const { statePath, runsRoot, graph } = await activeFixture({ marker: "valid" });
+
+    const result = await upgradeSpecTrace(JSON.stringify(input), ["--retire-abandoned-run"]);
+    expect(result.kind, result.kind === "error" ? result.message : "").toBe("passthrough");
+    const stored = new StateManager(statePath).load();
+    expect(stored.spec_trace_version).toBe(2);
+    expect(stored.tasks.map(({ spec_anchors: _a, spec_contributions: _c, ...rest }) => rest))
+      .toEqual(graph.tasks.map(({ spec_anchors: _a, spec_contributions: _c, ...rest }) => rest));
+    expect(stored.spec_trace_wave_gate_retirements).toEqual([{
+      schemaVersion: 1,
+      kind: "spec-trace-wave-gate-retirement",
+      runId: "run.active",
+      wave: 1,
+      authorityDigest: "c".repeat(64),
+      revision: 4,
+      runsRoot,
+      reason: "legacy spec scope cannot reach the correct Requirement ownership",
+      supersededBy: null,
+    }]);
+    expect(process.env.LOOM_SUBAGENT_DIR).not.toBe(ambient);
+    expect(readFileSync(join(ambient, "ambient.task_graph"), "utf8")).toBe("");
+  });
+
   it("refuses while a project-bound subagent roster is active", async () => {
     const { root, statePath } = fixture();
     const subagents = join(root, "subagents");
-    cleanup.push(subagents);
-    mkdirSync(subagents);
     writeFileSync(join(subagents, "session.active"), "agent-1\tcode-implementer-agent\n");
     writeFileSync(join(subagents, "session.task_graph"), statePath);
     process.env.LOOM_SUBAGENT_DIR = subagents;

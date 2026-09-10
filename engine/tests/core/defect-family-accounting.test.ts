@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { legacyStandaloneContext, legacyFixtureReviewerProtocols } from "../fixtures/standalone-reviewer-protocol";
 import { describe, expect, it } from "vitest";
 import fc from "fast-check";
 import { MAX_STRUCTURED_REPORT_BYTES, parseStructuredTestReportBytes } from "../../src/core/structured-test-report";
@@ -286,7 +287,7 @@ function sourceWithEveryFindingClass(): AuthoritativeStandaloneReviewResult {
       claude: { harness: "claude-code", model: "sonnet" },
     },
     requiredSkill: null,
-    contextDigest: digest(attempt === 1 ? "c" : "d"),
+    contextDigest: legacyStandaloneContext({ runId, requestId: `request:defect-family:mixed:${attempt}`, role: "code-reviewer", attempt, requiredSkill: null }, ["src/main.ts"]).digest,
     outputSlot: `transcripts/mixed/attempt-${attempt}.raw`,
   });
   const prepared = prepareStandaloneReview({
@@ -344,7 +345,7 @@ function sourceWithEveryFindingClass(): AuthoritativeStandaloneReviewResult {
   const accepted = acceptedAgentResult(issued, captured.value);
   if (!accepted.ok) throw new Error(accepted.error.message);
   const initialResolver = createPublicationAuthorityResolver(() => ({ ok: true, value: initial.receiptBytes }));
-  const completion = proveStandaloneRosterCompletion(authority, initialResolver, [accepted.value]);
+  const completion = proveStandaloneRosterCompletion(authority, initialResolver, [accepted.value], legacyFixtureReviewerProtocols(authority, initialResolver, initial.action.requests));
   if (!completion.ok) throw new Error(JSON.stringify(completion.error));
   const aggregate = aggregateStandaloneReview({ authority, completion: completion.value });
   if (!aggregate.ok || aggregate.value.kind !== "requires-refutation") {

@@ -13,6 +13,8 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
  */
 
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { captureLoomRuntimeIdentity, PI_EXTENSION_RUNTIME_ROOT_ENV, PI_EXTENSION_RUNTIME_REVISION_ENV } from "../../../../src/runtime-compatibility";
 import { canonicalTempDir } from "../../../fixtures/canonical-temp-dir";
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import {
@@ -103,8 +105,8 @@ const graph = (overrides: Partial<TaskGraph> = {}): TaskGraph => ({
 } as unknown as TaskGraph);
 
 const registration = (
-  overrides: Partial<RegisteredWaveGateProgram> = {},
-): RegisteredWaveGateProgram => ({
+  overrides: Partial<Extract<RegisteredWaveGateProgram, { schemaVersion: 1 }>> = {},
+): Extract<RegisteredWaveGateProgram, { schemaVersion: 1 }> => ({
   schemaVersion: 1,
   kind: "wave-gate",
   input: { wave: 1 },
@@ -135,10 +137,10 @@ describe("Wave Gate start effect ordering", () => {
         taskIds: ["T9"],
       })).ok).toBe(true);
       const before = readFileSync(statePath);
-      const childEnv: NodeJS.ProcessEnv = { ...process.env, LOOM_STATE_PATH: statePath };
-      delete childEnv.PI_CODING_AGENT;
-      delete childEnv.LOOM_PI_EXTENSION_RUNTIME_REVISION;
-      delete childEnv.LOOM_PI_EXTENSION_RUNTIME_ROOT;
+      const runtime = captureLoomRuntimeIdentity(fileURLToPath(new URL("../../../../../", import.meta.url)));
+      const childEnv: NodeJS.ProcessEnv = { ...process.env, LOOM_STATE_PATH: statePath,
+        PI_CODING_AGENT: "true", [PI_EXTENSION_RUNTIME_ROOT_ENV]: runtime.packageRoot,
+        [PI_EXTENSION_RUNTIME_REVISION_ENV]: runtime.revision };
       const started = spawnSync("bun", [
         new URL("../../../../src/cli.ts", import.meta.url).pathname,
         "helper", "orchestration", "start", "wave-gate",

@@ -16,6 +16,11 @@ import {
   deriveImplementationRetryDisposition,
 } from "../src/core/implementation-retry";
 import type { DeclaredArtifactBaseline } from "../src/core/artifact-baseline";
+import { parseAgentRequestAuthority } from "../src/core/orchestration-contract";
+import { parseTaskGraph } from "../src/state-manager";
+import { graphFixture, taskFixture } from "./fixtures/task-lifecycle";
+import { publishInitialBatch } from "../src/handlers/helpers/programs/helpers";
+import { waveGateAuthorityDigest, waveRequests } from "../src/handlers/helpers/programs/wave-gate";
 import type { AgentRequestAuthority } from "../src/core/orchestration-contract";
 import { fsSessionRegistry, TASK_GRAPH_POINTER_LEASES_SUFFIX } from "../src/machine";
 import { openRunDirectory, type RunDirHandle } from "../src/orchestration/run-directory-handle";
@@ -286,14 +291,30 @@ async function piCaptureRun(runSuffix: string, contextText = "Pi capture context
   const requestId = "request:reviewer:1" as AgentRequestAuthority["requestId"];
   const section = encodeByteSection("test", contextText);
   if (!section.ok) throw new Error(section.error.message);
-  const packet = buildContextPacket({
-    requestId,
-    role: "code-reviewer",
-    requiredSkill: "none",
-    outputContract: "review output",
-    fixedContext: [section.value],
-    variableContext: [],
-  });
+  // Historical transport fixtures still need genuine registered subject and
+  // publication authority; a generic self-hashed context is not issuance.
+  const repository = join(temp, `capture-source-${runSuffix}`);
+  mkdirSync(repository, { recursive: true });
+  writeFileSync(join(repository, "source.ts"), "export const fixture = 1;\n");
+  execFileSync("git", ["init", "-q"], { cwd: repository });
+  execFileSync("git", ["add", "source.ts"], { cwd: repository });
+  execFileSync("git", ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture"], { cwd: repository });
+  const parsedGraph = parseTaskGraph(graphFixture([taskFixture({ id: "T1", description: "historical transport fixture",
+    agent: "code-implementer-agent", depends_on: [], wave: 1, file_list: ["source.ts"], files_modified: ["source.ts"],
+    review_generation: 0, review_status: "pending", findings: [], critical_findings: [], advisory_findings: [] })]));
+  if (!parsedGraph.ok) throw new Error(parsedGraph.error);
+  const graph = parsedGraph.value;
+  const registration = { schemaVersion: 1 as const, kind: "wave-gate" as const, input: { wave: 1 }, taskIds: ["T1"],
+    authorityDigest: waveGateAuthorityDigest(1, ["T1"], graph) };
+  const registered = await opened.value.registerProgram(registration);
+  if (!registered.ok) throw new Error(registered.error.message);
+  const previous = process.cwd();
+  process.chdir(repository);
+  let batch: ReturnType<typeof waveRequests>;
+  try { batch = waveRequests(opened.value, registration, graph, 1); } finally { process.chdir(previous); }
+  const source = batch.packets.find(({ role }) => role === "code-reviewer");
+  if (source === undefined) throw new Error("historical Wave fixture lacks reviewer packet");
+  const packet = buildContextPacket({ ...source, requestId, fixedContext: [...source.fixedContext, section.value] });
   if (!packet.ok) throw new Error(packet.error.message);
   const published = await opened.value.publishContext(packet.value);
   if (!published.ok) throw new Error(published.error.message);
@@ -313,9 +334,36 @@ async function piCaptureRun(runSuffix: string, contextText = "Pi capture context
     contextDigest: packet.value.digest,
     outputSlot: { kind: "fixed-artifact-slot", path: "transcripts/slot-1/attempt-1.raw" },
   } as AgentRequestAuthority;
-  const reserved = await opened.value.reserveRequest(request);
-  if (!reserved.ok) throw new Error(reserved.error.message);
+  await publishPiFixtureRequest(opened.value, request);
   return { runsRoot, runDir, request, handle: opened.value };
+}
+
+async function publishPiFixtureRequest(handle: RunDirHandle, raw: AgentRequestAuthority): Promise<void> {
+  const request = parseAgentRequestAuthority(raw);
+  if (!request.ok) throw new Error(JSON.stringify(request.error));
+  const packet = handle.readContext(request.value.contextDigest);
+  if (!packet.ok) throw new Error(packet.error.message);
+  const published = await publishInitialBatch(handle, [{ authority: request.value,
+    context: { digest: packet.value.digest, slot: `contexts/${packet.value.digest}.json` } }], [packet.value], "pi-transport-fixture");
+  if (!published.ok) throw new Error(published.message);
+}
+
+async function additionalPiFixtureRequest(staged: Awaited<ReturnType<typeof piCaptureRun>>, text: string): Promise<AgentRequestAuthority> {
+  const source = staged.handle.readContext(staged.request.contextDigest);
+  if (!source.ok) throw new Error(source.error.message);
+  const section = encodeByteSection("test", text);
+  if (!section.ok) throw new Error(section.error.message);
+  const requestId = "request:reviewer:10" as AgentRequestAuthority["requestId"];
+  const packet = buildContextPacket({ ...source.value, requestId,
+    fixedContext: source.value.fixedContext.map((entry) => entry.label === "test" ? section.value : entry) });
+  if (!packet.ok) throw new Error(packet.error.message);
+  const published = await staged.handle.publishContext(packet.value);
+  if (!published.ok) throw new Error(published.error.message);
+  const request = parseAgentRequestAuthority({ ...staged.request, requestId, slotId: "slot-2", contextDigest: packet.value.digest,
+    outputSlot: { kind: "fixed-artifact-slot", path: "transcripts/slot-2/attempt-1.raw" } });
+  if (!request.ok) throw new Error(JSON.stringify(request.error));
+  await publishPiFixtureRequest(staged.handle, request.value);
+  return request.value;
 }
 
 describe("Pi extension review tool_result integration", () => {
@@ -1811,14 +1859,7 @@ describe("Pi extension review tool_result integration", () => {
     }, { sessionManager: { getSessionId: () => session } });
     expect(call).toEqual([undefined]);
 
-    const expected = [
-      "### Machine Summary",
-      "CRITICAL_COUNT: 0",
-      "ADVISORY_COUNT: 0",
-      "```findings",
-      "[]",
-      "```",
-    ].join("\n");
+    const expected = JSON.stringify({ schemaVersion: 2, kind: "standalone-review", findings: [] });
     const responses = await pi.emit("tool_result", {
       toolName: "subagent",
       toolCallId,
@@ -1841,7 +1882,7 @@ describe("Pi extension review tool_result integration", () => {
       join(ROOT, "engine", "src", "cli.ts"),
       "helper", "orchestration", "resume", "--runs-root", runsRoot, "--run", runDir,
     ], {
-      cwd: ROOT,
+      cwd: projectCwd,
       encoding: "utf-8",
       env: {
         ...process.env,
@@ -1900,7 +1941,7 @@ describe("Pi extension review tool_result integration", () => {
     writeFileSync(join(runDir, "program.json"), JSON.stringify(tamperedProgram));
     writeFileSync(join(runDir, "result.json"), JSON.stringify(tamperedResult));
     await expect(bridge.verify({ cwd: projectCwd, sessionId: session }))
-      .rejects.toThrow("scope authority does not match registered standalone authority");
+      .rejects.toThrow("published subject must match full scope and ordered prior roster");
     writeFileSync(join(runDir, "program.json"), originalProgram);
     writeFileSync(join(runDir, "result.json"), originalResult);
 
@@ -1965,7 +2006,7 @@ describe("Pi extension review tool_result integration", () => {
       join(ROOT, "engine", "src", "cli.ts"),
       "helper", "orchestration", "resume", "--runs-root", runsRoot, "--run", secondRunDir,
     ], {
-      cwd: ROOT,
+      cwd: projectCwd,
       encoding: "utf-8",
       env: {
         ...process.env,
@@ -2062,23 +2103,7 @@ describe("Pi extension review tool_result integration", () => {
   it("preserves same-role result index authority across a Pi extension reload", async () => {
     const beforeReload = await extension();
     const staged = await piCaptureRun("pi-session-binding-reload-same-role");
-    const secondRequestId = "request:reviewer:10" as AgentRequestAuthority["requestId"];
-    const section = encodeByteSection("test", "second same-role context");
-    if (!section.ok) throw new Error(section.error.message);
-    const packet = buildContextPacket({
-      requestId: secondRequestId, role: "code-reviewer", requiredSkill: "none", outputContract: "review output",
-      fixedContext: [section.value], variableContext: [],
-    });
-    if (!packet.ok) throw new Error(packet.error.message);
-    expect((await staged.handle.publishContext(packet.value)).ok).toBe(true);
-    const second = {
-      ...staged.request,
-      requestId: secondRequestId,
-      slotId: "slot-2",
-      contextDigest: packet.value.digest,
-      outputSlot: { kind: "fixed-artifact-slot", path: "transcripts/slot-2/attempt-1.raw" },
-    } as AgentRequestAuthority;
-    expect((await staged.handle.reserveRequest(second)).ok).toBe(true);
+    const second = await additionalPiFixtureRequest(staged, "second same-role context");
     const session = "019fca39-f989-7510-8e62-50dadbcad445";
     const toolCallId = "call-session-binding-reload-same-role";
     expect((await bindSession(session, staged, [staged.request.requestId, second.requestId])).ok).toBe(true);
@@ -2274,6 +2299,12 @@ describe("Pi extension review tool_result integration", () => {
     const pi = await extension();
     const session = "019fca39-f989-7510-8e62-50dadbcad446";
     const toolCallId = "call-registered-missing-result-retry";
+    const projectCwd = join(temp, "registered-missing-result-project");
+    mkdirSync(join(projectCwd, "engine/src"), { recursive: true });
+    writeFileSync(join(projectCwd, "engine/src/types.ts"), "export type ScriptedFixture = string;\n");
+    execFileSync("git", ["init", "-q"], { cwd: projectCwd });
+    execFileSync("git", ["add", "engine/src/types.ts"], { cwd: projectCwd });
+    execFileSync("git", ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture"], { cwd: projectCwd });
     const runsRoot = join(temp, "registered-missing-result-retry-runs");
     const runId = "run.pi-missing-result-retry";
     mkdirSync(runsRoot, { recursive: true });
@@ -2291,7 +2322,7 @@ describe("Pi extension review tool_result integration", () => {
       LOOM_SUBAGENT_DIR: subagentDir,
     };
     const started = JSON.parse(execFileSync("bun", command, {
-      cwd: ROOT,
+      cwd: projectCwd,
       encoding: "utf-8",
       input: JSON.stringify({ kind: "comments", files: ["engine/src/types.ts"], dryRun: false }),
       env,
@@ -2327,7 +2358,7 @@ describe("Pi extension review tool_result integration", () => {
       "helper", "orchestration", "resume",
       "--runs-root", runsRoot,
       "--run", runId,
-    ], { cwd: ROOT, encoding: "utf-8", env })) as {
+    ], { cwd: projectCwd, encoding: "utf-8", env })) as {
       kind: string;
       requests: readonly { authority: AgentRequestAuthority }[];
     };
@@ -2471,14 +2502,7 @@ describe("Pi extension review tool_result integration", () => {
   it("binds duplicate-role Pi batch items by exact request marker instead of lexical request order", async () => {
     const pi = await extension();
     const staged = await piCaptureRun("pi-duplicate-role-correlator");
-    const second = {
-      ...staged.request,
-      requestId: "request:reviewer:10",
-      slotId: "slot-2",
-      outputSlot: { kind: "fixed-artifact-slot", path: "transcripts/slot-2/attempt-1.raw" },
-    } as AgentRequestAuthority;
-    const reserved = await staged.handle.reserveRequest(second);
-    expect(reserved.ok).toBe(true);
+    const second = await additionalPiFixtureRequest(staged, "Pi capture context");
     process.env.LOOM_ORCHESTRATION_RUNS_ROOT = staged.runsRoot;
     process.env.LOOM_ORCHESTRATION_RUN_DIR = staged.runDir;
     const session = "019fca39-f989-7510-8e62-50dadbcad43b";

@@ -18,6 +18,7 @@ import {
   parseRefutationVerdict,
   parseReviewLens,
   parseWaveFindingId,
+  parseCurrentBriefFinding,
   tallyRefutations,
   type BriefFinding,
   type FindingOutcome,
@@ -1289,8 +1290,15 @@ export function parseArchitecturePanelAuthority(raw: ArchitecturePanelAuthorityI
 }
 
 function parseStrictBriefFinding(raw: unknown): DomainResult<BriefFinding, Readonly<{ message: string }>> {
-  const finding = safeRecord(raw, ["id", "taskId", "agent", "severity", "file", "line", "claim"]);
+  const finding = safeRecord(raw, ["id", "taskId", "agent", "severity", "file", "line", "claim", "protocolVersion", "basis", "reason"]);
   if (finding === null) return { ok: false, error: { message: "Finding must be an exact data record" } };
+  if (["protocolVersion", "basis", "reason"].some((key) => Object.hasOwn(finding, key))) {
+    const parsed = parseCurrentBriefFinding(finding);
+    if (!parsed.ok) return { ok: false, error: { message: parsed.errors.join("; ") } };
+    return parsed.value.severity === "critical"
+      ? { ok: true, value: parsed.value }
+      : { ok: false, error: { message: "Finding severity must be critical" } };
+  }
   const id = parseWaveFindingId(finding.id);
   const taskId = typeof finding.taskId === "string" ? sanitizeProse(finding.taskId) : "";
   const agent = typeof finding.agent === "string" ? sanitizeProse(finding.agent) : "";

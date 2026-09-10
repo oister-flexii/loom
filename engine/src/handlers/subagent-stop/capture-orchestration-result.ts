@@ -22,22 +22,25 @@
  * standalone review beside an active wave therefore cannot capture into the
  * wave's graph or vice versa.
  *
- * Only the two genuinely harness-native facts live here — how to read Claude's
- * final payload, and what its native correlator is. Everything the run
- * directory is asked for is shared with Pi through
- * `orchestration/harness-capture-runtime`, so the two harnesses cannot drift
- * into admitting different results for the same run.
+ * Claude's payload reader and native correlator live here. Capture writes and
+ * payload admission are shared with Pi through `harness-capture-runtime`.
+ * This adapter also preserves the historical Claude observation-fault policy
+ * from the bound packet/registration; current infrastructure unavailability
+ * must not consume a reviewer semantic attempt.
  */
 
 import { readFileSync } from "node:fs";
 import type { HookHandler, HookResult, SubagentStopInput } from "../../types";
 import type { AgentRequestAuthority } from "../../core/orchestration-contract";
+import { isReviewAgent } from "../../config";
+import { parseRegisteredFacadeProgram } from "../helpers/programs";
 import { parseSubagentStopStdin } from "../../parsers/parse-subagent-stop-input";
 import type { FinalPayloadCandidate } from "../../core/harness-capture";
 import { resolveAgentTranscriptPath } from "../../utils/agent-transcript-path";
 import {
   captureAuditLine,
   captureCandidates,
+  captureUnavailable,
   captureHarnessResult,
   describeCaptureFailure,
   resolveCorrelatedRequest,
@@ -165,6 +168,31 @@ export function resolveClaudeRequestAuthority(
     : { ok: false, message: describeCaptureFailure(resolved.outcome) };
 }
 
+function claudeObservationUnavailable(
+  input: SubagentStopInput,
+  runsRoot: string | undefined,
+  runDirectory: string | undefined,
+  reason: string,
+  message: string,
+): CaptureObservation {
+  const correlated = resolveCorrelatedRequest({ harness: "claude", runsRoot, runDirectory, nativeId: input.agent_id ?? "" });
+  if (!correlated.ok) return captureUnavailable(reason, message);
+  const { handle, request } = correlated.value;
+  if (!isReviewAgent(request.role)) return terminalCaptureRefusal(reason, message);
+  const packet = handle.readContext(request.contextDigest);
+  const stored = handle.readProgramRegistration();
+  const parsed = stored.ok && stored.value !== null ? parseRegisteredFacadeProgram(stored.value) : null;
+  const historicalRegistration = stored.ok && (stored.value === null ||
+    (parsed?.kind === "registered" && parsed.program.schemaVersion === 1));
+  if (packet.ok && packet.value.schemaVersion === 1 && historicalRegistration) {
+    return terminalCaptureRefusal(reason, message);
+  }
+  // Current or unavailable reviewer authority cannot spend a semantic attempt
+  // on a missing locator/read. This explicit observation lets the shared
+  // runtime report a retriable failure without a capture-rejection tombstone.
+  return captureUnavailable(reason, message);
+}
+
 /**
  * Capture one finished Claude agent. Pure with respect to decisions: every
  * refusal is returned as a typed outcome the caller audits. Accepted captures
@@ -185,26 +213,24 @@ export async function captureClaudeResult(
   readPayload: ClaudePayloadReader = claudeFinalPayloadCandidates,
 ): Promise<CaptureOutcome> {
   // Observation stays lazy so the shared runtime resolves the correlator and
-  // immutable reservation first. An unrelated stop therefore remains
-  // `no-reservation`; a request-bound locator/read/JSON refusal can be durably
-  // terminalised against the exact request it failed to observe.
+  // immutable reservation first. An unrelated stop remains `no-reservation`.
+  // Actual final-payload refusals can be terminalised against that request;
+  // current locator/read unavailability instead preserves its exact attempt.
   const observe = (): CaptureObservation => {
     const transcriptPath = resolveAgentTranscriptPath(input);
     if (transcriptPath === null) {
-      return terminalCaptureRefusal(
-        "transcript-locator",
+      return claudeObservationUnavailable(
+        input, runsRoot, runDirectory, "transcript-locator",
         `no transcript can be located for session ${JSON.stringify(input.session_id ?? "")} agent ${JSON.stringify(input.agent_id ?? "")}: none was supplied and the derived path does not exist`,
       );
     }
     try {
       return captureCandidates(readPayload(transcriptPath));
     } catch (error) {
-      if (error instanceof ClaudeTranscriptReadError || error instanceof ClaudeTranscriptJsonError) {
-        return terminalCaptureRefusal(
-          error instanceof ClaudeTranscriptReadError ? "transcript-read" : "transcript-json",
-          error.message,
-        );
+      if (error instanceof ClaudeTranscriptReadError) {
+        return claudeObservationUnavailable(input, runsRoot, runDirectory, "transcript-read", error.message);
       }
+      if (error instanceof ClaudeTranscriptJsonError) return terminalCaptureRefusal("transcript-json", error.message);
       throw error;
     }
   };

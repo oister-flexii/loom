@@ -1,7 +1,10 @@
 /**
- * Reviewer transcript → findings. The pure half of storing a review.
+ * Reviewer evidence → findings. The pure half of storing a review.
+ * Issued admission joins publication, Context Packet and registration authority
+ * before selecting the decoder. Current JSON has only engine-derived counts;
+ * the historical text contract and reconciliation below remain v1-only.
  *
- * A reviewer emits three overlapping descriptions of what it found:
+ * A historical reviewer emits three overlapping descriptions of what it found:
  * `CRITICAL_COUNT` / `ADVISORY_COUNT` markers (its own tallies),
  * `CRITICAL:` / `ADVISORY:` marker lines (the claims as text), and —
  * optionally — a fenced ```findings block
@@ -41,6 +44,11 @@ import { match } from "ts-pattern";
 import {
   FINDING_SEVERITIES,
   PRIOR_FINDING_VERDICTS,
+  type CurrentDraftFinding,
+  type LegacyDraftFinding,
+  type LegacyReviewRun,
+  type CurrentReviewRunEvidence,
+  type LegacyReviewRunEvidence,
   type FindingSeverity,
   type PriorFindingAssessment,
   type ReviewRun,
@@ -53,9 +61,225 @@ import {
   mergeFindings,
   parseFindingsBlockResult,
   recordReviewRunEvidence,
-  type DraftFinding,
+  reviewFindingCounts,
 } from "./findings";
 import { parseReviewPath } from "./review-packet";
+import { parseContextPacket, type ContextPacket, type LegacyContextPacket, type ReviewerContextPacketV2 } from "./context-packets";
+import { parseReviewerPayloadV2 } from "./reviewer-protocol";
+import { parseReviewerProtocolDescriptor, REVIEWER_PAYLOAD_LIMITS, type ReviewerProtocolDescriptor, type ReviewerProtocolFailure } from "./reviewer-contract";
+import { acceptedAgentResult, canonicalStructuralEquals, type AgentRequestAuthority, type DomainResult, type OrchestrationRunId, type SpawnRequest } from "./orchestration-contract";
+import { readWaveReviewContext } from "./wave-review-authority";
+import { readExactDataRecord } from "./orchestration-contract/bytes";
+import { isStandaloneReviewAgent } from "./model-profiles";
+
+export type ReviewerSubjectBinding =
+  | Readonly<{ kind: "standalone-review"; runId: OrchestrationRunId; scope: readonly string[] }>
+  | Readonly<{ kind: "wave-review"; runId: OrchestrationRunId; taskId: string; packetId: string;
+      generation: number; priorFindingIds: readonly string[]; scope: readonly string[] }>;
+
+export type ReviewerProtocolRegistration =
+  | Readonly<{ schemaVersion: 1; runId: OrchestrationRunId; program: "standalone-review" | "wave-gate"; reviewerProtocol?: never }>
+  | Readonly<{ schemaVersion: 2; runId: OrchestrationRunId; program: "standalone-review" | "wave-gate"; reviewerProtocol: ReviewerProtocolDescriptor }>;
+
+declare const issuedReviewerProtocolBrand: unique symbol;
+type IssuedProtocolMembership = Readonly<{ [issuedReviewerProtocolBrand]: true }>;
+type IssuedProtocolVersion =
+  | Readonly<{ protocolVersion: 1; packet: LegacyContextPacket; reviewerProtocol?: never }>
+  | Readonly<{ protocolVersion: 2; packet: ReviewerContextPacketV2; reviewerProtocol: ReviewerProtocolDescriptor }>;
+export type IssuedStandaloneReviewerProtocol = IssuedProtocolMembership & IssuedProtocolVersion & Readonly<{
+  request: AgentRequestAuthority; subject: Extract<ReviewerSubjectBinding, { kind: "standalone-review" }>;
+}>;
+export type IssuedWaveReviewerProtocol = IssuedProtocolMembership & IssuedProtocolVersion & Readonly<{
+  request: AgentRequestAuthority; subject: Extract<ReviewerSubjectBinding, { kind: "wave-review" }>;
+}>;
+export type IssuedReviewerProtocol = IssuedStandaloneReviewerProtocol | IssuedWaveReviewerProtocol;
+export type ReviewerProtocolAuthorityResolver = (request: AgentRequestAuthority) => DomainResult<IssuedReviewerProtocol, ReviewerProtocolFailure>;
+const issuedReviewerProtocols = new WeakSet<object>();
+
+function protocolFailure(code: ReviewerProtocolFailure["code"], path: string, message: string): DomainResult<never, ReviewerProtocolFailure> {
+  const encoder = new TextEncoder();
+  let safe = "";
+  let length = 0;
+  for (const character of message) {
+    const rendered = /[\p{Cc}\p{Cf}\p{Cs}]/u.test(character)
+      ? `\\u{${character.codePointAt(0)!.toString(16)}}` : character;
+    const bytes = encoder.encode(rendered).length;
+    if (length + bytes > 2048) break;
+    length += bytes;
+    safe += rendered;
+  }
+  return Object.freeze({ ok: false, error: Object.freeze({ kind: "reviewer-protocol-failed", code, path, message: safe }) });
+}
+
+function packetReviewerSubject(packet: ContextPacket, request: AgentRequestAuthority): ReviewerSubjectBinding | null {
+  if (request.program === "standalone-review") {
+    const section = packet.fixedContext.find(({ label }) => label === "standalone-review-authority");
+    if (section === undefined) return null;
+    const raw: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(section.bytes)));
+    const parsed = readExactDataRecord(raw, ["runId", "scope", "role", "attempt"], "standalone reviewer subject");
+    if (!parsed.ok) return null;
+    const subject = parsed.value;
+    if (subject.runId !== request.runId || subject.role !== request.role || subject.attempt !== request.attempt ||
+        !Array.isArray(subject.scope) || subject.scope.some((path) => typeof path !== "string")) return null;
+    return Object.freeze({ kind: "standalone-review", runId: request.runId, scope: Object.freeze([...subject.scope]) });
+  }
+  if (request.program !== "wave-gate") return null;
+  const context = readWaveReviewContext([packet], packet.digest);
+  if (context.kind !== "loaded" || context.value.task === null || context.value.taskRun === null ||
+      context.value.runId !== request.runId || context.value.subject.role !== request.role) return null;
+  const { task, taskRun } = context.value;
+  return Object.freeze({
+    kind: "wave-review", runId: request.runId, taskId: task.id, packetId: taskRun.packetId,
+    generation: taskRun.generation, priorFindingIds: Object.freeze(task.priorFindings.map(({ id }) => id)),
+    scope: Object.freeze([...new Set([...task.declaredFiles, ...task.modifiedFiles])].sort()),
+  });
+}
+
+function currentPriorRosterIsRepresentable(subject: Extract<ReviewerSubjectBinding, { kind: "wave-review" }>): boolean {
+  const encoder = new TextEncoder();
+  if (subject.priorFindingIds.length > REVIEWER_PAYLOAD_LIMITS.priorFindings || subject.priorFindingIds.some((id) =>
+    id.includes("\0") || /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(id) ||
+    encoder.encode(id).length > REVIEWER_PAYLOAD_LIMITS.reference)) return false;
+  // A byte-size lower bound, not an assessment or an admitted evidence value.
+  const minimum = JSON.stringify({ schemaVersion: 2, kind: "wave-review", packetId: subject.packetId, generation: subject.generation,
+    prior_findings: subject.priorFindingIds.map((finding_id) => ({ finding_id, verdict: "still_present", reason: "x" })), findings: [],
+  });
+  return encoder.encode(minimum).length <= REVIEWER_PAYLOAD_LIMITS.bytes;
+}
+
+/** Joins a real publication-issued request to independently parsed registration and exact packet bytes. */
+export function parseIssuedReviewerProtocol(input: Readonly<{
+  request: SpawnRequest; packet: ContextPacket; registration: ReviewerProtocolRegistration; subject: ReviewerSubjectBinding;
+}>): DomainResult<IssuedReviewerProtocol, ReviewerProtocolFailure> {
+  try {
+    const accepted = acceptedAgentResult(input.request, null);
+    if (!accepted.ok) return protocolFailure("authority-unavailable", "/request", "reviewer authority requires a runtime-issued request");
+    const request = accepted.value.authority;
+    const parsed = parseContextPacket(input.packet);
+    if (!parsed.ok) return protocolFailure("authority-mismatch", "/packet", "reviewer Context Packet integrity failed");
+    const packet = parsed.value;
+    if (!isStandaloneReviewAgent(request.role) || packet.requestId !== request.requestId ||
+        packet.role !== request.role || packet.requiredSkill !== (request.requiredSkill ?? "none") ||
+        packet.digest !== request.contextDigest || input.request.context.digest !== packet.digest ||
+        input.request.context.slot.path !== `contexts/${packet.digest}.json`) {
+      return protocolFailure("authority-mismatch", "/request", "issued request does not match reviewer Context Packet");
+    }
+    const registered = readExactDataRecord(input.registration, ["schemaVersion", "runId", "program", "reviewerProtocol"], "reviewer registration");
+    if (!registered.ok) return protocolFailure("authority-mismatch", "/registration", "reviewer registration requires exact own data fields");
+    const registration = registered.value;
+    const fieldCount = registration.schemaVersion === 2 ? 4 : 3;
+    if (Object.keys(registration).length !== fieldCount || registration.runId !== request.runId ||
+        registration.program !== request.program || registration.schemaVersion !== packet.schemaVersion) {
+      return protocolFailure("authority-mismatch", "/registration", "registration and issued request protocol must agree");
+    }
+    if (registration.schemaVersion === 2 && (!parseReviewerProtocolDescriptor(registration.reviewerProtocol).ok ||
+        packet.schemaVersion !== 2 || !canonicalStructuralEquals(registration.reviewerProtocol, packet.reviewerProtocol))) {
+      return protocolFailure("authority-mismatch", "/registration/reviewerProtocol", "current registration requires the exact supported descriptor");
+    }
+    const subject = packetReviewerSubject(packet, request);
+    if (subject === null || !canonicalStructuralEquals(subject, input.subject) || subject.scope.length === 0 ||
+        new Set(subject.scope).size !== subject.scope.length || subject.scope.some((path) => {
+          const parsedPath = parseReviewPath(path, "review scope");
+          return !parsedPath.ok || parsedPath.value !== path;
+        }) || (subject.kind === "wave-review" && (new Set(subject.priorFindingIds).size !== subject.priorFindingIds.length ||
+          (packet.schemaVersion === 2 && !currentPriorRosterIsRepresentable(subject))))) {
+      return protocolFailure("authority-mismatch", "/subject", "published subject must match full scope and ordered prior roster");
+    }
+    const version: IssuedProtocolVersion = packet.schemaVersion === 2
+      ? { protocolVersion: 2, packet, reviewerProtocol: packet.reviewerProtocol }
+      : { protocolVersion: 1, packet };
+    // The private membership is minted only after the full publication/context/registration join.
+    const authority = Object.freeze({ request, subject, ...version }) as IssuedReviewerProtocol;
+    issuedReviewerProtocols.add(authority);
+    return Object.freeze({ ok: true, value: authority });
+  } catch {
+    return protocolFailure("authority-unavailable", "/", "reviewer authority could not be inspected");
+  }
+}
+
+export type LegacyStandaloneReviewerEvidence = Readonly<{ kind: "standalone-review"; protocolVersion: 1; findings: LegacyParsedFindings }>;
+export type CurrentStandaloneReviewerEvidence = Readonly<{ kind: "standalone-review"; protocolVersion: 2; findings: CurrentParsedFindings }>;
+export type LegacyWaveReviewerEvidence = Readonly<{ kind: "wave-review"; protocolVersion: 1; findings: LegacyParsedFindings; bound: BoundReviewEvidence }>;
+export type CurrentWaveReviewerEvidence = Readonly<{ kind: "wave-review"; protocolVersion: 2; findings: CurrentParsedFindings; bound: BoundReviewEvidence }>;
+export type ParsedReviewerEvidence = LegacyStandaloneReviewerEvidence | CurrentStandaloneReviewerEvidence | LegacyWaveReviewerEvidence | CurrentWaveReviewerEvidence;
+
+function parseCurrentReviewerEvidence(
+  authority: Extract<IssuedReviewerProtocol, { protocolVersion: 2 }>,
+  rawBytes: Uint8Array,
+): DomainResult<CurrentStandaloneReviewerEvidence | CurrentWaveReviewerEvidence, ReviewerProtocolFailure> {
+  const parsed = parseReviewerPayloadV2(rawBytes);
+  if (!parsed.ok) return parsed;
+  const payload = parsed.value;
+  const subject = authority.subject;
+  if (payload.kind !== subject.kind) return protocolFailure("binding-mismatch", "/kind", "payload kind must match issued subject");
+  if (payload.findings.some(({ file }) => file !== null && !subject.scope.includes(file))) {
+    return protocolFailure("out-of-scope", "/findings", "finding location is outside the frozen scope");
+  }
+  const drafts = Object.freeze(payload.findings.map((draft): CurrentDraftFinding => Object.freeze({ protocolVersion: 2, ...draft })));
+  const counts = reviewFindingCounts(drafts);
+  const findings: CurrentParsedFindings = Object.freeze({
+    protocolVersion: 2, drafts, critical: Object.freeze(claimsOfSeverity(drafts, "critical")),
+    advisory: Object.freeze(claimsOfSeverity(drafts, "advisory")), criticalCount: counts.critical,
+    advisoryCount: counts.advisory, blockStatus: Object.freeze({ kind: "json" }),
+  });
+  if (payload.kind === "wave-review" && subject.kind === "wave-review") {
+    if (payload.packetId !== subject.packetId || payload.generation !== subject.generation) {
+      return protocolFailure("binding-mismatch", "/packetId", "payload packet and generation must match issuance");
+    }
+    if (payload.prior_findings.length !== subject.priorFindingIds.length ||
+        payload.prior_findings.some(({ finding_id }, index) => finding_id !== subject.priorFindingIds[index])) {
+      return protocolFailure("invalid-prior-assessments", "/prior_findings", "every issued prior ID must be assessed exactly once in order");
+    }
+    return Object.freeze({ ok: true, value: Object.freeze({ kind: "wave-review", protocolVersion: 2, findings,
+      bound: Object.freeze({ packetId: subject.packetId, generation: subject.generation, priorAssessments: payload.prior_findings }),
+    }) });
+  }
+  return Object.freeze({ ok: true, value: Object.freeze({ kind: "standalone-review", protocolVersion: 2, findings }) });
+}
+
+/** Authority selects the decoder. A current failure never invokes legacy reconciliation. */
+export function parseReviewerEvidence(authority: IssuedReviewerProtocol, rawBytes: Uint8Array): DomainResult<ParsedReviewerEvidence, ReviewerProtocolFailure> {
+  if (!issuedReviewerProtocols.has(authority)) return protocolFailure("authority-unavailable", "/authority", "reviewer evidence requires minted protocol authority");
+  try {
+    if (authority.protocolVersion === 1) {
+      const transcript = new TextDecoder().decode(rawBytes);
+      const subject = authority.subject;
+      const resolution = subject.kind === "standalone-review"
+        ? resolveReviewFindings(transcript, authority.request.role)
+        : resolveBoundReviewFindings(transcript, authority.request.role, {
+            packet_id: subject.packetId, generation: subject.generation, prior_finding_ids: subject.priorFindingIds,
+          });
+      const scoped = constrainReviewResolutionToScope(resolution, subject.scope);
+      if (scoped.kind !== "findings" && scoped.kind !== "bound-findings") {
+        const message = scoped.message.startsWith("review_lifecycle block is not valid JSON:")
+          ? "review_lifecycle block is not valid JSON" : scoped.message;
+        return protocolFailure("legacy-evidence-failed", "/", message);
+      }
+      if (scoped.findings.protocolVersion !== undefined) return protocolFailure("legacy-evidence-failed", "/", "historical decoder returned current evidence");
+      const value: ParsedReviewerEvidence = scoped.kind === "bound-findings"
+        ? Object.freeze({ kind: "wave-review", protocolVersion: 1, findings: scoped.findings, bound: Object.freeze(scoped.bound) })
+        : Object.freeze({ kind: "standalone-review", protocolVersion: 1, findings: scoped.findings });
+      return Object.freeze({ ok: true, value });
+    }
+    return parseCurrentReviewerEvidence(authority, rawBytes);
+  } catch {
+    return protocolFailure("invalid-payload", "/", "reviewer evidence could not be inspected");
+  }
+}
+
+export function resolveIssuedTaskReviewFindings(authority: IssuedWaveReviewerProtocol, rawBytes: Uint8Array): ReviewResolution {
+  const admitted = parseReviewerEvidence(authority, rawBytes);
+  if (!issuedReviewerProtocols.has(authority)) return { kind: "evidence-failed", agent: "unissued-reviewer", message: "reviewer evidence requires minted authority" };
+  const agent = authority.request.role;
+  if (!admitted.ok) return { kind: "evidence-failed", agent, message: admitted.error.message };
+  if (admitted.value.kind !== "wave-review") return { kind: "evidence-failed", agent, message: "Task evidence requires issued Wave authority" };
+  return admitted.value.protocolVersion === 2
+    ? { kind: "bound-findings", agent, findings: admitted.value.findings, bound: admitted.value.bound, issuedSlot: {
+        slot_id: authority.request.slotId, attempted: authority.request.attempt,
+        request_id: authority.request.requestId, context_digest: authority.request.contextDigest,
+      } }
+    : { kind: "bound-findings", agent, findings: admitted.value.findings, bound: admitted.value.bound };
+}
 
 /** Marker placed in standalone reviewer prompts so harness lifecycle hooks know
  * the transcript belongs to a run artifact, not to an orchestration Task. */
@@ -110,8 +334,9 @@ export function carriedOverCount(status: FindingsBlockStatus): number {
  * `advisory` are DERIVED views over it, materialized here so the ~10 existing
  * consumers of the two `string[]` task fields keep working unchanged.
  */
-export interface ParsedFindings {
-  readonly drafts: readonly DraftFinding[];
+export interface LegacyParsedFindings {
+  readonly protocolVersion?: never;
+  readonly drafts: readonly LegacyDraftFinding[];
   readonly critical: readonly string[];
   readonly advisory: readonly string[];
   readonly criticalCount: number | null;
@@ -134,6 +359,17 @@ export interface ParsedFindings {
   readonly blockStatus: FindingsBlockStatus;
 }
 
+export type CurrentParsedFindings = Readonly<{
+  protocolVersion: 2;
+  drafts: readonly CurrentDraftFinding[];
+  critical: readonly string[];
+  advisory: readonly string[];
+  criticalCount: number;
+  advisoryCount: number;
+  blockStatus: Readonly<{ kind: "json" }>;
+}>;
+export type ParsedFindings = LegacyParsedFindings | CurrentParsedFindings;
+
 /**
  * Smart constructor. Accepts either the authoritative drafts (structured
  * block) or the legacy severity-grouped claim strings, and always derives the
@@ -143,13 +379,13 @@ export interface ParsedFindings {
 export function makeParsedFindings(input: {
   critical?: readonly string[];
   advisory?: readonly string[];
-  drafts?: readonly DraftFinding[];
+  drafts?: readonly LegacyDraftFinding[];
   criticalCount?: number | null;
   advisoryCount?: number | null;
   blockStatus?: FindingsBlockStatus;
-}): ParsedFindings {
+}): LegacyParsedFindings {
   const drafts = input.drafts ?? draftsFromClaims(input.critical ?? [], input.advisory ?? []);
-  const parsed: ParsedFindings = {
+  const parsed: LegacyParsedFindings = {
     drafts: Object.freeze([...drafts]),
     critical: Object.freeze([...claimsOfSeverity(drafts, "critical")]),
     advisory: Object.freeze([...claimsOfSeverity(drafts, "advisory")]),
@@ -161,7 +397,7 @@ export function makeParsedFindings(input: {
 }
 
 /** Pure: Build evidence_capture_failed error message, surfacing partial findings if any. */
-export function buildEvidenceFailureMessage(findings: ParsedFindings): string {
+export function buildEvidenceFailureMessage(findings: LegacyParsedFindings): string {
   const missing = [
     ...(findings.criticalCount === null ? ["CRITICAL_COUNT marker not found"] : []),
     ...(findings.advisoryCount === null ? ["ADVISORY_COUNT marker not found"] : []),
@@ -196,7 +432,7 @@ function parseFailureClaim(severity: FindingSeverity, missing: number, total: nu
  * item (its `await-user` advisory-disposition action in `commands/wave-gate.md`). The synthetic entry keeps its own severity, so a lost advisory
  * does not fabricate a blocker.
  */
-export function reconcileFindings(findings: ParsedFindings): ParsedFindings {
+export function reconcileFindings(findings: LegacyParsedFindings): LegacyParsedFindings {
   const shortfalls = FINDING_SEVERITIES.flatMap((severity) => {
     const count = severity === "critical" ? findings.criticalCount : findings.advisoryCount;
     const captured = severity === "critical" ? findings.critical : findings.advisory;
@@ -204,7 +440,7 @@ export function reconcileFindings(findings: ParsedFindings): ParsedFindings {
     // An authored claim, not agent output — a plain literal rather than
     // makeDraftFinding, whose sentinel/empty filter exists to reject UNTRUSTED
     // text and must never be able to silently drop this reconciliation.
-    const synthetic: DraftFinding = {
+    const synthetic: LegacyDraftFinding = {
       severity,
       file: null,
       line: null,
@@ -226,7 +462,7 @@ export function reconcileFindings(findings: ParsedFindings): ParsedFindings {
 /** Extract CRITICAL/ADVISORY claim lines plus BOTH declared counts
  *  (CRITICAL_COUNT and ADVISORY_COUNT) from a text block.
  *  Strips code fences and handles bold/starred markers. */
-function extractFindings(block: string): ParsedFindings {
+function extractFindings(block: string): LegacyParsedFindings {
   const cleaned = block.replace(/^\`\`\`\w*$/gm, "");
 
   const critical: string[] = [];
@@ -273,7 +509,7 @@ function declaredCount(text: string, severity: "CRITICAL" | "ADVISORY"): number 
 /** Parse Machine Summary block for structured findings.
  *  Matches heading variants: ## / ### / #### (with optional bold), MACHINE_SUMMARY, etc.
  *  Uses the LAST match to skip skill-template echoes that precede real output. */
-export function parseMachineSummary(output: string): ParsedFindings | null {
+export function parseMachineSummary(output: string): LegacyParsedFindings | null {
   // Match various heading formats agents produce
   const headingPattern = /^(?:#{2,4}\s*\*{0,2}Machine Summary\*{0,2}|MACHINE[_ ]SUMMARY)/gim;
 
@@ -312,9 +548,9 @@ function consumeClaim(pool: string[], claim: string): boolean {
 
 /** Severity-aware multiset subtraction for structured/marker arbitration. */
 function draftsUnaccountedFor(
-  candidates: readonly DraftFinding[],
-  accountedFor: readonly DraftFinding[],
-): readonly DraftFinding[] {
+  candidates: readonly LegacyDraftFinding[],
+  accountedFor: readonly LegacyDraftFinding[],
+): readonly LegacyDraftFinding[] {
   const criticalPool = accountedFor
     .filter(({ severity }) => severity === "critical")
     .map(({ claim }) => claim);
@@ -334,9 +570,9 @@ function draftsUnaccountedFor(
  * same-severity slot when duplicate wording appears at both severities.
  */
 function alignStructuredSeverity(
-  structured: readonly DraftFinding[],
-  markers: readonly DraftFinding[],
-): readonly DraftFinding[] {
+  structured: readonly LegacyDraftFinding[],
+  markers: readonly LegacyDraftFinding[],
+): readonly LegacyDraftFinding[] {
   const remaining = [...markers];
   return structured.map((draft) => {
     const sameSeverity = remaining.findIndex(
@@ -367,11 +603,11 @@ function alignStructuredSeverity(
  * line, while `blockStatus` still reported `used` so no degradation note was
  * printed. The wave gate's advisory-disposition step (the `await-user` action
  * in `commands/wave-gate.md`) must triage every advisory to fixed/deferred/
- * dismissed; it cannot triage what it never sees. Every agent file in
- * `REVIEW_SUB_AGENTS` includes Machine Summary markers and a fenced findings
- * block — `engine/tests/review-agent-contract.test.ts` pins that contract
- * surface — but arbitration must still defend against a block that does not
- * account for its prompt's advisory entries.
+ * dismissed; it cannot triage what it never sees. Archived v1 reviewer files
+ * include Machine Summary markers and a fenced findings block; the contract
+ * tests pin that historical surface. This v1-only arbitration must defend
+ * against blocks that omit advisory entries. Current v2 emits JSON only and
+ * never enters this marker/block arbitration.
  *
  * Counting is necessary and NOT sufficient. Arbitration stays cardinal on
  * purpose — demanding that the block reproduce marker text verbatim would
@@ -390,17 +626,17 @@ function alignStructuredSeverity(
  * own tally and is what distinguishes "zero findings" from "the parse failed".
  */
 function markerClaimsUnnamedByBlock(
-  scraped: ParsedFindings,
-  structured: readonly DraftFinding[],
-): readonly DraftFinding[] {
+  scraped: LegacyParsedFindings,
+  structured: readonly LegacyDraftFinding[],
+): readonly LegacyDraftFinding[] {
   return draftsUnaccountedFor(scraped.drafts, structured);
 }
 
 function supersededBlockFindings(
-  scraped: ParsedFindings,
-  structured: readonly DraftFinding[],
-  counts: Pick<ParsedFindings, "criticalCount" | "advisoryCount">,
-): ParsedFindings {
+  scraped: LegacyParsedFindings,
+  structured: readonly LegacyDraftFinding[],
+  counts: Pick<LegacyParsedFindings, "criticalCount" | "advisoryCount">,
+): LegacyParsedFindings {
   // The block lost the cardinal comparison, but claims found only there remain
   // evidence. Consume marker claims as multisets, separately by severity.
   const recovered = draftsUnaccountedFor(structured, scraped.drafts);
@@ -411,7 +647,7 @@ function supersededBlockFindings(
   });
 }
 
-function chooseSource(scraped: ParsedFindings, block: string): ParsedFindings {
+function chooseSource(scraped: LegacyParsedFindings, block: string): LegacyParsedFindings {
   const counts = { criticalCount: scraped.criticalCount, advisoryCount: scraped.advisoryCount };
   const parsedBlock = parseFindingsBlockResult(block);
   if (parsedBlock.kind !== "parsed") {
@@ -458,7 +694,7 @@ function chooseSource(scraped: ParsedFindings, block: string): ParsedFindings {
  * documented to mean "the reviewer emitted no block", so `blockStatusNote`
  * printed nothing about a real degradation.
  */
-export function parseLegacyFindings(output: string): ParsedFindings {
+export function parseLegacyFindings(output: string): LegacyParsedFindings {
   return chooseSource(scrapeLegacyFindings(output), output);
 }
 
@@ -471,7 +707,7 @@ function legacySectionClaims(output: string, heading: "Critical" | "Advisory"): 
         .filter((claim) => claim !== "None");
 }
 
-function scrapeLegacyFindings(output: string): ParsedFindings {
+function scrapeLegacyFindings(output: string): LegacyParsedFindings {
   const critical = legacySectionClaims(output, "Critical");
   const advisory = legacySectionClaims(output, "Advisory");
 
@@ -521,13 +757,21 @@ export type ReviewResolution =
   | {
       readonly kind: "findings";
       readonly agent: string;
-      readonly findings: ParsedFindings;
+      readonly findings: LegacyParsedFindings;
     }
   | {
       readonly kind: "bound-findings";
       readonly agent: string;
-      readonly findings: ParsedFindings;
+      readonly findings: LegacyParsedFindings;
       readonly bound: BoundReviewEvidence;
+      readonly issuedSlot?: never;
+    }
+  | {
+      readonly kind: "bound-findings";
+      readonly agent: string;
+      readonly findings: CurrentParsedFindings;
+      readonly bound: BoundReviewEvidence;
+      readonly issuedSlot: Readonly<{ request_id: string; context_digest: string; slot_id: string; attempted: 1 | 2 }>;
     };
 
 /** Either finding-carrying arm — the two that own a `ParsedFindings`. */
@@ -637,7 +881,7 @@ function parsePriorAssessments(
 export function resolveBoundReviewFindings(
   transcript: string,
   agent: string,
-  run: ReviewRun,
+  run: Pick<LegacyReviewRun, "packet_id" | "generation" | "prior_finding_ids">,
 ): ReviewResolution {
   const packetId = lastMarker(transcript, "REVIEW_PACKET_ID");
   const generationRaw = lastMarker(transcript, "REVIEW_GENERATION");
@@ -684,6 +928,9 @@ export function resolveTaskReviewFindings(
   run: ReviewRun | undefined,
   reviewGeneration: number | undefined,
 ): ReviewResolution {
+  if (run?.reviewer_protocol !== undefined) return {
+    kind: "evidence-failed", agent, message: "current review requires issued reviewer protocol authority",
+  };
   if (run !== undefined) return resolveBoundReviewFindings(transcript, agent, run);
   if (reviewGeneration !== undefined ||
       lastMarker(transcript, "REVIEW_PACKET_ID") !== null ||
@@ -777,18 +1024,19 @@ export function applyReviewResolution(
     })
     .with({ kind: "findings" }, (r): Task => mergeFindings(task, r.findings, r.agent))
     .with({ kind: "bound-findings" }, (r): Task => {
-      const baseEvidence = {
-        agent: r.agent,
-        prior_assessments: r.bound.priorAssessments,
-        new_findings: r.findings.drafts,
-      };
-      const evidence = slotAuthority === undefined
-        ? baseEvidence
-        : {
-            ...baseEvidence,
-            slot_id: slotAuthority.slot_id,
-            attempted: slotAuthority.attempted,
-          };
+      let evidence: CurrentReviewRunEvidence | LegacyReviewRunEvidence;
+      if (r.findings.protocolVersion === 2) {
+        if (r.issuedSlot === undefined) return markReviewEvidenceFailed(task, r.agent, "current findings require issued request/context authority");
+        evidence = {
+          protocolVersion: 2, agent: r.agent, prior_assessments: r.bound.priorAssessments,
+          new_findings: r.findings.drafts, ...r.issuedSlot,
+        };
+      } else {
+        const baseEvidence = { agent: r.agent, prior_assessments: r.bound.priorAssessments, new_findings: r.findings.drafts };
+        evidence = slotAuthority === undefined ? baseEvidence : {
+          ...baseEvidence, slot_id: slotAuthority.slot_id, attempted: slotAuthority.attempted,
+        };
+      }
       const transition = recordReviewRunEvidence(
         task,
         r.bound.packetId,
@@ -835,11 +1083,12 @@ function criticalTally(resolution: FindingsResolution): number {
  * duplicate, and an operator who cannot see the count cannot tell an inflated
  * finding set from a genuinely large one.
  */
-function blockStatusNote(status: FindingsBlockStatus): string {
+function blockStatusNote(status: FindingsBlockStatus | CurrentParsedFindings["blockStatus"]): string {
   const carried = (count: number) => `${count} claim(s) carried over`;
   return match(status)
     .with({ kind: "absent" }, () => "")
     .with({ kind: "used" }, () => "")
+    .with({ kind: "json" }, () => "")
     .with(
       { kind: "rejected" },
       (s) => ` [findings block was malformed (${s.reason}) — fell back to marker lines, ` +
@@ -870,7 +1119,10 @@ export function reviewResolutionLog(
   return match(resolution)
     .with(
       { kind: "evidence-failed" },
-      (r) => `WARNING: ${r.message} for ${taskId} — marking evidence_capture_failed`,
+      (r) => `WARNING: ${r.message} for ${taskId} — ` +
+        (applicationChanged === true && appliedTask?.review_evidence_failures?.includes(r.agent)
+          ? "marking evidence_capture_failed"
+          : "review evidence rejected (evidence_capture_failed diagnostic; no mutation asserted)"),
     )
     .with(
       { kind: "ignored-stale" },
