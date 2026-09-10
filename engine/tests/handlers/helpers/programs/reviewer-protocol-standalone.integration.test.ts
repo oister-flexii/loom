@@ -16,12 +16,13 @@ import { parseRegistration, parseRegisteredFacadeProgram, parsedAuthority, publi
 import { inspectStandaloneFacade, readStandaloneReviewedSource, replayStandaloneResultFromEvidence, type StandaloneCaptureWitness } from "../../../../src/handlers/helpers/programs/standalone";
 import { createRunDirectory, openRunDirectory, type RunDirHandle } from "../../../../src/orchestration/run-directory-handle";
 import { captureHarnessResult } from "../../../../src/orchestration/harness-capture-runtime";
-import { captureLoomRuntimeIdentity, PI_EXTENSION_RUNTIME_ROOT_ENV, PI_EXTENSION_RUNTIME_REVISION_ENV } from "../../../../src/runtime-compatibility";
+import { disposeFixturePiSessions, fixturePiEnvironment, fixtureSession, withFixturePiSession } from "../../../fixtures/pi-session";
+import { readSessionRunBindings } from "../../../../src/orchestration/session-run-bindings";
 
 const packageRoot = fileURLToPath(new URL("../../../../../", import.meta.url));
 const cli = fileURLToPath(new URL("../../../../src/cli.ts", import.meta.url));
 const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+afterEach(() => { disposeFixturePiSessions(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 const hash = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 const currentEmpty = JSON.stringify({ schemaVersion: 2, kind: "standalone-review", findings: [] });
 const legacyEmpty = "### Machine Summary\nCRITICAL_COUNT: 0\nADVISORY_COUNT: 0\n\n```findings\n[]\n```";
@@ -55,12 +56,10 @@ function project() {
 type Action = Readonly<{ kind: string; requests?: readonly Readonly<{ authority: AgentRequestAuthority; task: string }>[] }>;
 /** Child-only real runtime admission. No parent environment or live worktree mutation. */
 async function runCli(root: string, args: readonly string[], stdin = ""): Promise<Action> {
-  const runtime = captureLoomRuntimeIdentity(packageRoot);
   const result = await new Promise<Readonly<{ status: number | null; stdout: string; stderr: string }>>((resolve, reject) => {
     const child = spawn("bun", [cli, "helper", "orchestration", ...args], {
       cwd: root,
-      env: { ...process.env, PI_CODING_AGENT: "true", [PI_EXTENSION_RUNTIME_ROOT_ENV]: runtime.packageRoot,
-        [PI_EXTENSION_RUNTIME_REVISION_ENV]: runtime.revision, LOOM_STATE_PATH: join(root, ".claude", "state", "active_task_graph.json") },
+      env: fixturePiEnvironment(root),
     });
     let stdout = "";
     let stderr = "";
@@ -129,8 +128,8 @@ async function legacyPrefix(p: ReturnType<typeof project>): Promise<{ handle: Ru
     authority: JSON.parse(serializeStandaloneReviewAuthority(prepared.authority)) }));
   value(await handle.registerProgram(registration));
   const firstPackets = packets.filter((_, index) => index % 2 === 0);
-  const published = await publishInitialBatch(handle, prepared.initialRequests.map((authority) => ({ authority,
-    context: { digest: authority.contextDigest, slot: `contexts/${authority.contextDigest}.json` } })), firstPackets, "standalone-review");
+  const published = await withFixturePiSession(p.root, () => publishInitialBatch(handle, prepared.initialRequests.map((authority) => ({ authority,
+    context: { digest: authority.contextDigest, slot: `contexts/${authority.contextDigest}.json` } })), firstPackets, "standalone-review"));
   if (!published.ok) throw new Error(published.message);
   const awaiting = value(reduceStandaloneReviewMachine(startStandaloneReviewMachine(prepared.authority), { kind: "review-batch-published", runId: handle.runId }));
   await handle.writeCheckpoint(serializeStandaloneReviewMachineState(awaiting));
@@ -162,6 +161,11 @@ describe("standalone registered protocol delivery and publication", () => {
     const p = project();
     const initial = (await runCli(p.root, ["start", "standalone-review", "--runs-root", p.runsRoot, "--run", "run.current"], JSON.stringify({ kind: "all", files: p.scope, dryRun: false })));
     const handle = value(openRunDirectory(p.runsRoot, "run.current"));
+    const session = fixtureSession(p.root);
+    const bindings = value(readSessionRunBindings(session.transport, session.sessionId));
+    expect(bindings).toHaveLength(1);
+    expect(bindings[0]).toMatchObject({ runId: handle.runId, runsRoot: p.runsRoot, runDirectory: handle.runDirectory, resultDigest: null });
+    expect(bindings[0]!.requestIds).toEqual(initial.requests!.map(({ authority }) => authority.requestId).sort());
     const registration = registered(handle);
     expect(registration.schemaVersion).toBe(2);
     expect(registration.reviewerProtocol).toEqual(CURRENT_REVIEWER_PROTOCOL);
@@ -193,6 +197,9 @@ describe("standalone registered protocol delivery and publication", () => {
     expect((await resume(p.root, handle)).kind).toBe("done");
     expect(value(await inspectStandaloneFacade(handle, registration)).kind).toBe("done");
     const resultBytes = readFileSync(join(handle.runDirectory, "result.json"));
+    const completedBinding = value(readSessionRunBindings(session.transport, session.sessionId))[0]!;
+    expect(completedBinding.resultDigest).toBe(hash(resultBytes));
+    expect(completedBinding.requestIds).toContain(retry.authority.requestId);
     const result = JSON.parse(resultBytes.toString());
     expect(result.schema_version).toBe(2);
     expect(result.reviewer_evidence).toHaveLength(7);

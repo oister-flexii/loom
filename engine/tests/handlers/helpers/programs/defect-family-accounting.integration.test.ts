@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { captureNativeReview } from "../../../fixtures/native-review-capture";
+import { disposeFixturePiSessions, withFixturePiSession as inDirectory } from "../../../fixtures/pi-session";
 import { createHash } from "node:crypto";
 import { captureKey } from "../../../../src/core/harness-capture";
 import { prepareDefectFamilyAccounting } from "../../../../src/core/defect-family-accounting";
@@ -46,6 +47,7 @@ const CHECK_ID = "project:repair-regression";
 const REPORT_PATH = ".loom/completion-reports/repair.xml";
 
 afterEach(() => {
+  disposeFixturePiSessions();
   for (const path of cleanup.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
@@ -53,16 +55,6 @@ function git(repository: string, args: readonly string[]): string {
   const result = spawnSync("git", args, { cwd: repository, encoding: "utf8" });
   if (result.status !== 0) throw new Error(result.stderr || `git ${args.join(" ")} failed`);
   return result.stdout;
-}
-
-async function inDirectory<T>(directory: string, operation: () => Promise<T>): Promise<T> {
-  const previous = process.cwd();
-  process.chdir(directory);
-  try {
-    return await operation();
-  } finally {
-    process.chdir(previous);
-  }
 }
 
 function reviewerTranscript(critical: boolean): string {

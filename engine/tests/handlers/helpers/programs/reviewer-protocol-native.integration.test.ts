@@ -17,11 +17,11 @@ import { handleWaveReviewContext } from "../../../../src/handlers/helpers/progra
 import { parseRegisteredFacadeProgram, parseRegistration } from "../../../../src/handlers/helpers/programs/helpers";
 import { startStandaloneFacade, resumeStandaloneFacade, replayStandaloneResultFromEvidence } from "../../../../src/handlers/helpers/programs/standalone";
 import { createRunDirectory, type RunDirHandle } from "../../../../src/orchestration/run-directory-handle";
-import { captureLoomRuntimeIdentity, PI_EXTENSION_RUNTIME_ROOT_ENV, PI_EXTENSION_RUNTIME_REVISION_ENV } from "../../../../src/runtime-compatibility";
+import { disposeFixturePiSessions, fixturePiEnvironment, withFixturePiSession as inDirectory } from "../../../fixtures/pi-session";
 
 const packageRoot = fileURLToPath(new URL("../../../../../", import.meta.url));
 const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+afterEach(() => { disposeFixturePiSessions(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 const empty = JSON.stringify({ schemaVersion: 2, kind: "standalone-review", findings: [] });
 type Action = Readonly<{ kind: string; requests?: readonly Readonly<{ authority: AgentRequestAuthority; task: string }>[] }>;
 function value<T>(result: Readonly<{ ok: true; value: T }> | Readonly<{ ok: false }>): T {
@@ -44,23 +44,10 @@ function fixture() {
   return root;
 }
 function cli(root: string, args: readonly string[], input = "") {
-  const identity = captureLoomRuntimeIdentity(packageRoot);
   return spawnSync("bun", [join(packageRoot, "engine/src/cli.ts"), "helper", "orchestration", ...args], {
     cwd: root, encoding: "utf8", input,
-    env: { ...process.env, PI_CODING_AGENT: "true", PI_SESSION_ID: "fixture-native-review",
-      [PI_EXTENSION_RUNTIME_ROOT_ENV]: identity.packageRoot, [PI_EXTENSION_RUNTIME_REVISION_ENV]: identity.revision,
-      LOOM_SUBAGENT_DIR: join(root, "fixture-subagents"), LOOM_STATE_PATH: join(root, ".claude/state/active_task_graph.json") },
+    env: fixturePiEnvironment(root),
   });
-}
-async function inDirectory<T>(root: string, operation: () => Promise<T>): Promise<T> {
-  const previous = process.cwd();
-  const statePath = process.env.LOOM_STATE_PATH;
-  process.env.LOOM_STATE_PATH = join(root, ".claude/state/active_task_graph.json");
-  process.chdir(root);
-  try { return await operation(); } finally {
-    process.chdir(previous);
-    if (statePath === undefined) delete process.env.LOOM_STATE_PATH; else process.env.LOOM_STATE_PATH = statePath;
-  }
 }
 async function start(root: string) {
   const handle = value(createRunDirectory(join(root, "runs"), "run.native"));

@@ -12,7 +12,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { canonicalTempDir } from "../../../fixtures/canonical-temp-dir";
 import { afterEach, describe, expect, it } from "vitest";
-import { captureLoomRuntimeIdentity, PI_EXTENSION_RUNTIME_ROOT_ENV, PI_EXTENSION_RUNTIME_REVISION_ENV } from "../../../../src/runtime-compatibility";
+import { disposeFixturePiSessions, fixturePiEnvironment } from "../../../fixtures/pi-session";
 import { evaluateTaskProof } from "../../../../src/core/proof-obligations";
 import { defaultVerificationManifest, freezeVerificationManifest, type FrozenVerificationManifest } from "../../../../src/core/verification-manifest";
 import { parseNewTestEvidence, type TaskGraph } from "../../../../src/types";
@@ -20,15 +20,6 @@ import { parseNewTestEvidence, type TaskGraph } from "../../../../src/types";
 const ENGINE = fileURLToPath(new URL("../../../../", import.meta.url));
 const CLI = join(ENGINE, "src/cli.ts");
 const roots: string[] = [];
-const sessionDirectories = new Map<string, string>();
-function sessionDirectory(root: string): string {
-  const existing = sessionDirectories.get(root);
-  if (existing !== undefined) return existing;
-  const directory = canonicalTempDir("loom-completion-session-");
-  roots.push(directory);
-  sessionDirectories.set(root, directory);
-  return directory;
-}
 
 function git(root: string, ...args: string[]): void {
   const result = spawnSync("git", ["-C", root, ...args], { encoding: "utf8" });
@@ -151,14 +142,7 @@ async function invokeCli(
   cwd = root,
   statePath = join(root, ".claude/state/active_task_graph.json"),
 ) {
-  const runtime = captureLoomRuntimeIdentity(fileURLToPath(new URL("../../../../../", import.meta.url)));
-  const env: NodeJS.ProcessEnv = {
-    ...process.env, PI_CODING_AGENT: "true", PI_SESSION_ID: "fixture-wave-completion",
-    LOOM_SUBAGENT_DIR: sessionDirectory(root),
-    [PI_EXTENSION_RUNTIME_ROOT_ENV]: runtime.packageRoot,
-    [PI_EXTENSION_RUNTIME_REVISION_ENV]: runtime.revision,
-    LOOM_STATE_PATH: statePath,
-  };
+  const env = { ...fixturePiEnvironment(root), LOOM_STATE_PATH: statePath };
   const result = await new Promise<Readonly<{ status: number | null; stdout: string; stderr: string }>>((resolve, reject) => {
     const child = spawn("bun", [CLI, "helper", "orchestration", ...args], { cwd, env });
     let stdout = "";
@@ -229,7 +213,7 @@ function completionResultArtifact(root: string, runId: string): string {
 
 afterEach(() => {
   while (roots.length > 0) rmSync(roots.pop()!, { recursive: true, force: true });
-  sessionDirectories.clear();
+  disposeFixturePiSessions();
 });
 
 describe("Wave Gate façade completion-suite integration", () => {

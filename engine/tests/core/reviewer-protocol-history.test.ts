@@ -208,12 +208,40 @@ describe("bounded lossless historical fixture storage", () => {
       const first = gzipSync(raw, { level: 9 });
       const second = gzipSync(raw, { level: 9 });
       expect(first.equals(second)).toBe(true);
-      expect(first.equals(packed())).toBe(true);
+      const stored = packed();
+      // Storage bytes are pinned; valid deflate encodings are not unique across runtimes.
+      expect(stored.length).toBe(storage.goldens[name].compressedByteLength);
+      expect(sha256(stored)).toBe(storage.goldens[name].sha256);
       expect(first.readUInt32LE(4)).toBe(0); // gzip MTIME, not wall-clock time
-      expect(first.length).toBe(storage.goldens[name].compressedByteLength);
-      expect(sha256(first)).toBe(storage.goldens[name].sha256);
+      expect(stored.readUInt32LE(4)).toBe(0);
+      expect(first.subarray(0, 4).equals(Buffer.from([0x1f, 0x8b, 8, 0]))).toBe(true);
+      expect(stored.subarray(0, 4).equals(Buffer.from([0x1f, 0x8b, 8, 0]))).toBe(true);
       expect(raw.length).toBe(storage.goldens[name].decompressedByteLength);
+      expect(gunzipSync(stored, { maxOutputLength: raw.length }).equals(raw)).toBe(true);
       expect(gunzipSync(first, { maxOutputLength: raw.length }).equals(raw)).toBe(true);
+    });
+
+    it("decodes an alternative valid deflate encoding without accepting it as the pinned stored pack", () => {
+      const raw = canonical();
+      const alternative = gzipSync(raw, { level: 0 });
+      expect(alternative.equals(packed())).toBe(false);
+      const inflated = gunzipSync(alternative, { maxOutputLength: raw.length });
+      expect(inflated.equals(raw)).toBe(true);
+      const decoded = required(parseReviewerV1Pack(name, inflated));
+      const stored = required(decodeReviewerV1Pack(name, packed()));
+      expect([...decoded.keys()]).toEqual([...stored.keys()]);
+      for (const entry of inventory.goldens.find((entry) => entry.name === name)!.files) {
+        const bytes = bytesAt(decoded, entry.path);
+        expect(Buffer.from(bytes).equals(Buffer.from(bytesAt(stored, entry.path)))).toBe(true);
+        expect(bytes.length).toBe(entry.byteLength);
+        expect(sha256(bytes)).toBe(entry.sha256);
+      }
+      // Portability belongs to inflation + canonical parsing, never a storage hash bypass.
+      expect(alternative.length).toBeGreaterThan(storage.goldens[name].compressedByteLength);
+      expect(decodeReviewerV1Pack(name, alternative)).toEqual({ ok: false, error: "compressed-size" });
+      const tampered = Buffer.from(inflated);
+      tampered[tampered.indexOf(Buffer.from('"base64bytes":"')) + '"base64bytes":"'.length] ^= 1;
+      expect(parseReviewerV1Pack(name, tampered).ok).toBe(false);
     });
 
     it("round trips every exact logical byte into independent copies", () => {

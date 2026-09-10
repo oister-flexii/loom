@@ -15,6 +15,7 @@ import { WAVE_REVIEW_AGENTS, type GateDeps } from "../../../src/core/wave-gate-m
 import { evaluateTaskProof } from "../../../src/core/proof-obligations";
 import { parseAgentRequestAuthority, type AgentRequestAuthority } from "../../../src/core/orchestration-contract";
 import { agentRequestAuthority } from "../../fixtures/agent-request-authority";
+import { disposeFixturePiSessions, fixturePiEnvironment, withFixturePiSession } from "../../fixtures/pi-session";
 import { parseRegisteredFacadeProgram } from "../../../src/handlers/helpers/programs";
 import {
   replayStandaloneResultFromEvidence,
@@ -66,6 +67,7 @@ function currentWavePayload(
 }
 
 afterEach(async () => {
+  disposeFixturePiSessions();
   for (const path of cleanup.splice(0)) rmSync(path, { recursive: true, force: true });
   // This file intentionally drives many synchronous child CLIs. Yield between
   // cases so Vitest can acknowledge task-update RPCs instead of timing out
@@ -197,11 +199,7 @@ function runCli(
   envOverrides: Readonly<Record<string, string | undefined>> = {},
 ) {
   const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    PI_CODING_AGENT: "true",
-    PI_SESSION_ID: "fixture-orchestration-cli",
-    LOOM_SUBAGENT_DIR: join(cwd, ".claude/state/subagents"),
-    LOOM_STATE_PATH: join(cwd, ".claude", "state", "active_task_graph.json"),
+    ...fixturePiEnvironment(cwd),
     ...envOverrides,
   };
   // The ambient session's own runtime handshake must not leak into the spawned
@@ -631,11 +629,7 @@ describe("orchestration CLI", () => {
   }
 
   async function resumeWaveFixture(root: string, runsRoot: string, runDir: string): Promise<unknown> {
-    const cwd = process.cwd();
-    const statePath = process.env.LOOM_STATE_PATH;
-    process.chdir(root);
-    process.env.LOOM_STATE_PATH = join(root, ".claude/state/active_task_graph.json");
-    try {
+    return withFixturePiSession(root, async () => {
       vi.resetModules();
       const driver = await import("../../../src/handlers/helpers/programs/wave-gate");
       const handle = openRunDirectory(runsRoot, runDir);
@@ -647,10 +641,7 @@ describe("orchestration CLI", () => {
       const driven = await driver.resumeWaveGateFacade(handle.value, registered.program);
       if (!driven.ok) throw new Error(driven.message);
       return driven.action;
-    } finally {
-      process.chdir(cwd);
-      if (statePath === undefined) delete process.env.LOOM_STATE_PATH; else process.env.LOOM_STATE_PATH = statePath;
-    }
+    });
   }
 
   /** Archived v1 producer for the unchanged-context historical retry regression. */
@@ -666,14 +657,12 @@ describe("orchestration CLI", () => {
     if (!stored.ok) throw new Error(stored.error.message);
     await manager.registerActiveWaveGate({ schemaVersion: 1, kind: "active-wave-gate", runId: handle.value.runId,
       wave: 1, authorityDigest: registration.authorityDigest, revision: 0, terminalOutcome: null, runsRoot }, taskIds);
-    const previous = process.cwd();
-    process.chdir(root);
-    try {
+    await withFixturePiSession(root, async () => {
       const batch = waveRequests(handle.value, registration, manager.load(), 1);
       const published = await publishInitialBatch(handle.value, batch.requests, batch.packets, "wave-gate-current");
       if (!published.ok) throw new Error(published.message);
       await installWaveReviewRuns(manager, registration, batch);
-    } finally { process.chdir(previous); }
+    });
     return (await runCli(["resume", "--runs-root", runsRoot, "--run", runDir], "", root));
   }
 
@@ -2372,7 +2361,7 @@ describe("orchestration CLI", () => {
       expect((await previous.value.captureTranscript(authority, [...Buffer.from("malformed attempt one")])).ok).toBe(true);
       if (authority.role !== "spec-check-invoker") {
         const retry = deriveWaveAttemptTwo(previous.value, authority);
-        const published = await publishInitialBatch(previous.value, [retry.request], [retry.packet], `wave-gate-retry:${authority.slotId}`);
+        const published = await withFixturePiSession(root, () => publishInitialBatch(previous.value, [retry.request], [retry.packet], `wave-gate-retry:${authority.slotId}`));
         if (!published.ok) throw new Error(published.message);
       }
     }
@@ -3458,9 +3447,7 @@ describe("orchestration CLI", () => {
     mkdirSync(sourceRun); mkdirSync(remediationRun);
     const opened = createRunDirectory(runsRoot, sourceRun);
     if (!opened.ok) throw new Error(opened.error.message);
-    const previous = process.cwd();
-    process.chdir(repository);
-    try {
+    await withFixturePiSession(repository, async () => {
       const started = await startStandaloneFacade(opened.value, { kind: "comments", files: ["a.txt"], dryRun: false });
       if (!started.ok) throw new Error(started.message);
       const action = started.action as { requests: { authority: AgentRequestAuthority }[] };
@@ -3474,7 +3461,7 @@ describe("orchestration CLI", () => {
       if (!registered.ok) throw new Error(registered.message);
       const done = await resumeStandaloneFacade(opened.value, registered.value);
       expect(done.ok && (done.action as { kind: string }).kind === "done").toBe(true);
-    } finally { process.chdir(previous); }
+    });
     return { repository, runsRoot, sourceRun, remediationRun, git };
   }
 

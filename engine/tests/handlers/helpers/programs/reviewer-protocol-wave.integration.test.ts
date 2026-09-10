@@ -14,14 +14,14 @@ import { handleWaveReviewContext, installWaveReviewRuns, waveGateAuthorityDigest
 import { createRunDirectory, openRunDirectory, type RunDirHandle } from "../../../../src/orchestration/run-directory-handle";
 import { captureHarnessResult } from "../../../../src/orchestration/harness-capture-runtime";
 import { parseTaskGraph, StateManager } from "../../../../src/state-manager";
-import { captureLoomRuntimeIdentity, PI_EXTENSION_RUNTIME_ROOT_ENV, PI_EXTENSION_RUNTIME_REVISION_ENV } from "../../../../src/runtime-compatibility";
+import { disposeFixturePiSessions, fixturePiEnvironment, withFixturePiSession } from "../../../fixtures/pi-session";
 import type { Finding, TaskGraph } from "../../../../src/types";
 import { graphFixture, taskFixture } from "../../../fixtures/task-lifecycle";
 
 const packageRoot = fileURLToPath(new URL("../../../../../", import.meta.url));
 const cli = fileURLToPath(new URL("../../../../src/cli.ts", import.meta.url));
 const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+afterEach(() => { disposeFixturePiSessions(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 function value<T>(result: Readonly<{ ok: true; value: T }> | Readonly<{ ok: false }>): T {
   if (!result.ok) throw new Error(JSON.stringify(result));
   return result.value;
@@ -91,11 +91,9 @@ function project(priors: readonly Finding[] = []) {
 type Action = Readonly<{ kind: string; requests?: readonly Readonly<{ authority: AgentRequestAuthority; task: string }>[];
   diagnostic?: { message: string }; request?: { requestId: string }; outcome?: unknown }>;
 async function cliResult(p: ReturnType<typeof project>, args: readonly string[], stdin = "") {
-  const runtime = captureLoomRuntimeIdentity(packageRoot);
   const result = await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
     const child = spawn("bun", [cli, "helper", "orchestration", ...args], { cwd: p.root,
-      env: { ...process.env, PI_CODING_AGENT: "true", [PI_EXTENSION_RUNTIME_ROOT_ENV]: runtime.packageRoot,
-        [PI_EXTENSION_RUNTIME_REVISION_ENV]: runtime.revision, LOOM_STATE_PATH: p.statePath },
+      env: fixturePiEnvironment(p.root),
     });
     let stdout = "";
     let stderr = "";
@@ -153,15 +151,13 @@ async function legacyPrefix(p: ReturnType<typeof project>) {
   value(await handle.registerProgram(registered));
   await manager.registerActiveWaveGate({ schemaVersion: 1, kind: "active-wave-gate", runId: handle.runId, wave: 1,
     authorityDigest: registered.authorityDigest, revision: 0, terminalOutcome: null, runsRoot: p.runsRoot }, ["T1"]);
-  const previous = process.cwd();
-  process.chdir(p.root);
-  try {
+  return withFixturePiSession(p.root, async () => {
     const batch = waveRequests(handle, registered, manager.load(), 1);
     const published = await publishInitialBatch(handle, batch.requests, batch.packets, "wave-gate-current");
     if (!published.ok) throw new Error(published.message);
     await installWaveReviewRuns(manager, registered, batch);
     return { handle, action: published.action as Action };
-  } finally { process.chdir(previous); }
+  });
 }
 function legacyDelivery(action: Action) {
   expect(action.kind, JSON.stringify(action)).toBe("spawn-batch");
