@@ -38,6 +38,7 @@ import {
   findingScopeErrors,
   parseReviewerEvidence,
   parseStandalonePanelOutcomes,
+  parseStandaloneAggregate,
   parseStandaloneReviewScope,
   uniqueNonEmpty,
   STANDALONE_REVIEW_SUBJECT,
@@ -47,6 +48,7 @@ import {
   type StandaloneReviewerEvidence,
   type StandaloneReviewerRole,
   type StandaloneReviewState,
+  type StandaloneReviewAggregate,
 } from "./standalone-review";
 import { parseArtifactDigest, parseArtifactRef, parseOrchestrationRunId, parseRequestId, parseSlotId, type ArtifactDigest, type ArtifactRef, type DomainResult, type NonEmpty, type OrchestrationRunId } from "./orchestration-contract";
 import { findingsUnionError, parseStoredFindings } from "./findings";
@@ -136,6 +138,17 @@ export function aggregateLegacyStandaloneReview(input: {
 // authority; schema-v1 is and remains canonical-only.
 // ─────────────────────────────────────────────────────────────────────────
 
+/** Explicit adapter for the historical manual helper; a current aggregate cannot enter archive finalization. */
+export function parseHistoricalStandaloneAggregate(raw: unknown): ParseResult<Extract<StandaloneReviewAggregate, { schemaVersion: 1 }>> {
+  const parsed = parseStandaloneAggregate(raw);
+  if (!parsed.ok) return parsed;
+  return parsed.value.schemaVersion === 1 ? ok(parsed.value) : fail(["current standalone aggregates require canonical LC-2 publication"]);
+}
+
+function hasCurrentFindingFields(raw: unknown): boolean {
+  return isRecord(raw) && ["protocolVersion", "basis", "reason"].some((key) => Object.hasOwn(raw, key));
+}
+
 function historicalPanelOutcomeValue(entry: Record<string, unknown>, snake: string, camel: string): unknown {
   return Object.hasOwn(entry, snake) ? entry[snake] : entry[camel];
 }
@@ -176,7 +189,7 @@ function normalizeHistoricalPanel(
   };
 }
 
-export type HistoricalStandaloneReviewResult = AdjudicatedStandaloneReview & Readonly<{
+export type HistoricalStandaloneReviewResult = Extract<AdjudicatedStandaloneReview, { schemaVersion: 1 }> & Readonly<{
   authorityKind: "unauthenticated-historical";
 }>;
 
@@ -199,6 +212,11 @@ export function parseAdjudicatedStandaloneReview(
   // branches carried comments describing enforcement that could never run.
   if (Object.hasOwn(raw, "schema_version")) {
     return fail(["schema-v1 standalone results require authoritative LC-2 publication parsing"]);
+  }
+  const active = [raw.surviving_critical_findings, raw.advisory_findings];
+  if (active.some((entries) => Array.isArray(entries) && entries.some(hasCurrentFindingFields)) ||
+      (Array.isArray(raw.refuted_critical_findings) && raw.refuted_critical_findings.some((entry) => isRecord(entry) && hasCurrentFindingFields(entry.finding)))) {
+    return fail(["historical standalone results cannot contain current reviewer Finding fields"]);
   }
   const historicalFields = [
     "run_id", "scope", "surviving_critical_findings", "advisory_findings", "refuted_critical_findings", "panel",

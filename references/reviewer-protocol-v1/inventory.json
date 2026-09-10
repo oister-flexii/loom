@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "baselineCommit": "224f0d74373ddab619c1620738c5ba4fa6b44e0e",
+  "files": [
+    {
+      "path": "agents/_shared/wire-contract.md",
+      "byteLength": 4331,
+      "sha256": "21a0db66e3fbb4061e6a7083490b61a76eaa64e060469ce4947e16868df11cfe",
+      "gitBlob": "733fe83aadb1f17965b70851b4e34836a98ca810"
+    },
+    {
+      "path": "agents/code-reviewer.md",
+      "byteLength": 8353,
+      "sha256": "bb0ddfe36b827a0dbefee2071ece96d3b4b791665443a9e6a2a9c9f114e4e56b",
+      "gitBlob": "46109eb8998a31558999d248c8760800924bc719"
+    },
+    {
+      "path": "agents/silent-failure-hunter.md",
+      "byteLength": 9193,
+      "sha256": "5ac45bf4a52ecda7a065aebe2f51742d36246cbb95745669be82ed871ef87b20",
+      "gitBlob": "d303e6ba530861d7eb62e6a517dfccfd8bca5390"
+    },
+    {
+      "path": "agents/pr-test-analyzer.md",
+      "byteLength": 8180,
+      "sha256": "285f6c889b6db2fcebb695acf3e16679391f21515b713c6c73590102d8e0410c",
+      "gitBlob": "586d483b63fa698d9bcb1108eed02d66ea216f37"
+    },
+    {
+      "path": "agents/type-design-analyzer.md",
+      "byteLength": 8709,
+      "sha256": "b81d2e73143833d6d58283b0f733726fa3eb812544136b00173e6d048684ed7a",
+      "gitBlob": "14323111ee824f22cfa8a49fb2987d11acefa6e8"
+    },
+    {
+      "path": "agents/comment-analyzer.md",
+      "byteLength": 8850,
+      "sha256": "a7296cd64ad22152cbcf396b85bf95339a2a6b27f9617afb697e42d0c769036d",
+      "gitBlob": "4dd733b9a62ce1580d0989a91fd8c8864059dba2"
+    },
+    {
+      "path": "agents/architecture-tech-lead.md",
+      "byteLength": 10912,
+      "sha256": "e3babfb0e0b7dc5e9e0e612c8894adf30d044f05d3d97f1fa70e597ac3f2fab0",
+      "gitBlob": "9c112a58f88a00bda97de54e840ab9b9fd95666c"
+    },
+    {
+      "path": "agents/code-simplifier.md",
+      "byteLength": 6672,
+      "sha256": "c57efc635ea1d6e4e7e7a2f5350cdcc97cdb2a9e3808d64503c6a39f4822ca71",
+      "gitBlob": "9b9133f891d420bffcd1e88cdf005691eac0d0ee"
+    }
+  ]
+}

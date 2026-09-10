@@ -1,0 +1,15 @@
+{
+  "format": "gzip-json-path-base64bytes-v1",
+  "goldens": {
+    "pr48-clean": {
+      "compressedByteLength": 1280350,
+      "sha256": "17b6f6f1ca1affac114482ed2adbb4ac17871dc5822db02d2e78e6b336a87c4d",
+      "decompressedByteLength": 8759255
+    },
+    "seven-reviewers-retry": {
+      "compressedByteLength": 2115409,
+      "sha256": "db6984a71ed38c6dc6191f9c58d15da5f186e9e5c85e1b69b2406afb81c01380",
+      "decompressedByteLength": 18250725
+    }
+  }
+}

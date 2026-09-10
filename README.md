@@ -168,6 +168,16 @@ Critical Findings are adjudicated by a Refutation Panel. **Default panel size is
 
 A clean rerun cannot erase an old blocker by omission.
 
+Fresh reviewer registrations in this checkout use Reviewer Protocol v2: one JSON
+payload, engine-derived counts/IDs, and full critical Finding Basis under the
+issued schema and impact rubric. Filled fields prove neither truth nor impact.
+Malformed output is failed evidence, not a synthetic Finding. The same panel and
+majority remain; a true assertion is not refuted because fixing it seems unimportant,
+and surviving criticals block without a new severity override. Completed and
+unfinished issued reviewer v1 runs keep their original protocol and packet-first
+archived instructions. See [ADR-0009](docs/adr/ADR-0009-versioned-reviewer-protocol.md).
+**P4 source review, merge, publication and loaded-runtime cutover remain pending.**
+
 ## Standalone quality workflows
 
 ### `/review-pr`
@@ -190,7 +200,14 @@ For critical checks, the engine first removes the exact old ignored/untracked re
 
 The engine binds those observations to unchanged candidate bytes and modes, audits dirty paths, stages literal paths in a temporary Git index, proves the staged set, and installs only versioned opaque authority under the real index lock. The external `done` outcome contains the actual installation receipt and Defect-Family Assessment; callers do not supply staging outcomes, receipts, manifests, report bytes, or Run JSON. Push is optional; force-push is forbidden. Completed v1 remediation is read-only `historical-unknown`, never authority to reinstall; unfinished v1 blocks and missing v2 fields never downgrade. Completed-v2 replay refuses malformed checkpoint audit paths explicitly.
 
-For this feature's bootstrap, the admitted CLI and loaded Skill 3.1 may review/install under their existing protocol after external validation. That is not its own v2 repair-checked publication. New live P3 operation requires package reload/restart with matching runtime admission; see [runtime bootstrap](docs/operations.md#remediation-and-git-safety).
+P3's selected operator checks, fresh required reports and installation policy are
+unchanged by the reviewer-wire major version. Both published source-review versions
+retain original IDs/full basis and result authority. Use canonical
+`helper orchestration inspect` for engine-rendered emitted/admitted and
+post-refutation counts from root `result.json`; do not author replacement tallies.
+Subsequent review/install uses the actually admitted runtime, with reload/restart
+after package installation. The earlier Skill 3.1 bootstrap is P3 history, not a
+P4 recipe; see [runtime publication](docs/operations.md#remediation-and-git-safety).
 
 ### Requirements and drift
 

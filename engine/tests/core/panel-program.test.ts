@@ -57,7 +57,9 @@ import {
   type SpawnBatchAction,
   type NonEmpty,
 } from "../../src/core/panel-program";
-import { parseWaveFindingId, type BriefFinding, type ReviewLens, type WaveFindingId } from "../../src/core/review-panel";
+import { parseWaveFindingId, projectFindingForPanel, type BriefFinding, type ReviewLens, type WaveFindingId } from "../../src/core/review-panel";
+import { REVIEWER_PAYLOAD_EXAMPLE_V2 } from "../../src/core/reviewer-contract";
+import { attributeFindings } from "../../src/core/findings";
 import {
   createAtomicInitialPublicationClaimPort,
   createInitialBatchPublicationReconciler,
@@ -658,17 +660,17 @@ function semanticVerifierSlots(
   });
 }
 
-function refutationFixture(suffix: string): RefutationFixture {
+function refutationFixture(suffix: string, entries: readonly [BriefFinding, BriefFinding] = findings): RefutationFixture {
   const runId = parsed(parseOrchestrationRunId(`run.refutation.${suffix}`));
   // Verifier roster identities are SEMANTIC: each slot is derived from the
   // run, its lens, and the exact finding set (deriveRefutationVerifierBinding),
   // so reordering lenses or findings cannot relabel issued verifier requests.
   const lensList = ["reproduction", "intent", "blast-radius"] as const;
-  const findingIds = findings.map(({ id }) => id) as unknown as NonEmpty<WaveFindingId>;
+  const findingIds = entries.map(({ id }) => id) as unknown as NonEmpty<WaveFindingId>;
   const slots = semanticVerifierSlots(runId, lensList, findingIds);
   const authority = parsed(parseRefutationPanelAuthority({
     runId,
-    findings,
+    findings: entries,
     lenses: lensList as readonly string[],
     verifierSlots: slots,
   }));
@@ -1625,6 +1627,103 @@ describe("persistent refutation panel", () => {
       ok: false,
       error: { kind: "malformed-checkpoint", message: expect.stringContaining("does not replay") },
     });
+  });
+});
+
+function mixedRefutationFixture(suffix: string, confidence = 50): RefutationFixture {
+  const example = REVIEWER_PAYLOAD_EXAMPLE_V2.findings[0]!;
+  if (example.severity !== "critical") throw new Error("expected critical example");
+  const current = attributeFindings([{ protocolVersion: 2, ...example, claim: "  exact {claim}\n<script> | ```\u001b ",
+    basis: { ...example.basis, truthConfidence: confidence, severityRationale: "  exact rationale\n " } }], "code-reviewer")[0]!;
+  return refutationFixture(suffix, [projectFindingForPanel("T1", current), findings[1]]);
+}
+
+describe("current and historical Findings through the full persistent panel", () => {
+  it("publishes journal/checkpoint effects and reloads every prefix through full-basis done", () => {
+    const fixture = mixedRefutationFixture("current-prefixes");
+    let step = startPersistentRefutationPanel(fixture.authority);
+    const events: PersistentRefutationPanelEvent[] = [];
+    for (const index of [2, 0, 1, 3]) {
+      const history = reduced(parsePersistentRefutationPanelHistory(fixture.authority, JSON.parse(JSON.stringify(events)), publicationResolver));
+      step = index === 3 ? reduced(completePersistentRefutationPanel(step.state, publicationResolver))
+        : reduced(submitRefutationVerdict(step.state, publicationResolver, panelRequestIdentity(fixture.requests[index]!), verdictJson(fixture.authority, index, votes[index]!)));
+      const effects = reduced(planRefutationPanelPersistence(step, history, publicationResolver));
+      events.push(step.recordedEvent!);
+      expect(effects.map(({ sequence }) => sequence)).toEqual([events.length, events.length]);
+      const replacement = effects[1];
+      if (replacement.kind !== "replace-refutation-panel-checkpoint") throw new Error("checkpoint expected");
+      expect(replacement.checkpoint.schemaVersion).toBe(2);
+      const snapshot = JSON.stringify(replacement.checkpoint);
+      const reloaded = reduced(parseRefutationPanelCheckpoint(JSON.parse(snapshot), publicationResolver));
+      expect(JSON.stringify(reloaded.state)).toBe(JSON.stringify(step.state));
+      expect(JSON.stringify(reduced(replayPersistentRefutationPanel(fixture.authority, JSON.parse(JSON.stringify(events)), publicationResolver)).state))
+        .toBe(JSON.stringify(step.state));
+      expect(reloaded.state.authority.findings).toEqual(fixture.authority.findings);
+      expect(Object.isFrozen(reloaded.state.authority.findings[0]?.basis?.evidence)).toBe(true);
+      expect(reloaded.state.authority.findings[1]).not.toHaveProperty("protocolVersion");
+      for (const effect of effects) {
+        expect(parsePanelPersistenceReceipt({ schemaVersion: 1, kind: "panel-persistence-recorded", panel: "refutation",
+          runId: effect.runId, sequence: effect.sequence, dedupKey: effect.dedupKey }, effect).ok).toBe(true);
+      }
+    }
+    if (step.state.stage !== "done") throw new Error("done expected");
+    expect(step.state.decision.threshold).toBe(2);
+    expect(step.state.decision.outcomes).toHaveLength(2);
+    expect(step.state.decision.refuted).toHaveLength(1);
+    expect(step.state.decision.retained).toHaveLength(1);
+    expect(step.state.decision.refuted[0]?.finding).toEqual(fixture.authority.findings[0]);
+    expect(step.state.decision.retained[0]?.finding).toEqual(fixture.authority.findings[1]);
+  });
+
+  it.each(["protocol", "basis", "nested", "claim", "consequence", "advisory"])("refuses %s authority tampering during completed checkpoint reload", (mutation) => {
+    const fixture = mixedRefutationFixture(`current-tamper-${mutation}`);
+    const { step, events } = fullRefutationHistory(fixture);
+    const checkpoint = JSON.parse(JSON.stringify(reduced(refutationPanelCheckpoint(step.state, events, publicationResolver))));
+    const entry = checkpoint.authority.findings[0];
+    if (mutation === "protocol") delete entry.protocolVersion;
+    if (mutation === "basis") delete entry.basis;
+    if (mutation === "nested") entry.basis.evidence.surplus = true;
+    if (mutation === "claim") entry.claim += " altered";
+    if (mutation === "consequence") entry.basis.consequence.impact += " altered";
+    if (mutation === "advisory") { entry.severity = "advisory"; entry.reason = "downgraded"; }
+    expect(parseRefutationPanelCheckpoint(checkpoint, publicationResolver).ok).toBe(false);
+  });
+
+  it.each(["outcomes", "retained", "refuted"])("compares whole nested %s Finding values in tally events, not just IDs/claims", (partition) => {
+    const fixture = mixedRefutationFixture(`current-event-${partition}`);
+    const { step, events } = fullRefutationHistory(fixture);
+    const raw = JSON.parse(JSON.stringify(events));
+    const decision = raw.at(-1).decision;
+    const target = partition === "retained" ? decision.retained[0].finding : decision[partition][0].finding;
+    target.claim += " changed";
+    if (target.protocolVersion === 2) { delete target.protocolVersion; delete target.basis; }
+    expect(replayPersistentRefutationPanel(fixture.authority, raw, publicationResolver).ok).toBe(false);
+    expect(step.state.stage).toBe("done");
+  });
+
+  it("refuses an independently minted history for a changed current basis at persistence planning", () => {
+    const original = mixedRefutationFixture("current-parent-join", 50);
+    const changed = mixedRefutationFixture("current-parent-join", 51);
+    const history = reduced(parsePersistentRefutationPanelHistory(original.authority, [], publicationResolver));
+    const step = reduced(submitRefutationVerdict(startPersistentRefutationPanel(changed.authority).state,
+      publicationResolver, panelRequestIdentity(changed.requests[0]!), verdictJson(changed.authority, 0, votes[0]!)));
+    expect(planRefutationPanelPersistence(step, history, publicationResolver)).toMatchObject({ ok: false, error: { kind: "malformed-history" } });
+  });
+
+  it("confidence changes never change majority votes, counts, surviving severity or uncertainty", () => {
+    fc.assert(fc.property(fc.integer({ min: 0, max: 100 }), (confidence) => {
+      const fixture = mixedRefutationFixture(`current-confidence-${confidence}`, confidence);
+      let step = startPersistentRefutationPanel(fixture.authority);
+      const tied = [["refuted", "uncertain"], ["upheld", "uncertain"], ["uncertain", "uncertain"]] as const;
+      for (const index of [0, 1, 2]) step = reduced(submitRefutationVerdict(step.state, publicationResolver,
+        panelRequestIdentity(fixture.requests[index]!), verdictJson(fixture.authority, index, tied[index]!)));
+      step = reduced(completePersistentRefutationPanel(step.state, publicationResolver));
+      if (step.state.stage !== "done") throw new Error("done expected");
+      expect(step.state.decision.threshold).toBe(2);
+      expect(step.state.decision.refuted).toHaveLength(0);
+      expect(step.state.decision.retained.map(({ finding }) => finding.severity)).toEqual(["critical", "critical"]);
+      expect(step.state.decision.retained[0]?.finding.basis?.truthConfidence).toBe(confidence);
+    }), { seed: 4402, numRuns: 25 });
   });
 });
 

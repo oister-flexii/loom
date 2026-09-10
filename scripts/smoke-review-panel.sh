@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 #
-# Smoke test for the wave gate's adversarial review panel.
+# Historical/manual smoke test for the wave gate's adversarial review panel.
+# Untagged fixture Findings exercise the retained compatibility helpers, not
+# current reviewer issuance. smoke-orchestration-facades.ts covers that chain.
 #
 # Drives the REAL loom hook CLI (not the unit-test harness) through the whole
 # refutation lifecycle to prove the wiring end-to-end:

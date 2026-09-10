@@ -6,7 +6,8 @@ import { awaitUserAction, parseAgentRequestAuthority, parseStoredAgentRequestAut
 import { defaultRefutationThreshold } from '../../../core/review-panel';
 import { completePersistentRefutationPanel, deriveRefutationVerifierBinding, panelRequestIdentity, parseRefutationPanelAuthority, rejectRefutationVerdict, startPersistentRefutationPanel, submitRefutationVerdict, type RefutationPanelAuthority } from '../../../core/panel-program';
 import type { FindingOutcome } from '../../../core/review-panel';
-import { buildContextPacket, encodeByteSection, type ContextPacket } from '../../../orchestration/context-packets';
+import { buildContextPacket, encodeByteSection, parseContextPacket, contextPacketDigest, type ContextPacket } from '../../../orchestration/context-packets';
+import { CURRENT_REVIEWER_PROTOCOL } from '../../../core/reviewer-contract';
 import { captureKey } from '../../../core/harness-capture';
 import { inspectRunDirectoryEntry, type RunDirHandle } from '../../../orchestration/run-directory-handle';
 import { TASK_GRAPH_PATH } from '../../../config';
@@ -19,8 +20,8 @@ import { observeReviewedWorkspace } from '../reviewed-workspace';
 import { observeWaveSpecCheckDocuments } from '../../../orchestration/wave-spec-check-documents';
 import { applyFindingOutcomes, preserveAcceptedReviewRunFindings } from '../../../core/findings';
 import { buildFindingBrief } from '../../../core/review-panel';
-import { applyReviewResolution, constrainReviewResolutionToScope, resolveTaskReviewFindings } from '../../../core/review-output';
-import type { ReviewRunSlotAuthority, Task, TaskGraph } from '../../../types';
+import { applyReviewResolution, constrainReviewResolutionToScope, parseReviewerEvidence, resolveTaskReviewFindings, resolveIssuedTaskReviewFindings, type IssuedReviewerProtocol, type IssuedWaveReviewerProtocol } from '../../../core/review-output';
+import type { CurrentReviewRunSlotAuthority, LegacyReviewRunSlotAuthority, Task, TaskGraph } from '../../../types';
 import { anyActiveSubagent } from '../../../machine';
 import { parseSpecCheckOutput, settleSpecCheck, specCheckAuthorityProblem, specCheckNeedsReapplication } from '../../../core/spec-check';
 import { reconcileWaveBlock } from '../../../core/wave-gate-model';
@@ -40,7 +41,7 @@ import {
   type WaveSpecCheckTaskAuthority,
   type WaveTaskRunAuthority,
 } from '../../../core/wave-review-authority';
-import { durableCaptureRejection, durableRefutationRequests, exactObject, executableRefutationRequests, failed, parseRegisteredFacadeProgram, publicationResolver, publishInitialBatch, recoverOrPublishRefutationRetry, refutationRejectionDiagnostic, renderSpawnTask, type FacadeDriveResult, type RegisteredWaveGateProgram } from './helpers';
+import { durableCaptureRejection, durableRefutationRequests, exactObject, executableRefutationRequests, failed, parseRegisteredFacadeProgram, reviewerProtocolResolver, publicationResolver, publishInitialBatch, recoverOrPublishRefutationRetry, refutationRejectionDiagnostic, renderSpawnTask, type FacadeDriveResult, type RegisteredWaveGateProgram } from './helpers';
 
 export const waveGateDeps = Object.freeze({
   loadPlanModels: loadPlanModelsSource,
@@ -279,7 +280,8 @@ export function prepareExhaustedWaveGateRestart(
   if (!replacement.ok) return replacement;
   const exhaustedSlots = Object.freeze(outstanding.map(({ task, slot }) => `${task.id}/${slot.agent}`));
   const registration: RegisteredWaveGateProgram = Object.freeze({
-    schemaVersion: 1,
+    schemaVersion: 2,
+    reviewerProtocol: CURRENT_REVIEWER_PROTOCOL,
     kind: "wave-gate",
     input: Object.freeze({ wave }),
     taskIds: previous.taskIds,
@@ -360,7 +362,8 @@ export function prepareOrphanedWaveGateRecovery(
     replacementAuthorityDigest: replacement.active.authorityDigest,
   });
   const registration: RegisteredWaveGateProgram = Object.freeze({
-    schemaVersion: 1,
+    schemaVersion: 2,
+    reviewerProtocol: CURRENT_REVIEWER_PROTOCOL,
     kind: "wave-gate",
     input: Object.freeze({ wave: expected.wave }),
     taskIds,
@@ -414,20 +417,46 @@ export function waveRequests(
   return prepared.value;
 }
 
-export function resolveWaveReviewerTranscript(task: Task, agent: string, bytes: Uint8Array) {
-  return constrainReviewResolutionToScope(
-    resolveTaskReviewFindings(
-      Buffer.from(bytes).toString("utf8"),
-      agent,
-      task.review_run,
-      task.review_generation,
-    ),
-    [...(task.file_list ?? []), ...(task.files_modified ?? [])],
-  );
+function isWaveProtocol(protocol: IssuedReviewerProtocol): protocol is IssuedWaveReviewerProtocol {
+  return protocol.subject.kind === "wave-review";
 }
 
-export function reviewerRejectionReason(task: Task, agent: string, bytes: Uint8Array): string | null {
-  const resolution = resolveWaveReviewerTranscript(task, agent, bytes);
+function issuedWaveProtocol(
+  handle: RunDirHandle,
+  registration: RegisteredWaveGateProgram,
+  request: AgentRequestAuthority,
+): IssuedWaveReviewerProtocol {
+  const issued = reviewerProtocolResolver(handle, registration)(request);
+  if (!issued.ok) throw new Error(issued.error.message);
+  if (!isWaveProtocol(issued.value)) throw new Error("Wave reviewer request lacks issued Wave protocol authority");
+  return issued.value;
+}
+
+export function resolveWaveReviewerTranscript(
+  task: Task, agent: string, bytes: Uint8Array, protocol: IssuedWaveReviewerProtocol,
+) {
+  if (protocol.subject.taskId !== task.id || protocol.request.role !== agent ||
+      task.review_run?.packet_id !== protocol.subject.packetId ||
+      (task.review_generation ?? 0) !== protocol.subject.generation) {
+    return { kind: "ignored-stale" as const, agent, message: "issued reviewer protocol differs from the current Task Review Packet" };
+  }
+  if (protocol.protocolVersion === 1) {
+    const admitted = parseReviewerEvidence(protocol, bytes);
+    // Only genuinely issued v1 may retain its original diagnostic/retry bytes.
+    // Authority failure is never an invitation to the historical parser.
+    if (admitted.ok || admitted.error.code === "legacy-evidence-failed") {
+      return constrainReviewResolutionToScope(resolveTaskReviewFindings(
+        Buffer.from(bytes).toString("utf8"), agent, task.review_run, task.review_generation,
+      ), protocol.subject.scope);
+    }
+  }
+  return resolveIssuedTaskReviewFindings(protocol, bytes);
+}
+
+export function reviewerRejectionReason(
+  task: Task, agent: string, bytes: Uint8Array, protocol: IssuedWaveReviewerProtocol,
+): string | null {
+  const resolution = resolveWaveReviewerTranscript(task, agent, bytes, protocol);
   if (resolution.kind === "evidence-failed" || resolution.kind === "ignored-stale") return resolution.message;
   const slot = task.review_run?.slot_authority?.find((candidate) => candidate.agent === agent);
   const applied = applyReviewResolution(task, resolution, slot);
@@ -446,6 +475,7 @@ export type WaveTaskReviewRetry = Readonly<{
   agent: string;
   slotId: string;
   retryDiagnostic: string;
+  protocol: IssuedWaveReviewerProtocol;
   request: InitialSpawnRequestInput;
   packet: ContextPacket;
 }>;
@@ -493,8 +523,27 @@ export const WAVE_RETRY_FIXED_TAIL = [
   "once in packet order. Use an empty array when there are no prior findings.",
 ].join("\n");
 
+const CURRENT_WAVE_RETRY_TAIL = "Emit exactly one JSON object conforming to the unchanged reviewer-payload-schema and reviewer-impact-rubric sections.";
+
+function boundedRetryReason(reason: string): string {
+  const escaped = JSON.stringify(reason);
+  let bounded = "";
+  let length = 0;
+  for (const character of escaped) {
+    const size = new TextEncoder().encode(character).length;
+    if (length + size > 2048) break;
+    bounded += character;
+    length += size;
+  }
+  return bounded;
+}
+
 export function waveRetryDiagnosticText(reason: string): string {
   return `${WAVE_RETRY_PREAMBLE}${reason}\n\n${WAVE_RETRY_FIXED_TAIL}`;
+}
+
+function currentWaveRetryDiagnosticText(reason: string): string {
+  return `${WAVE_RETRY_PREAMBLE}${boundedRetryReason(reason)}\n\n${CURRENT_WAVE_RETRY_TAIL}`;
 }
 
 /**
@@ -506,6 +555,7 @@ export function waveRetryDiagnosticText(reason: string): string {
  */
 export function parseWaveRetryDiagnosticSection(
   bytes: readonly number[],
+  protocolVersion: 1 | 2,
 ): Readonly<{ ok: true; reason: string }> | Readonly<{ ok: false; message: string }> {
   let text: string;
   try {
@@ -517,12 +567,15 @@ export function parseWaveRetryDiagnosticSection(
     return { ok: false, message: "wave attempt-1 rejection section lacks the canonical retry preamble" };
   }
   const remainder = text.slice(WAVE_RETRY_PREAMBLE.length);
-  const tailMarker = `\n\n${WAVE_RETRY_FIXED_TAIL}`;
+  const tailMarker = `\n\n${protocolVersion === 1 ? WAVE_RETRY_FIXED_TAIL : CURRENT_WAVE_RETRY_TAIL}`;
   const markerIndex = remainder.indexOf(tailMarker);
   if (markerIndex < 0 || remainder.slice(markerIndex + tailMarker.length) !== "") {
     return { ok: false, message: "wave attempt-1 rejection section is not one canonical diagnostic-rich retry" };
   }
   const reason = remainder.slice(0, markerIndex);
+  if (protocolVersion === 2 && new TextEncoder().encode(reason).length > 2048) {
+    return { ok: false, message: "current Wave retry diagnostic exceeds its byte bound" };
+  }
   if (reason.trim().length === 0) {
     return { ok: false, message: "wave attempt-1 rejection section carries an empty parser rejection reason" };
   }
@@ -543,6 +596,9 @@ export function deriveWaveAttemptTwo(
   }
   const original = handle.readContext(attemptOne.contextDigest);
   if (!original.ok) throw new Error(original.error.message);
+  if (original.value.schemaVersion === 2 && retryDiagnostic === null) {
+    throw new Error("current Wave reviewer retry requires its rejection diagnostic");
+  }
   // Attempt 1 was rejected. Surface the parser's exact reason plus the exact
   // required schema so the model corrects the specific defect instead of
   // re-emitting the same malformed shape into its final attempt — a silent
@@ -550,18 +606,14 @@ export function deriveWaveAttemptTwo(
   const variableContext = retryDiagnostic === null
     ? original.value.variableContext
     : (() => {
-        const section = encodeByteSection("wave-review-attempt-1-rejection", waveRetryDiagnosticText(retryDiagnostic));
+        const diagnostic = original.value.schemaVersion === 2
+          ? currentWaveRetryDiagnosticText(retryDiagnostic) : waveRetryDiagnosticText(retryDiagnostic);
+        const section = encodeByteSection("wave-review-attempt-1-rejection", diagnostic);
         if (!section.ok) throw new Error(section.error.message);
         return Object.freeze([...original.value.variableContext, section.value]);
       })();
-  const packet = buildContextPacket({
-    requestId: requestId.value,
-    role: original.value.role,
-    requiredSkill: original.value.requiredSkill,
-    outputContract: original.value.outputContract,
-    fixedContext: original.value.fixedContext,
-    variableContext,
-  });
+  const retryPacket = { ...original.value, requestId: requestId.value, variableContext };
+  const packet = parseContextPacket({ ...retryPacket, digest: contextPacketDigest(retryPacket) });
   if (!packet.ok) throw new Error(packet.error.message);
   // Stored mode: attemptOne was read back from this run's durable artifacts, so
   // its role->profile/skill couplings belong to the policy tables in force when
@@ -592,6 +644,29 @@ export function deriveWaveAttemptTwo(
   });
 }
 
+function persistedWaveReviewerRetry(
+  handle: RunDirHandle,
+  taskId: string,
+  protocol: IssuedWaveReviewerProtocol,
+  derived: ReturnType<typeof deriveWaveAttemptTwo>,
+  storedRequests: readonly AgentRequestAuthority[],
+): ReturnType<typeof deriveWaveAttemptTwo> {
+  const first = protocol.request;
+  const stored = storedRequests.filter((request) => request.program === "wave-gate" &&
+    request.slotId === first.slotId && request.role === first.role && request.attempt === 2);
+  if (stored.length > 1) throw new Error(`Task ${taskId}/${first.role} has multiple stored retry authorities`);
+  if (stored[0] === undefined) return derived;
+  const second = handle.readContext(stored[0].contextDigest);
+  if (!second.ok) throw new Error(second.error.message);
+  const problem = persistedWaveAttemptTwoCompatibilityProblem(first, stored[0], protocol.packet, second.value);
+  if (problem !== null) throw new Error(problem);
+  if (protocol.protocolVersion === 2 && !canonicalStructuralEquals(derived.packet, second.value)) {
+    throw new Error("current retry diagnostic differs from the captured attempt-1 rejection");
+  }
+  return { request: { authority: stored[0], context: { digest: second.value.digest,
+    slot: { kind: "fixed-artifact-slot", path: `contexts/${second.value.digest}.json` } } }, packet: second.value };
+}
+
 export async function currentWaveTaskReviewRetries(
   handle: RunDirHandle,
   registration: RegisteredWaveGateProgram,
@@ -599,16 +674,23 @@ export async function currentWaveTaskReviewRetries(
   issued: readonly AgentRequestAuthority[],
 ): Promise<readonly WaveTaskReviewRetry[]> {
   const events = await handle.readEvents();
+  const storedRequests = handle.readIssuedRequests();
+  if (!storedRequests.ok) throw new Error(storedRequests.error.message);
   const rejectionReason = (authority: AgentRequestAuthority): string | null => {
     const found = events.find(({ event }) => matchesCaptureRejection(event, authority));
-    if (found === undefined || typeof found.event !== "object" || found.event === null) return null;
+    if (found === undefined || typeof found.event !== "object" || found.event === null) {
+      const marker = handle.readCaptureRejection(authority);
+      if (!marker.ok) throw new Error(marker.error.message);
+      return marker.value;
+    }
     const diagnostic = (found.event as Record<string, unknown>).diagnostic;
     return typeof diagnostic === "string" && diagnostic.trim() !== "" ? diagnostic : "capture was rejected without a diagnostic";
   };
   return graph.tasks.filter((task) => registration.taskIds.includes(task.id) && task.review_run !== undefined)
     .flatMap((task) => {
       const run = task.review_run!;
-      if (run.slot_authority === undefined || run.slot_authority.length !== run.expected_agents.length) {
+      if (run.slot_authority === undefined || run.slot_authority.length !== run.expected_agents.length ||
+          (run.reviewer_protocol !== undefined && !canonicalStructuralEquals(run.expected_agents, WAVE_REVIEW_AGENTS))) {
         throw new Error(`Task ${task.id} active Review Run lacks engine-issued exact slot authority`);
       }
       return run.expected_agents.flatMap((agent, index) => {
@@ -624,17 +706,21 @@ export async function currentWaveTaskReviewRetries(
         }
         const captured = handle.readTranscriptBytes(attemptOne);
         const retryReason = captured.ok
-          ? reviewerRejectionReason(task, agent, captured.value) ??
+          ? reviewerRejectionReason(task, agent, captured.value, issuedWaveProtocol(handle, registration, attemptOne)) ??
             "attempt 1 was accepted but did not close this outstanding slot"
           : rejectionReason(attemptOne) ?? task.review_error ?? captured.error.message;
-        const retryDiagnostic = waveRetryDiagnosticText(retryReason);
-        const retry = deriveWaveAttemptTwo(handle, attemptOne, retryReason);
+        const protocol = issuedWaveProtocol(handle, registration, attemptOne);
+        const retryDiagnostic = protocol.protocolVersion === 2
+          ? currentWaveRetryDiagnosticText(retryReason) : waveRetryDiagnosticText(retryReason);
+        const derived = deriveWaveAttemptTwo(handle, attemptOne, retryReason);
+        const retry = persistedWaveReviewerRetry(handle, task.id, protocol, derived, storedRequests.value);
         return [Object.freeze({
           taskId: task.id,
           packetId: run.packet_id,
           agent,
           slotId: slot.slot_id,
           retryDiagnostic,
+          protocol,
           request: retry.request,
           packet: retry.packet,
         })];
@@ -654,20 +740,39 @@ export async function markWaveTaskReviewRetriesIssued(
       if (mine.length === 0) return task;
       const run = task.review_run;
       if (run === undefined || mine.some((retry) => retry.packetId !== run.packet_id)) {
+        if (mine.every(({ protocol }) => protocol.protocolVersion === 2)) return task;
         throw new Error(`Task ${task.id} Review Packet changed before attempt-2 issuance could commit`);
+      }
+      if (run.reviewer_protocol !== undefined) {
+        const replacements = new Map<string, CurrentReviewRunSlotAuthority>();
+        for (const retry of mine) {
+          const request = parseStoredAgentRequestAuthority(retry.request.authority);
+          if (!request.ok) throw new Error("Wave retry request authority is invalid");
+          const context = readWaveReviewContext([retry.packet], request.value.contextDigest);
+          if (context.kind !== "loaded" ||
+              waveReviewerSlotProblem(locked, task, context.value, retry.protocol, false) !== null) return task;
+          const slot = run.slot_authority.find(({ agent }) => agent === retry.agent);
+          if (slot === undefined || run.evidence.some(({ agent }) => agent === retry.agent)) return task;
+          const expected = slot.attempted === 1 ? retry.protocol.request : request.value;
+          if (slot.request_id !== expected.requestId || slot.context_digest !== expected.contextDigest ||
+              slot.slot_id !== request.value.slotId || request.value.attempt !== 2 ||
+              request.value.role !== slot.agent || request.value.runId !== retry.protocol.request.runId) return task;
+          replacements.set(slot.agent, Object.freeze({ ...slot, attempted: 2,
+            request_id: request.value.requestId, context_digest: request.value.contextDigest }));
+        }
+        const [first, ...rest] = run.slot_authority;
+        const replace = (slot: CurrentReviewRunSlotAuthority) => replacements.get(slot.agent) ?? slot;
+        return { ...task, review_run: { ...run, slot_authority: [replace(first), ...rest.map(replace)] } };
       }
       if (run.slot_authority === undefined) {
         throw new Error(`Task ${task.id} active Review Run lost exact slot authority`);
       }
+      const [first, ...rest] = run.slot_authority;
+      const replace = (slot: LegacyReviewRunSlotAuthority): LegacyReviewRunSlotAuthority => mine.some((retry) =>
+        retry.agent === slot.agent && retry.slotId === slot.slot_id) ? { ...slot, attempted: 2 } : slot;
       return {
         ...task,
-        review_run: {
-          ...run,
-          slot_authority: run.slot_authority.map((slot) => mine.some((retry) =>
-            retry.agent === slot.agent && retry.slotId === slot.slot_id)
-            ? { ...slot, attempted: 2 as const }
-            : slot) as unknown as typeof run.slot_authority,
-        },
+        review_run: { ...run, slot_authority: [replace(first), ...rest.map(replace)] },
       };
     }),
   }));
@@ -675,8 +780,8 @@ export async function markWaveTaskReviewRetriesIssued(
 
 function reviewSlotAuthorityRoster(
   authorities: readonly AgentRequestAuthority[],
-): readonly [ReviewRunSlotAuthority, ...ReviewRunSlotAuthority[]] {
-  const slotFor = (agent: (typeof WAVE_REVIEW_AGENTS)[number]): ReviewRunSlotAuthority => {
+): readonly [LegacyReviewRunSlotAuthority, ...LegacyReviewRunSlotAuthority[]] {
+  const slotFor = (agent: (typeof WAVE_REVIEW_AGENTS)[number]): LegacyReviewRunSlotAuthority => {
     const matches = authorities.filter((authority) => authority.role === agent);
     if (matches.length !== 1) {
       throw new Error(`current Review Packet requires exactly one ${agent} slot, got ${matches.length}`);
@@ -783,9 +888,20 @@ export async function installWaveReviewRuns(
         throw new Error(`Task ${task.id} current Review Packet lacks the exact reviewer roster`);
       }
       const slotAuthority = reviewSlotAuthorityRoster(authorities);
+      const currentSlot = (slot: LegacyReviewRunSlotAuthority): CurrentReviewRunSlotAuthority => {
+        const request = authorities.find(({ role }) => role === slot.agent)!;
+        return Object.freeze({ ...slot, request_id: request.requestId, context_digest: request.contextDigest });
+      };
+      const [firstSlot, ...remainingSlots] = slotAuthority;
+      const currentSlots: readonly [CurrentReviewRunSlotAuthority, ...CurrentReviewRunSlotAuthority[]] =
+        Object.freeze([currentSlot(firstSlot), ...remainingSlots.map(currentSlot)]);
       if (task.review_run !== undefined) {
         const run = task.review_run;
-        const same = run.packet_id === taskRun.packetId && run.generation === taskRun.generation &&
+        const sameProtocol = registration.schemaVersion === 2
+          ? canonicalStructuralEquals(run.reviewer_protocol, registration.reviewerProtocol) &&
+            canonicalStructuralEquals(run.slot_authority, currentSlots)
+          : run.reviewer_protocol === undefined;
+        const same = sameProtocol && run.packet_id === taskRun.packetId && run.generation === taskRun.generation &&
           run.head_sha === taskRun.headSha && canonicalStructuralEquals(run.expected_agents, WAVE_REVIEW_AGENTS) &&
           run.slot_authority?.length === slotAuthority.length && slotAuthority.every((slot, index) =>
             run.slot_authority?.[index]?.agent === slot.agent && run.slot_authority[index]?.slot_id === slot.slot_id) &&
@@ -808,7 +924,9 @@ export async function installWaveReviewRuns(
           expected_agents: WAVE_REVIEW_AGENTS,
           prior_finding_ids: (task.findings ?? []).map(({ id }) => id),
           evidence: [],
-          slot_authority: slotAuthority,
+          ...(registration.schemaVersion === 2
+            ? { reviewer_protocol: registration.reviewerProtocol, slot_authority: currentSlots }
+            : { slot_authority: slotAuthority }),
           workspace_scope: currentWorkspace.scope,
           workspace_head_sha: taskRun.workspaceHeadSha ?? taskRun.headSha,
           wave_gate_run_id: specCheckAuthority.runId,
@@ -1009,7 +1127,10 @@ export function persistedWaveAttemptTwoCompatibilityProblem(
       first.role !== attemptOne.role || first.requiredSkill !== (attemptOne.requiredSkill ?? "none")) {
     return "persisted attempt-1 context does not match its request authority";
   }
-  if (second.digest !== attemptTwo.contextDigest || second.requestId !== attemptTwo.requestId || second.role !== first.role ||
+  if (second.schemaVersion !== first.schemaVersion ||
+      (first.schemaVersion === 2 && (second.schemaVersion !== 2 ||
+        !canonicalStructuralEquals(first.reviewerProtocol, second.reviewerProtocol))) ||
+      second.digest !== attemptTwo.contextDigest || second.requestId !== attemptTwo.requestId || second.role !== first.role ||
       second.requiredSkill !== first.requiredSkill || second.outputContract !== first.outputContract ||
       !canonicalStructuralEquals(second.fixedContext, first.fixedContext)) {
     return "persisted attempt-2 context changed fixed attempt-1 authority";
@@ -1019,9 +1140,9 @@ export function persistedWaveAttemptTwoCompatibilityProblem(
   const diagnostic = second.variableContext.length === first.variableContext.length + 1 &&
     canonicalStructuralEquals(second.variableContext.slice(0, -1), first.variableContext) &&
     second.variableContext.at(-1)?.label === "wave-review-attempt-1-rejection"
-    ? parseWaveRetryDiagnosticSection(second.variableContext.at(-1)!.bytes)
+    ? parseWaveRetryDiagnosticSection(second.variableContext.at(-1)!.bytes, first.schemaVersion)
     : ({ ok: false as const, message: "attempt-2 context carries no wave-review-attempt-1-rejection section" });
-  if (!unchangedLegacyContext) {
+  if (first.schemaVersion === 2 || !unchangedLegacyContext) {
     if (!diagnostic.ok) {
       return `persisted attempt-2 context is neither a legacy retry nor one diagnostic-rich retry (${diagnostic.message})`;
     }
@@ -1038,7 +1159,6 @@ export async function exhaustedWaveReviewerAttempts(
   const captured = handle.readCapturedAttempts();
   if (!issued.ok) return { ok: false, message: issued.error.message };
   if (!captured.ok) return { ok: false, message: captured.error.message };
-  const events = await handle.readEvents();
   const exhausted = new Set<string>();
   for (const task of graph.tasks.filter(({ id }) => registration.taskIds.includes(id))) {
     const run = task.review_run;
@@ -1072,7 +1192,7 @@ export async function exhaustedWaveReviewerAttempts(
       if (captured.value.has(key)) {
         const transcript = handle.readTranscriptBytes(authority);
         if (!transcript.ok) return { ok: false, message: transcript.error.message };
-        const rejection = reviewerRejectionReason(task, slot.agent, transcript.value);
+        const rejection = reviewerRejectionReason(task, slot.agent, transcript.value, issuedWaveProtocol(handle, registration, authority));
         if (rejection === null) {
           return {
             ok: false,
@@ -1082,9 +1202,9 @@ export async function exhaustedWaveReviewerAttempts(
         exhausted.add(key);
         continue;
       }
-      const rejected = events.some(({ event }) => matchesCaptureRejection(event, authority));
-      if (rejected) {
-        const terminal = await handle.rejectCapture(authority);
+      const rejected = await durableCaptureRejection(handle, authority);
+      if (rejected !== null) {
+        const terminal = await handle.rejectCapture(authority, rejected);
         if (!terminal.ok) return { ok: false, message: terminal.error.message };
         exhausted.add(terminal.value);
       }
@@ -1204,7 +1324,8 @@ function sameOrphanRecoveryRegistration(
   left: RegisteredWaveGateProgram,
   right: RegisteredWaveGateProgram,
 ): boolean {
-  return left.input.wave === right.input.wave && left.authorityDigest === right.authorityDigest &&
+  return left.schemaVersion === right.schemaVersion && canonicalStructuralEquals(left.reviewerProtocol, right.reviewerProtocol) &&
+    left.input.wave === right.input.wave && left.authorityDigest === right.authorityDigest &&
     left.taskIds.length === right.taskIds.length && left.taskIds.every((taskId, index) => taskId === right.taskIds[index]) &&
     left.orphanRecovery?.previousRunId === right.orphanRecovery?.previousRunId &&
     left.orphanRecovery?.previousAuthorityDigest === right.orphanRecovery?.previousAuthorityDigest;
@@ -1336,7 +1457,7 @@ export async function startWaveGateFacade(
     if (taskIds.length === 0) return waveBlocked(handle, `wave ${wave} has no tasks`);
     const authorityDigest = waveGateAuthorityDigest(wave, taskIds, initial);
     const registration: RegisteredWaveGateProgram = Object.freeze({
-      schemaVersion: 1, kind: "wave-gate", input: Object.freeze({ wave }),
+      schemaVersion: 2, reviewerProtocol: CURRENT_REVIEWER_PROTOCOL, kind: "wave-gate", input: Object.freeze({ wave }),
       taskIds: Object.freeze(taskIds), authorityDigest,
     });
     // Publish the recoverable Run Directory program first. If publication is
@@ -1388,6 +1509,72 @@ export async function markWaveSpecCheckRetryIssued(
   });
 }
 
+function verifyCompletedWaveProtocols(handle: RunDirHandle, registration: RegisteredWaveGateProgram): void {
+  const requests = handle.readIssuedRequests();
+  if (!requests.ok) throw new Error(requests.error.message);
+  const protocols = requests.value.filter(({ program, role }) => program === "wave-gate" && role !== "spec-check-invoker")
+    .map((request) => issuedWaveProtocol(handle, registration, request));
+  for (const taskId of registration.taskIds) {
+    if (WAVE_REVIEW_AGENTS.some((role) => !protocols.some((protocol) =>
+      protocol.subject.taskId === taskId && protocol.request.role === role))) {
+      throw new Error(`completed Wave Task ${taskId} lacks the complete published reviewer protocol roster`);
+    }
+  }
+}
+
+function readRegisteredWaveProgram(handle: RunDirHandle): RegisteredWaveGateProgram {
+  const raw = handle.readProgramRegistration();
+  if (!raw.ok) throw new Error(raw.error.message);
+  const parsed = parseRegisteredFacadeProgram(raw.value);
+  if (parsed.kind !== "registered" || parsed.program.kind !== "wave-gate") {
+    throw new Error("Wave reviewer registered authority is unavailable");
+  }
+  return parsed.program;
+}
+
+/** Protected membership is rechecked inside every Task write, independently of payload admission. */
+function waveReviewerSlotProblem(
+  graph: TaskGraph,
+  task: Task,
+  context: WaveReviewContextAuthority,
+  protocol: IssuedWaveReviewerProtocol,
+  checkAttempt = true,
+): string | null {
+  const request = protocol.request;
+  const run = task.review_run;
+  const taskRun = context.taskRun;
+  const epoch = graph.wave_review_epoch;
+  const active = graph.active_wave_gate;
+  const slot = run?.slot_authority?.find(({ agent }) => agent === request.role);
+  if (graph.current_phase !== "execute" || graph.current_wave !== context.wave ||
+      active?.runId !== request.runId || active.wave !== context.wave || active.terminalOutcome !== null ||
+      active.authorityDigest !== context.authorityDigest || epoch?.runId !== request.runId ||
+      epoch.wave !== context.wave || epoch.batchEpoch !== context.batchEpoch ||
+      run === undefined || taskRun === null || taskRun.taskId !== task.id ||
+      taskRun.generation !== run.generation || (task.review_generation ?? 0) !== run.generation ||
+      taskRun.packetId !== run.packet_id || taskRun.headSha !== run.head_sha ||
+      context.batchEpoch !== run.head_sha || slot?.slot_id !== request.slotId ||
+      (checkAttempt && slot.attempted !== request.attempt)) {
+    return "request does not belong to the exact current Wave Review Packet slot";
+  }
+  if (protocol.protocolVersion === 2) {
+    const scope = [...new Set([...(task.file_list ?? []), ...(task.files_modified ?? [])])].sort();
+    if (!canonicalStructuralEquals(run.expected_agents, WAVE_REVIEW_AGENTS) ||
+        !canonicalStructuralEquals(run.reviewer_protocol, protocol.reviewerProtocol) ||
+        run.wave_gate_run_id !== request.runId || run.wave_gate_authority_digest !== context.authorityDigest ||
+        run.workspace_head_sha !== taskRun.workspaceHeadSha ||
+        !canonicalStructuralEquals(run.workspace_scope, protocol.subject.scope) ||
+        !canonicalStructuralEquals(scope, protocol.subject.scope) ||
+        !canonicalStructuralEquals(run.prior_finding_ids, protocol.subject.priorFindingIds) ||
+        (checkAttempt && (slot.request_id !== request.requestId || slot.context_digest !== request.contextDigest))) {
+      return "current reviewer protocol differs from protected workspace/request/context authority";
+    }
+  } else if (run.reviewer_protocol !== undefined) {
+    return "historical reviewer cannot settle a current Review Run";
+  }
+  return null;
+}
+
 type WaveFacadeSubmissionResult =
   | Readonly<{ ok: true }>
   | Readonly<{ ok: false; message: string }>;
@@ -1395,7 +1582,7 @@ type WaveFacadeSubmissionResult =
 export async function applyWaveFacadeSubmission(
   handle: RunDirHandle,
   authority: AgentRequestAuthority,
-  raw: string,
+  raw: string | Uint8Array,
 ): Promise<WaveFacadeSubmissionResult> {
   try {
     const packet = handle.readContext(authority.contextDigest);
@@ -1418,7 +1605,7 @@ export async function applyWaveFacadeSubmission(
         specCheckDocuments.plan.path,
       );
       const currentDocuments = currentObservation.authority;
-      const parsed = parseSpecCheckOutput(raw);
+      const parsed = parseSpecCheckOutput(typeof raw === "string" ? raw : Buffer.from(raw).toString("utf8"));
       const wave = context.wave;
       const batchEpoch = context.batchEpoch;
       return manager.updateAndReturn<WaveFacadeSubmissionResult>((locked) => {
@@ -1450,6 +1637,13 @@ export async function applyWaveFacadeSubmission(
     }
     const taskId = context.subject.taskId;
     if (typeof taskId !== "string") return { ok: false, message: "Wave reviewer request lacks Task identity" };
+    const registration = readRegisteredWaveProgram(handle);
+    const protocol = issuedWaveProtocol(handle, registration, authority);
+    // Submission follows durable capture. Re-read its original bytes rather than
+    // trust a CLI's decoded string (or a conflicting duplicate submission).
+    const captured = handle.readTranscriptBytes(authority);
+    if (!captured.ok) return { ok: false, message: captured.error.message };
+    const bytes = captured.value;
     return manager.updateAndReturn<WaveFacadeSubmissionResult>((locked) => {
       const target = locked.tasks.find((task) => task.id === taskId);
       if (target === undefined) {
@@ -1458,28 +1652,18 @@ export async function applyWaveFacadeSubmission(
           value: { ok: false as const, message: `Wave reviewer task ${taskId} is no longer in the protected task graph` },
         };
       }
-      const epoch = locked.wave_review_epoch;
-      const run = target.review_run;
-      const taskRun = context.taskRun;
-      const slot = run?.slot_authority?.find((candidate) => candidate.agent === authority.role);
-      if (run === undefined || taskRun === null || taskRun === undefined ||
-          taskRun.taskId !== target.id || taskRun.generation !== run.generation ||
-          taskRun.packetId !== run.packet_id || taskRun.headSha !== run.head_sha ||
-          context.batchEpoch !== run.head_sha || epoch?.runId !== authority.runId ||
-          epoch.wave !== context.wave || epoch.batchEpoch !== context.batchEpoch || slot === undefined ||
-          slot.slot_id !== authority.slotId || slot.attempted !== authority.attempt) {
+      const slot = target.review_run?.slot_authority?.find((candidate) => candidate.agent === authority.role);
+      const problem = waveReviewerSlotProblem(locked, target, context, protocol);
+      if (problem !== null) {
         return {
           state: locked,
           value: {
             ok: false as const,
-            message: `Wave reviewer request ${authority.requestId} does not belong to Task ${taskId}'s exact current Review Packet slot`,
+            message: `Wave reviewer request ${authority.requestId} does not belong to Task ${taskId}'s exact current Review Packet slot: ${problem}`,
           },
         };
       }
-      const resolution = constrainReviewResolutionToScope(
-        resolveTaskReviewFindings(raw, authority.role, run, target.review_generation),
-        [...(target.file_list ?? []), ...(target.files_modified ?? [])],
-      );
+      const resolution = resolveWaveReviewerTranscript(target, authority.role, bytes, protocol);
       const tasks = locked.tasks.map((task) =>
         task.id === taskId ? applyReviewResolution(task, resolution, slot) : task);
       return {
@@ -1515,6 +1699,10 @@ export async function resumeWaveGateFacade(
     if (depth > MAX_WAVE_GATE_REDERIVATIONS) {
       return waveBlocked(handle, `Wave Gate resume exceeded ${MAX_WAVE_GATE_REDERIVATIONS} re-derivations without durable progress; refusing to spin`);
     }
+    const registered = readRegisteredWaveProgram(handle);
+    if (!canonicalStructuralEquals(registered, registration)) {
+      return waveBlocked(handle, "supplied Wave registration differs from durable protocol authority");
+    }
     const manager = new StateManager(TASK_GRAPH_PATH);
     const graph = manager.load();
     const terminal = await handle.readCheckpoint();
@@ -1527,6 +1715,7 @@ export async function resumeWaveGateFacade(
       }
       const record = raw as Record<string, unknown>;
       if (record.kind === "wave-gate-done") {
+        verifyCompletedWaveProtocols(handle, registration);
         if (!exactObject(record, ["schemaVersion", "kind", "receipt"]) || record.schemaVersion !== 1) {
           return waveBlocked(handle, "terminal Wave Gate checkpoint has invalid schema");
         }
@@ -1550,6 +1739,7 @@ export async function resumeWaveGateFacade(
       entry.runId === handle.runId && entry.wave === registration.input.wave &&
       entry.authorityDigest === registration.authorityDigest);
     if (completed !== undefined) {
+      verifyCompletedWaveProtocols(handle, registration);
       await handle.writeCheckpoint(JSON.stringify({
         schemaVersion: 1,
         kind: "wave-gate-done",
@@ -1713,10 +1903,9 @@ export async function resumeWaveGateFacade(
       const task = taskRun === null ? undefined : currentRuns.find(({ id }) => id === taskRun.taskId);
       currentPacketMembership.set(
         authority.requestId,
-        taskRun !== null && task?.review_run?.packet_id === taskRun.packetId &&
-          task.review_run.generation === taskRun.generation &&
-          task.review_run.slot_authority?.some(({ agent, slot_id, attempted }) =>
-            agent === authority.role && slot_id === authority.slotId && attempted === authority.attempt) === true,
+        task !== undefined && waveReviewerSlotProblem(
+          refreshed, task, context.value, issuedWaveProtocol(handle, registration, authority),
+        ) === null,
       );
     }
     const belongsToCurrentPacket = (request: AgentRequestAuthority): boolean =>
@@ -1739,7 +1928,7 @@ export async function resumeWaveGateFacade(
       }
       const bytes = handle.readTranscriptBytes(request);
       if (!bytes.ok) return waveBlocked(handle, bytes.error.message);
-      const applied = await applyWaveFacadeSubmission(handle, request, Buffer.from(bytes.value).toString("utf8"));
+      const applied = await applyWaveFacadeSubmission(handle, request, bytes.value);
       if (!applied.ok) return waveBlocked(handle, `captured Wave evidence could not be reconciled: ${applied.message}`);
     }
 
@@ -1751,7 +1940,7 @@ export async function resumeWaveGateFacade(
       belongsToCurrentPacket(authority) && !captured.value.has(captureKey(authority.slotId, authority.attempt)))) {
       const rejection = await durableCaptureRejection(handle, request);
       if (rejection === null) continue;
-      const terminal = await handle.rejectCapture(request);
+      const terminal = await handle.rejectCapture(request, rejection);
       if (!terminal.ok) return waveBlocked(handle, terminal.error.message);
       const read = readWaveRequestContext(handle, request);
       if (!read.ok) return read.result;
@@ -1776,20 +1965,11 @@ export async function resumeWaveGateFacade(
         if (context.kind !== "loaded" || taskRun === null) {
           return waveBlocked(handle, "rejected reviewer request lacks exact Task authority");
         }
+        const protocol = issuedWaveProtocol(handle, registration, request);
         await manager.update((locked) => {
           const target = locked.tasks.find(({ id }) => id === taskRun.taskId);
-          const run = target?.review_run;
-          const slot = run?.slot_authority?.find(({ agent }) => agent === request.role);
-          const epoch = locked.wave_review_epoch;
-          const active = locked.active_wave_gate;
-          if (locked.current_phase !== "execute" || locked.current_wave !== context.value.wave ||
-              active?.runId !== request.runId || active.wave !== context.value.wave ||
-              active.authorityDigest !== context.value.authorityDigest ||
-              epoch?.runId !== request.runId || epoch.wave !== context.value.wave ||
-              epoch.batchEpoch !== context.value.batchEpoch || run === undefined ||
-              run.generation !== taskRun.generation || run.packet_id !== taskRun.packetId ||
-              run.head_sha !== taskRun.headSha || slot?.slot_id !== request.slotId ||
-              slot.attempted !== request.attempt) return locked;
+          if (target === undefined || waveReviewerSlotProblem(locked, target, context.value, protocol) !== null) return locked;
+          const slot = target.review_run?.slot_authority?.find(({ agent }) => agent === request.role);
           const resolution = {
             kind: "evidence-failed" as const,
             agent: request.role,
@@ -1871,7 +2051,7 @@ export async function resumeWaveGateFacade(
       for (const request of capturedRetries) {
         const bytes = handle.readTranscriptBytes(request.authority);
         if (!bytes.ok) return waveBlocked(handle, bytes.error.message);
-        const applied = await applyWaveFacadeSubmission(handle, request.authority, Buffer.from(bytes.value).toString("utf8"));
+        const applied = await applyWaveFacadeSubmission(handle, request.authority, bytes.value);
         if (!applied.ok) return waveBlocked(handle, `captured Wave retry could not be reconciled: ${applied.message}`);
       }
       const afterReplay = manager.load();
@@ -1961,7 +2141,7 @@ export async function resumeWaveGateFacade(
       if (captured.value.has(captureKey(durable.authority.slotId, durable.authority.attempt))) {
         const bytes = handle.readTranscriptBytes(durable.authority);
         if (!bytes.ok) return waveBlocked(handle, bytes.error.message);
-        const applied = await applyWaveFacadeSubmission(handle, durable.authority, Buffer.from(bytes.value).toString("utf8"));
+        const applied = await applyWaveFacadeSubmission(handle, durable.authority, bytes.value);
         if (!applied.ok) return waveBlocked(handle, `captured Wave spec-check retry could not be reconciled: ${applied.message}`);
         const accepted = manager.load().spec_check;
         if (accepted?.wave !== registration.input.wave || accepted.verdict === "EVIDENCE_CAPTURE_FAILED") {
@@ -1978,6 +2158,13 @@ export async function resumeWaveGateFacade(
       } };
     }
 
+    if (registration.schemaVersion === 2 && refreshed.tasks.some((task) => {
+      if (!registration.taskIds.includes(task.id)) return false;
+      const accepted = task.accepted_review_authority;
+      return accepted?.run_id !== handle.runId || accepted.authority_digest !== registration.authorityDigest ||
+        accepted.generation !== (task.review_generation ?? 0) ||
+        !canonicalStructuralEquals(accepted.reviewer_protocol, registration.reviewerProtocol);
+    })) return waveBlocked(handle, "current Wave review lacks exact accepted reviewer protocol authority");
     const current = deriveWaveReadiness(refreshed, currentWaveGateDeps(refreshed, handle.runDirectory));
     if (!current.ok) return waveBlocked(handle, current.error.reasons.map(({ message }) => message).join("; "));
     if (current.value.facts.findingCounts.kind === "known" && current.value.facts.findingCounts.value.activeCritical > 0) {

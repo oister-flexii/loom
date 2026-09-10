@@ -5,10 +5,17 @@ import { fileURLToPath } from "node:url";
 import { REVIEW_SUB_AGENTS, WAVE_REVIEW_AGENTS, isReviewAgent } from "../src/config";
 import { carriedOverCount, resolveReviewFindings, resolveTaskReviewFindings } from "../src/core/review-output";
 import type { ReviewRun } from "../src/types";
+import { buildContextPacket, buildReviewerContextPacket, encodeByteSection, type ContextPacket } from "../src/core/context-packets";
+import { CURRENT_REVIEWER_PROTOCOL } from "../src/core/reviewer-contract";
+import { parseIssuedReviewerProtocol, parseReviewerEvidence } from "../src/core/review-output";
+import { createPublicationAuthorityResolver, parseAgentRequestAuthority, parseIssuedSpawnRequest, parseOrchestrationRunId, parseRequestId } from "../src/core/orchestration-contract";
+import { resolveAgentPolicy, resolveModelProfile, lowerModelProfile } from "../src/core/model-profiles";
+import { sha256Hex } from "../src/core/review-packet";
+import { extractWireContractRegion } from "../src/core/wire-contract";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const agentFile = (name: string): string =>
-  readFileSync(join(REPO_ROOT, "agents", `${name}.md`), "utf-8");
+  readFileSync(join(REPO_ROOT, "references", "reviewer-protocol-v1", "agents", `${name}.md`), "utf-8");
 
 /**
  * Membership in `REVIEW_SUB_AGENTS` is not a label — it is a routing decision
@@ -23,7 +30,7 @@ const agentFile = (name: string): string =>
  * executes the current catalog/agent-file relationship so that mismatch cannot
  * recur; it does not infer historical spawn order from today’s command prose.
  */
-describe("every REVIEW_SUB_AGENT declares the Machine Summary contract", () => {
+describe("every archived v1 REVIEW_SUB_AGENT retains the Machine Summary contract", () => {
   const agents = [...REVIEW_SUB_AGENTS].sort();
 
   it("has at least one member (a vacuous pass would prove nothing)", () => {
@@ -163,5 +170,99 @@ describe("every REVIEW_SUB_AGENT declares the Machine Summary contract", () => {
     expect(resolved.findings.blockStatus.kind).toBe("used");
     // The block won cleanly, so nothing was carried over and nothing duplicated.
     expect(carriedOverCount(resolved.findings.blockStatus)).toBe(0);
+  });
+});
+
+function value<T>(result: Readonly<{ ok: true; value: T }> | Readonly<{ ok: false }>): T {
+  if (!result.ok) throw new Error(JSON.stringify(result));
+  return result.value;
+}
+
+/** Independent in-memory publication bytes, parsed by the real issuance boundary. */
+function issuedContract(role: string, version: 1 | 2) {
+  const runId = value(parseOrchestrationRunId(`run.shim.${role}.${version}`));
+  const policy = value(resolveAgentPolicy(role));
+  const profile = value(resolveModelProfile(policy.profile));
+  const scope = ["src/x.ts"];
+  const input = {
+    requestId: value(parseRequestId(`request:${role}:${version}`)), role, requiredSkill: policy.requiredSkill ?? "none",
+    fixedContext: [value(encodeByteSection("standalone-review-authority", JSON.stringify({ runId, role, attempt: 1, scope })))],
+    variableContext: [],
+  };
+  const packet = value<ContextPacket>(version === 2 ? buildReviewerContextPacket(input)
+    : buildContextPacket({ ...input, outputContract: "Return the Loom Machine Summary." }));
+  const authority = value(parseAgentRequestAuthority({
+    runId, requestId: packet.requestId, slotId: `slot:${role}`, program: "standalone-review", role, attempt: 1,
+    modelProfile: policy.profile, requiredSkill: policy.requiredSkill,
+    harnessBinding: { pi: lowerModelProfile(profile, "pi"), claude: lowerModelProfile(profile, "claude-code") },
+    contextDigest: packet.digest, outputSlot: `transcripts/${role}/attempt-1.raw`,
+  }));
+  const context = { digest: packet.digest, slot: { kind: "fixed-artifact-slot", path: `contexts/${packet.digest}.json` } };
+  const content = { schemaVersion: 1, kind: "batch-published", effectId: "effect:shim", runId,
+    requestIds: [packet.requestId], contextDigests: [packet.digest], issuedRequests: [{ authority, context }] };
+  const receipt = { ...content, publicationDigest: sha256Hex(JSON.stringify(content)) };
+  const resolver = createPublicationAuthorityResolver(() => ({ ok: true, value: [...new TextEncoder().encode(JSON.stringify(receipt))] }));
+  const request = value(parseIssuedSpawnRequest(resolver, { authority, context, issuance: {
+    schemaVersion: 1, kind: "issued-spawn-request-proof", runId, effectId: content.effectId, publicationDigest: receipt.publicationDigest, batchIndex: 0,
+  } }));
+  const registration = version === 2
+    ? { schemaVersion: 2 as const, runId, program: "standalone-review" as const, reviewerProtocol: CURRENT_REVIEWER_PROTOCOL }
+    : { schemaVersion: 1 as const, runId, program: "standalone-review" as const };
+  return value(parseIssuedReviewerProtocol({ request, packet, registration, subject: { kind: "standalone-review", runId, scope } }));
+}
+
+const currentAgentFile = (role: string) => readFileSync(join(REPO_ROOT, "agents", `${role}.md`), "utf-8");
+function fencedSection(markdown: string, label: string): string {
+  const section = markdown.split(`## ${label}\n\n`)[1];
+  const found = section === undefined ? null : /^```json\n([\s\S]*?)\n```/.exec(section);
+  if (found === null) throw new Error(`missing executable section ${label}`);
+  return found[1]!;
+}
+
+describe("all seven issued reviewer shims select packet authority before current guidance", () => {
+  it.each([...REVIEW_SUB_AGENTS])("%s stamped example is admitted under its actual issued v2 packet", (role) => {
+    const issued = issuedContract(role, 2);
+    const markdown = currentAgentFile(role);
+    const region = value(extractWireContractRegion(markdown));
+    const example = fencedSection(region, "Current example (standalone)");
+    const schema = fencedSection(region, "reviewer-payload-schema");
+    const packetSchema = issued.packet.fixedContext.find(({ label }) => label === "reviewer-payload-schema");
+    const packetRubric = issued.packet.fixedContext.find(({ label }) => label === "reviewer-impact-rubric");
+    expect(packetSchema).toBeDefined();
+    expect(packetRubric).toBeDefined();
+    expect(schema).toBe(new TextDecoder().decode(Uint8Array.from(packetSchema!.bytes)));
+    expect(region.split("## reviewer-impact-rubric\n\n")[1] + "\n")
+      .toBe(new TextDecoder().decode(Uint8Array.from(packetRubric!.bytes)));
+    const admitted = value(parseReviewerEvidence(issued, new TextEncoder().encode(example)));
+    expect(admitted.protocolVersion).toBe(2);
+    expect(admitted.findings.criticalCount).toBe(1);
+    expect(admitted.findings.drafts[0]?.basis).toEqual(JSON.parse(example).findings[0].basis);
+    expect(parseReviewerEvidence(issued, new TextEncoder().encode("CRITICAL_COUNT: 0\nADVISORY_COUNT: 0")).ok).toBe(false);
+  });
+
+  it.each([...REVIEW_SUB_AGENTS])("%s genuine issued v1 selects read-only archived instructions, never v2", (role) => {
+    const issued = issuedContract(role, 1);
+    const markdown = currentAgentFile(role);
+    const bootstrap = markdown.split("\nYou are ")[0]!;
+    expect(bootstrap).toContain("## FIRST: issued Context Packet bootstrap");
+    expect(bootstrap).toContain("LOOM_CONTEXT_READ_COMMAND");
+    expect(bootstrap).not.toContain("call `readContextPacket`");
+    expect(bootstrap.indexOf("LOOM_CONTEXT_READ_COMMAND")).toBeLessThan(bootstrap.indexOf("schema-1"));
+    expect(bootstrap).toContain(`references/reviewer-protocol-v1/agents/${role}.md`);
+    expect(bootstrap).toContain("references/reviewer-protocol-v1/agents/_shared/wire-contract.md");
+    expect(bootstrap).toContain("INAPPLICABLE to this legacy request");
+    expect(bootstrap).toContain("If either archive is missing/unreadable, report unavailable and stop");
+    const archive = agentFile(issued.request.role);
+    const shared = readFileSync(join(REPO_ROOT, "references/reviewer-protocol-v1/agents/_shared/wire-contract.md"), "utf-8");
+    expect(value(extractWireContractRegion(archive))).toBe(shared.replace(/\n$/, ""));
+    const template = /### Machine Summary\nCRITICAL_COUNT:[\s\S]*?(?=\n\n```findings)/.exec(shared)?.[0];
+    if (template === undefined) throw new Error("archive lacks Machine Summary template");
+    const output = template.replace("{number of critical findings}", "0").replace("{number of advisory findings}", "0")
+      .replace("{one critical finding per line}", "").replace("{one advisory finding per line}", "");
+    expect(value(parseReviewerEvidence(issued, new TextEncoder().encode(output))).findings.criticalCount).toBe(0);
+    expect(issued.packet.schemaVersion).toBe(1);
+    expect(issued.packet.fixedContext.some(({ label }) => label === "reviewer-impact-rubric")).toBe(false);
+    const currentExample = fencedSection(value(extractWireContractRegion(markdown)), "Current example (standalone)");
+    expect(parseReviewerEvidence(issued, new TextEncoder().encode(currentExample)).ok).toBe(false);
   });
 });

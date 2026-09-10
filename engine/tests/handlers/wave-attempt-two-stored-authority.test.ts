@@ -17,9 +17,12 @@ import { join } from "node:path";
 import {
   deriveWaveAttemptTwo,
   persistedWaveAttemptTwoCompatibilityProblem,
+  parseWaveRetryDiagnosticSection,
+  WAVE_RETRY_PREAMBLE,
+  WAVE_RETRY_FIXED_TAIL,
 } from "../../src/handlers/helpers/programs/wave-gate";
 import { openRunDirectory, type RunDirHandle } from "../../src/orchestration/run-directory-handle";
-import { buildContextPacket, encodeByteSection, type ContextPacket } from "../../src/orchestration/context-packets";
+import { buildContextPacket, buildReviewerContextPacket, contextPacketDigest, parseContextPacket, encodeByteSection, type ContextPacket } from "../../src/orchestration/context-packets";
 import {
   parseRequestId,
   parseSlotId,
@@ -50,6 +53,7 @@ function publishedAttemptOne(
   profileId: string,
   slotSeed: string,
   requestSeed: string,
+  protocolVersion: 1 | 2 = 1,
 ): Promise<Readonly<{ handle: RunDirHandle; attemptOne: AgentRequestAuthority; packet: ContextPacket }>> {
   const profile = resolveModelProfile(profileId);
   const runsRoot = mkdtempSync(join(tmpdir(), prefix));
@@ -63,14 +67,17 @@ function publishedAttemptOne(
   );
   const slotId = authorityValue(parseSlotId(`slot:${slotSeed.repeat(32)}`));
   const requestId = authorityValue(parseRequestId(`wave-request:${requestSeed.repeat(32)}:1`));
-  const packet = authorityValue(buildContextPacket({
+  const packetInput = {
     requestId,
     role: ROLE,
     requiredSkill: "none",
     outputContract: "Emit an exact Review Packet.",
     fixedContext: Object.freeze([section]),
     variableContext: Object.freeze([]),
-  }));
+  };
+  const packet = protocolVersion === 2
+    ? authorityValue(buildReviewerContextPacket(packetInput))
+    : authorityValue(buildContextPacket(packetInput));
 
   return handle.publishContext(packet).then((published) => {
     if (!published.ok) throw new Error("test context could not be published");
@@ -122,6 +129,37 @@ describe("Wave attempt-2 derivation from stored attempt-1 authority", () => {
     expect(persistedWaveAttemptTwoCompatibilityProblem(
       attemptOne, attemptTwo, packet, derived.packet,
     )).toBeNull();
+  });
+
+  it("keeps current descriptor and fixed bytes, appending exactly one bounded diagnostic instead of a duplicate schema", async () => {
+    const policy = authorityValue(resolveAgentPolicy(ROLE));
+    const { handle, attemptOne, packet } = await publishedAttemptOne("loom-v2-attempt2-", policy.profile, "e", "f", 2);
+    const retry = deriveWaveAttemptTwo(handle, attemptOne, "bad input\n".repeat(2000));
+    const authority = authorityValue(parseStoredAgentRequestAuthority(retry.request.authority));
+    expect(retry.packet.schemaVersion).toBe(2);
+    expect(retry.packet.fixedContext).toEqual(packet.fixedContext);
+    expect(retry.packet.variableContext).toHaveLength(1);
+    const section = retry.packet.variableContext[0]!;
+    const parsed = parseWaveRetryDiagnosticSection(section.bytes, 2);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) expect(Buffer.byteLength(parsed.reason)).toBeLessThanOrEqual(2048);
+    expect(Buffer.from(section.bytes).toString()).toContain("unchanged reviewer-payload-schema");
+    expect(Buffer.from(section.bytes).toString()).not.toContain("review_lifecycle");
+    expect(persistedWaveAttemptTwoCompatibilityProblem(attemptOne, authority, packet, retry.packet)).toBeNull();
+    expect(() => deriveWaveAttemptTwo(handle, attemptOne)).toThrow("requires its rejection diagnostic");
+    const stripped = { ...retry.packet, variableContext: [] };
+    const noDiagnostic = authorityValue(parseContextPacket({ ...stripped, digest: contextPacketDigest(stripped) }));
+    const rewrittenAuthority = authorityValue(parseStoredAgentRequestAuthority({ ...authority, contextDigest: noDiagnostic.digest }));
+    expect(persistedWaveAttemptTwoCompatibilityProblem(attemptOne, rewrittenAuthority, packet, noDiagnostic)).not.toBeNull();
+  });
+
+  it("preserves historical retry text exactly, including multiline rejection reasons", async () => {
+    const policy = authorityValue(resolveAgentPolicy(ROLE));
+    const { handle, attemptOne } = await publishedAttemptOne("loom-v1-retry-text-", policy.profile, "1", "2");
+    const reason = "bad lifecycle JSON:\n  exact historical diagnostic  ";
+    const retry = deriveWaveAttemptTwo(handle, attemptOne, reason);
+    expect(Buffer.from(retry.packet.variableContext[0]!.bytes).toString()).toBe(`${WAVE_RETRY_PREAMBLE}${reason}\n\n${WAVE_RETRY_FIXED_TAIL}`);
+    expect(parseWaveRetryDiagnosticSection(retry.packet.variableContext[0]!.bytes, 1)).toEqual({ ok: true, reason });
   });
 
   it("keeps the retry on the current profile when nothing was grandfathered", async () => {

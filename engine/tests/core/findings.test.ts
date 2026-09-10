@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import fc from "fast-check";
-import type { Task, TaskCommonMetadata } from "../../src/types";
+import type { LegacyDraftFinding as DraftFinding, Task, TaskCommonMetadata } from "../../src/types";
 import { taskFixture as makeTaskFixture } from "../fixtures/task-lifecycle";
 import {
   applyFindingOutcomes,
@@ -30,7 +30,6 @@ import {
   parseStoredRefutations,
   salvageFindingsFromMalformedRefutations,
   salvageFindingsFromMalformedResolutions,
-  type DraftFinding,
   type Finding,
   type RefutedFinding,
 } from "../../src/core/findings";

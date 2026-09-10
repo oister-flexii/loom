@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { disposeFixturePiSessions, fixturePiEnvironment } from "../../../fixtures/pi-session";
 import { recordInstalledRemediation } from "../../../../src/handlers/helpers/programs/remediation";
 import { openRunDirectory, type RunDirHandle } from "../../../../src/orchestration/run-directory-handle";
 import type { AgentRequestAuthority, VerifiedIndexInstalled } from "../../../../src/core/orchestration-contract";
@@ -14,6 +15,7 @@ const CLI = join(ENGINE, "src", "cli.ts");
 const cleanup: string[] = [];
 
 afterEach(() => {
+  disposeFixturePiSessions();
   for (const path of cleanup.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
@@ -28,7 +30,7 @@ function runCli(repository: string, args: readonly string[], input = "") {
     cwd: repository,
     encoding: "utf8",
     input,
-    env: process.env,
+    env: fixturePiEnvironment(repository),
   });
 }
 
@@ -56,15 +58,7 @@ async function completedReviewFixture() {
   };
   const source = openRunDirectory(runsRoot, sourceRun);
   if (!source.ok) throw new Error(source.error.message);
-  const transcript = [
-    "### Machine Summary",
-    "CRITICAL_COUNT: 0",
-    "ADVISORY_COUNT: 0",
-    "",
-    "```findings",
-    "[]",
-    "```",
-  ].join("\n");
+  const transcript = JSON.stringify({ schemaVersion: 2, kind: "standalone-review", findings: [] });
   for (const { authority } of action.requests) {
     const captured = await source.value.captureTranscript(authority, [...Buffer.from(transcript)]);
     if (!captured.ok) throw new Error(captured.error.message);

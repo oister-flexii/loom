@@ -266,7 +266,7 @@ For every Wave Task, Loom creates an immutable Review Packet and issues the exac
 - `type-design-analyzer`;
 - `comment-analyzer`.
 
-`spec-check-invoker` runs once for the Wave. Exact transcript bytes are captured into engine-reserved slots. Missing/malformed output cannot be papered over by a clean sibling result.
+`spec-check-invoker` runs once for the Wave; its grammar, identity and Requirement Coverage floor are unchanged. Fresh reviewer registrations use Reviewer Protocol v2: exactly one JSON final payload under the issued packet's frozen schema/rubric, with engine-derived counts/IDs. Wave payloads echo packetId/generation and assess every prior ID once in packet order. Criticals require full Finding Basis; advisories require reason. Structure is not proof of truth or impact. Exact final bytes are captured into engine-reserved slots, then registered resume admits/settles them without legacy polling/concatenation. Malformed current output creates failed evidence, not a synthetic Finding. See [protocol operations](operations.md#reviewer-protocol-v2).
 
 ### Remediation-aware reviews
 
@@ -287,6 +287,11 @@ Baseline lenses are `reproduction` and `intent`; signals can add `blast-radius`,
 A strict majority must refute a Finding. `uncertain` is neutral and ties keep the Finding. Refuted Findings move to `refuted_findings` with all reasoning; they are never deleted.
 
 Only criticals are refuted. Advisories are user-policy decisions, not verifier work.
+The same panel assesses the assertion including its preconditions, contract and
+consequence, retaining full current basis. A true assertion is not refuted merely
+because repair seems unimportant; surviving criticals block. No severity downgrade
+or standalone severity-dispute action is added. The existing explicit Wave operator
+override remains separate, never automatic fallback for malformed reviewer evidence.
 
 ### Advisory decision
 
@@ -319,9 +324,18 @@ The registered Standalone Review Program:
 5. captures the complete transcript roster unchanged;
 6. aggregates identified Findings;
 7. runs the registered refutation panel when criticals exist;
-8. publishes authoritative `artifacts/result.json`.
+8. publishes authoritative `result.json` at the Run Directory root.
 
 The result separates `surviving_critical_findings`, `advisory_findings`, and `refuted_critical_findings`. A missing roster member or invalid panel result blocks publication.
+Use `helper orchestration inspect --runs-root <root> --run <run>` for the
+engine-rendered emitted/admitted and after-refutation summary from authenticated
+published authority, not authored arithmetic. JSON inspection keeps its existing
+shape; no summary artifact is added.
+
+Completed and unfinished issued reviewer v1 runs retain their original protocol,
+including all retry/replay prefixes and packet-first archived role/shared-wire
+instructions. The archive does not invent an originally frozen rubric/persona.
+Fresh starts select v2 internally, never by output sniffing or caller flag.
 
 Review aspects are `code`, `errors`, `tests`, `types`, `comments`, `architecture`, `simplify`, and `all` (default). Architecture review is included explicitly for `all`/`architecture` and by size/shape policy for large structural changes.
 
@@ -337,7 +351,7 @@ This workflow composes two registered programs around semantic remediation:
 
 A Declared Repair Group does not replace or mint Finding IDs. Compatible sibling reuse across distinct groups is allowed; duplicate sibling paths inside one group or conflicting cross-group statuses are rejected. `repair-checked` means the repaired-state checks were engine-observed on unchanged candidate bytes. It does not prove the declared family, root cause, invariant, sibling completeness, or Historical RED, and it is not `ResolvedFinding` status. An operator-owned fixed command can still fabricate a syntactically valid new report; structured fresh engine observations are not semantic proof.
 
-Completed schema-v1 remediation remains read-only `historical-unknown`, returning its old receipt without reinstalling; unfinished v1 cannot install and missing v2 authority never downgrades. Completed-v2 replay refuses missing/malformed checkpoint audit arrays with an explicit audit-path diagnostic. The source review's immutable publication remains source authority, not a new P3 assessment. For installing this feature itself, the admitted CLI with loaded Skill 3.1 may use its existing protocol after external validation; that bootstrap becomes historical-unknown, not v2 repair-checked. New live P3 use requires package reload/restart; never bypass runtime admission.
+Completed schema-v1 remediation remains read-only `historical-unknown`, returning its old receipt without reinstalling; unfinished v1 cannot install and missing v2 authority never downgrades. Completed-v2 replay refuses missing/malformed checkpoint audit arrays with an explicit audit-path diagnostic. The source review's immutable publication remains source authority, not a new P3 assessment. P4 source review, merge, publication and runtime cutover remain pending. Subsequent review/install must use the actually admitted runtime, with unchanged P3 v2 report/install policy; a reviewer-v1 source is not a remediation-v1 run. The Skill 3.1 bootstrap in ADR-0008 remains historical P3 context. Reload/restart after package installation; never bypass runtime admission.
 
 The parent must not substitute its own `git add` recipe or inject process outcomes, report bytes, manifests, installation receipts, or Run JSON through remediation input or hand-built run artifacts. Exact staged-set installation is a security and correctness boundary, not convenience automation. See the canonical [Review and Fix Skill](../skills/review-and-fix/SKILL.md) and [operations recovery](operations.md#remediation-and-git-safety).
 

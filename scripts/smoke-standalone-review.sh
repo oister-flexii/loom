@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Historical/manual v1 helper coverage, not registered current reviewer ingress.
+# smoke-orchestration-facades.ts covers current issuance and publication.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

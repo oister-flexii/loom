@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { ReviewerProtocolAuthorityResolver } from "./review-output";
 import { isDeepStrictEqual } from "node:util";
 import {
   canonicalRecord,
@@ -419,7 +420,7 @@ declare class AuthoritativeStandaloneReviewResultMembership {
   private readonly authoritativeStandaloneReviewResultMembership: true;
 }
 
-/** Opaque schema-v1 result authority consumed by downstream remediation (T5). */
+/** Opaque versioned result authority consumed by downstream remediation (T5). */
 export type AuthoritativeStandaloneReviewResult =
   AuthoritativeStandaloneReviewResultMembership & AdjudicatedStandaloneReview;
 
@@ -506,7 +507,7 @@ function readyToFinalize(
   if (finalized.value.reviewerEvidence.length === 0 ||
       finalized.value.reviewerEvidence.some(({ authorityKind }) => authorityKind !== "request-bound")) {
     return reject(state, event, "aggregate-route-mismatch",
-      "schema-v1 finalization requires exact non-empty request-bound reviewer evidence");
+      `schema-v${aggregate.schemaVersion} finalization requires exact non-empty request-bound reviewer evidence`);
   }
   const publication = prepareResultPublicationIntent(finalized.value);
   if (!publication.ok) {
@@ -531,7 +532,7 @@ function readyToFinalize(
 }
 
 /**
- * The only schema-v1 result parser. It requires the opaque ready state produced
+ * The version-aware result parser requires the opaque ready state produced
  * from roster/panel proof plus the exact engine-issued publication receipt.
  */
 export function parseAuthoritativeStandaloneReviewResult(
@@ -563,10 +564,10 @@ export function parseAuthoritativeStandaloneReviewResult(
   try {
     expectedRaw = JSON.parse(serializeAdjudicatedStandaloneReview(finalized.value));
   } catch {
-    return authoritativeResultFailure("engine-authored schema-v1 finalization is not canonical JSON");
+    return authoritativeResultFailure(`engine-authored schema-v${ready.authority.schemaVersion} finalization is not canonical JSON`);
   }
   if (!isDeepStrictEqual(rawResult, expectedRaw)) {
-    return authoritativeResultFailure("schema-v1 result bytes do not match the exact independently frozen finalization");
+    return authoritativeResultFailure(`schema-v${ready.authority.schemaVersion} result bytes do not match the exact independently frozen finalization`);
   }
   const reconciled = reconcileEffectReceipt(ready.publicationIntent, rawReceipt);
   if (!reconciled.ok || reconciled.value.kind !== "artifact-set-published") {
@@ -1042,7 +1043,7 @@ function serializableRefutationCompletion(receipt: StandaloneRefutationCompletio
 export function serializeStandaloneReviewMachineState(state: StandaloneReviewMachineState): string {
   const record: Record<string, unknown> = {
     ...state,
-    schema_version: 1,
+    schema_version: state.authority.schemaVersion,
     authority: JSON.parse(serializeStandaloneReviewAuthority(state.authority)),
   };
   // `in` narrows the real union; the ad-hoc intersection cast this replaces
@@ -1206,6 +1207,8 @@ function parsePersistedStandaloneProgress(
 export function parseStandaloneReviewMachineState(
   raw: unknown,
   publicationResolver: PublicationAuthorityResolver,
+  reviewerProtocols: ReviewerProtocolAuthorityResolver,
+  registeredAuthority: FrozenStandaloneReviewAuthority,
 ): Readonly<{ ok: true; value: StandaloneReviewMachineState }> |
   Readonly<{ ok: false; error: StandaloneMachineStateParseError }> {
   const failure = (message: string) => canonicalRecord({
@@ -1214,15 +1217,18 @@ export function parseStandaloneReviewMachineState(
   });
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return failure("checkpoint must be an object");
   const record = raw as Record<string, unknown>;
-  if (record.schema_version !== 1 || typeof record.kind !== "string") return failure("checkpoint schema_version or kind is invalid");
+  if (record.schema_version !== registeredAuthority.schemaVersion || typeof record.kind !== "string") return failure("checkpoint schema_version or kind differs from registered authority");
   const authority = parseStandaloneReviewAuthority(record.authority);
   if (!authority.ok) return failure(authority.errors.join("; "));
+  if (serializeStandaloneReviewAuthority(authority.value) !== serializeStandaloneReviewAuthority(registeredAuthority)) {
+    return failure("checkpoint authority differs from independently parsed program registration");
+  }
 
   const started = startStandaloneReviewMachine(authority.value);
   if (record.kind === "preparing") return canonicalRecord({ ok: true as const, value: started });
 
   if (record.kind === "recoverable-blocked") {
-    const predecessor = parseStandaloneReviewMachineState(record.predecessor, publicationResolver);
+    const predecessor = parseStandaloneReviewMachineState(record.predecessor, publicationResolver, reviewerProtocols, registeredAuthority);
     if (!predecessor.ok) return failure(`recoverable predecessor is invalid: ${predecessor.error.message}`);
     if (predecessor.value.kind === "recoverable-blocked" || predecessor.value.kind === "done" ||
         predecessor.value.kind === "terminal-blocked") {
@@ -1315,7 +1321,7 @@ export function parseStandaloneReviewMachineState(
     return canonicalRecord({ ok: true as const, value: terminal.value });
   }
 
-  const completion = parseStandaloneRosterCompletionProof(authority.value, publicationResolver, record.completion);
+  const completion = parseStandaloneRosterCompletionProof(authority.value, publicationResolver, record.completion, reviewerProtocols);
   if (!completion.ok) return failure(completion.error.violations.map((violation) => violation.kind).join("; "));
   // A retried slot's accepted proof entry is at attempt 2. Replay the exact
   // rejection that advanced it — derived from the persisted accepted

@@ -1,4 +1,11 @@
 import { spawnSync } from "node:child_process";
+import { captureNativeReview } from "../../../fixtures/native-review-capture";
+import { disposeFixturePiSessions, withFixturePiSession as inDirectory } from "../../../fixtures/pi-session";
+import { createHash } from "node:crypto";
+import { captureKey } from "../../../../src/core/harness-capture";
+import { prepareDefectFamilyAccounting } from "../../../../src/core/defect-family-accounting";
+import { parseStandaloneReviewMachineState } from "../../../../src/core/standalone-review-machine";
+import { renderStandaloneReviewSummary } from "../../../../src/core/standalone-review";
 import {
   mkdirSync,
   mkdtempSync,
@@ -16,7 +23,8 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AgentRequestAuthority } from "../../../../src/core/orchestration-contract";
 import { REMEDIATION_EVENT_RESOURCE_POLICY } from "../../../../src/handlers/helpers/programs/remediation-events";
-import { parseRegisteredFacadeProgram } from "../../../../src/handlers/helpers/programs/helpers";
+import { parsedAuthority, publicationResolver, reviewerProtocolResolver, parseRegistration, parseRegisteredFacadeProgram } from "../../../../src/handlers/helpers/programs/helpers";
+import { REVIEWER_PAYLOAD_EXAMPLE_V2 } from "../../../../src/core/reviewer-contract";
 import {
   inspectRemediationFacade,
   prepareRemediationFacadeStart,
@@ -25,6 +33,7 @@ import {
 } from "../../../../src/handlers/helpers/programs/remediation";
 import {
   resumeStandaloneFacade,
+  replayStandaloneResultFromEvidence,
   startStandaloneFacade,
 } from "../../../../src/handlers/helpers/programs/standalone";
 import {
@@ -38,6 +47,7 @@ const CHECK_ID = "project:repair-regression";
 const REPORT_PATH = ".loom/completion-reports/repair.xml";
 
 afterEach(() => {
+  disposeFixturePiSessions();
   for (const path of cleanup.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
@@ -47,38 +57,23 @@ function git(repository: string, args: readonly string[]): string {
   return result.stdout;
 }
 
-async function inDirectory<T>(directory: string, operation: () => Promise<T>): Promise<T> {
-  const previous = process.cwd();
-  process.chdir(directory);
-  try {
-    return await operation();
-  } finally {
-    process.chdir(previous);
-  }
-}
-
 function reviewerTranscript(critical: boolean): string {
   const findings = critical
     ? [
-        { severity: "critical", file: "src/repair.mjs", line: 1, claim: "repair predicate returns the vulnerable result" },
-        { severity: "critical", file: "src/repair.mjs", line: 1, claim: "refuted sibling claim" },
-        { severity: "advisory", file: "src/repair.mjs", line: 1, claim: "advisory naming improvement" },
+        { ...REVIEWER_PAYLOAD_EXAMPLE_V2.findings[0], severity: "critical", file: "src/repair.mjs", line: 1, claim: "  repair predicate returns the vulnerable result\n  " },
+        { ...REVIEWER_PAYLOAD_EXAMPLE_V2.findings[0], severity: "critical", file: "src/repair.mjs", line: 1, claim: "refuted sibling claim" },
+        { severity: "advisory", file: "src/repair.mjs", line: 1, claim: "advisory naming improvement", reason: "Clarify the exported predicate name." },
       ]
     : [];
-  return [
-    "### Machine Summary",
-    `CRITICAL_COUNT: ${critical ? 2 : 0}`,
-    `ADVISORY_COUNT: ${critical ? 1 : 0}`,
-    ...(critical ? [
-      "CRITICAL: repair predicate returns the vulnerable result",
-      "CRITICAL: refuted sibling claim",
-      "ADVISORY: advisory naming improvement",
-    ] : []),
-    "",
-    "```findings",
-    JSON.stringify(findings),
-    "```",
-  ].join("\n");
+  return JSON.stringify({ schemaVersion: 2, kind: "standalone-review", findings });
+}
+
+function registeredStandalone(handle: RunDirHandle) {
+  const stored = handle.readProgramRegistration();
+  if (!stored.ok) throw new Error(stored.error.message);
+  const parsed = parseRegistration(stored.value);
+  if (!parsed.ok) throw new Error(parsed.message);
+  return parsed.value;
 }
 
 function refutationTranscript(handle: RunDirHandle, authority: AgentRequestAuthority): string {
@@ -102,7 +97,7 @@ function refutationTranscript(handle: RunDirHandle, authority: AgentRequestAutho
   });
 }
 
-async function completeCriticalStandaloneReview(repository: string, runsRoot: string): Promise<Readonly<{
+async function completeCriticalStandaloneReview(repository: string, runsRoot: string, native = false): Promise<Readonly<{
   sourceRun: string;
   source: RunDirHandle;
   findingId: string;
@@ -122,36 +117,46 @@ async function completeCriticalStandaloneReview(repository: string, runsRoot: st
   const initial = started.action as { kind: string; requests: readonly { authority: AgentRequestAuthority }[] };
   expect(initial.kind).toBe("spawn-batch");
   for (const [index, { authority }] of initial.requests.entries()) {
-    const captured = await created.value.captureTranscript(
-      authority,
-      [...Buffer.from(reviewerTranscript(index === 0))],
-    );
-    expect(captured.ok).toBe(true);
+    const raw = native && index === 0 ? '{"schemaVersion":2,"schemaVersion":2}' : reviewerTranscript(index === 0);
+    if (native) {
+      const captured = await captureNativeReview(repository, created.value, authority, index % 2 === 0 ? "claude" : "pi", [raw]);
+      expect(captured.captured, captured.diagnostic).toBe(true);
+      const bytes = created.value.readTranscriptBytes(authority);
+      if (!bytes.ok) throw new Error(bytes.error.message);
+      expect(Buffer.from(bytes.value).toString("utf8")).toBe(raw);
+    } else {
+      expect((await created.value.captureTranscript(authority, [...Buffer.from(raw)])).ok).toBe(true);
+    }
   }
 
-  const panelResult = await inDirectory(repository, () => resumeStandaloneFacade(created.value, {
-    schemaVersion: 1,
-    kind: "standalone-review",
-    input: { kind: "all", files: ["src/repair.mjs"], dryRun: false },
-    authority: created.value.readProgramRegistration().ok
-      ? (created.value.readProgramRegistration() as { ok: true; value: { authority: unknown } }).value.authority
-      : null,
-  }));
+  if (native) {
+    const retried = await inDirectory(repository, () => resumeStandaloneFacade(created.value, registeredStandalone(created.value)));
+    if (!retried.ok) throw new Error(retried.message);
+    const action = retried.action as { kind: string; requests: readonly { authority: AgentRequestAuthority }[] };
+    expect(action.kind).toBe("spawn-batch");
+    expect(action.requests).toHaveLength(1);
+    const request = action.requests[0]!.authority;
+    expect(request.attempt).toBe(2);
+    const captured = await captureNativeReview(repository, created.value, request, "claude", [reviewerTranscript(true)]);
+    expect(captured.captured, captured.diagnostic).toBe(true);
+  }
+
+  const panelResult = await inDirectory(repository, () => resumeStandaloneFacade(created.value, registeredStandalone(created.value)));
   expect(panelResult.ok).toBe(true);
   if (!panelResult.ok) throw new Error(panelResult.message);
   const panel = panelResult.action as { kind: string; requests: readonly { authority: AgentRequestAuthority }[] };
   expect(panel.kind).toBe("spawn-batch");
-  for (const { authority } of panel.requests) {
-    const captured = await created.value.captureTranscript(authority, [...Buffer.from(refutationTranscript(created.value, authority))]);
-    expect(captured.ok).toBe(true);
+  for (const [index, { authority }] of panel.requests.entries()) {
+    const raw = refutationTranscript(created.value, authority);
+    if (native) {
+      const captured = await captureNativeReview(repository, created.value, authority, index % 2 === 0 ? "pi" : "claude", [raw]);
+      expect(captured.captured, captured.diagnostic).toBe(true);
+    } else {
+      expect((await created.value.captureTranscript(authority, [...Buffer.from(raw)])).ok).toBe(true);
+    }
   }
 
-  const registration = created.value.readProgramRegistration();
-  if (!registration.ok || registration.value === null) throw new Error("standalone registration is unavailable");
-  const done = await inDirectory(repository, () => resumeStandaloneFacade(
-    created.value,
-    registration.value as Parameters<typeof resumeStandaloneFacade>[1],
-  ));
+  const done = await inDirectory(repository, () => resumeStandaloneFacade(created.value, registeredStandalone(created.value)));
   expect(done.ok).toBe(true);
   if (!done.ok) throw new Error(done.message);
   expect((done.action as { kind: string }).kind).toBe("done");
@@ -163,6 +168,46 @@ async function completeCriticalStandaloneReview(repository: string, runsRoot: st
   expect(published.surviving_critical_findings).toHaveLength(1);
   expect(published.refuted_critical_findings).toHaveLength(1);
   expect(published.advisory_findings).toHaveLength(1);
+  const registered = registeredStandalone(created.value);
+  const authority = parsedAuthority(registered);
+  if (!authority.ok) throw new Error(authority.message);
+  const replay = parseStandaloneReviewMachineState(JSON.parse(readFileSync(join(created.value.runDirectory, "checkpoint.json"), "utf8")),
+    publicationResolver(created.value), reviewerProtocolResolver(created.value, registered), authority.value);
+  if (!replay.ok || replay.value.kind !== "done") throw new Error(JSON.stringify(replay));
+  expect(replay.value.result.schemaVersion).toBe(2);
+  const accounting = prepareDefectFamilyAccounting(replay.value.result, defectFamily(published.surviving_critical_findings[0]!.id));
+  if (!accounting.ok) throw new Error(JSON.stringify(accounting));
+  expect(accounting.value.source.survivingCriticals).toEqual(published.surviving_critical_findings);
+  expect(accounting.value.source.refutedCriticals).toEqual(published.refuted_critical_findings);
+  expect(accounting.value.source.advisories).toEqual(published.advisory_findings);
+  expect(accounting.value.source.survivingCriticals[0]?.basis).toEqual(REVIEWER_PAYLOAD_EXAMPLE_V2.findings[0]!.basis);
+  expect(accounting.value.source.survivingCriticals[0]?.claim).toBe("  repair predicate returns the vulnerable result\n  ");
+  expect(accounting.value.source.refutedCriticals[0]?.finding.basis).toEqual(REVIEWER_PAYLOAD_EXAMPLE_V2.findings[0]!.basis);
+  expect(accounting.value.source.sourceResultDigest).toBe(createHash("sha256").update(readFileSync(join(created.value.runDirectory, "result.json"))).digest("hex"));
+  expect(renderStandaloneReviewSummary(replay.value.result)).toContain("Emitted/admitted: 2 critical; 1 advisory.");
+  expect(renderStandaloneReviewSummary(replay.value.result)).toContain("After refutation: 1 surviving critical; 1 refuted critical; 1 advisory.");
+  if (native) {
+    const issued = created.value.readIssuedRequests();
+    const captured = created.value.readCapturedAttempts();
+    if (!issued.ok || !captured.ok) throw new Error("native fixture capture authority unavailable");
+    const witnesses = new Map(issued.value.flatMap((request) => {
+      const key = captureKey(request.slotId, request.attempt);
+      if (!captured.value.has(key)) return [];
+      const bytes = created.value.readTranscriptBytes(request);
+      if (!bytes.ok) throw new Error(bytes.error.message);
+      return [[key, { requestId: request.requestId, role: request.role, contextDigest: request.contextDigest,
+        digest: createHash("sha256").update(bytes.value).digest("hex"), byteLength: bytes.value.byteLength }] as const];
+    }));
+    const checkpointPath = join(created.value.runDirectory, "checkpoint.json");
+    const checkpoint = readFileSync(checkpointPath);
+    unlinkSync(checkpointPath);
+    const witnessed = replayStandaloneResultFromEvidence(created.value, registered, witnesses);
+    expect(witnessed.ok, JSON.stringify(witnessed)).toBe(true);
+    if (witnessed.ok) expect(Buffer.from(witnessed.json)).toEqual(readFileSync(join(created.value.runDirectory, "result.json")));
+    writeFileSync(checkpointPath, checkpoint);
+    const resumed = await inDirectory(repository, () => resumeStandaloneFacade(created.value, registered));
+    expect(resumed).toEqual(done);
+  }
   return Object.freeze({
     sourceRun,
     source: created.value,
@@ -187,12 +232,7 @@ async function completeCleanStandaloneReview(repository: string, runsRoot: strin
   for (const { authority } of initial.requests) {
     expect((await created.value.captureTranscript(authority, [...Buffer.from(reviewerTranscript(false))])).ok).toBe(true);
   }
-  const registration = created.value.readProgramRegistration();
-  if (!registration.ok || registration.value === null) throw new Error("standalone registration is unavailable");
-  const done = await inDirectory(repository, () => resumeStandaloneFacade(
-    created.value,
-    registration.value as Parameters<typeof resumeStandaloneFacade>[1],
-  ));
+  const done = await inDirectory(repository, () => resumeStandaloneFacade(created.value, registeredStandalone(created.value)));
   expect(done.ok && (done.action as { kind: string }).kind).toBe("done");
   return sourceRun;
 }
@@ -382,6 +422,45 @@ describe.sequential("Defect-Family Accounting production facade", () => {
       expect(prepared.ok, label).toBe(false);
       expect(() => readFileSync(join(fixture.runsRoot, run, "authority.json"))).toThrow();
       expect(readFileSync(join(fixture.repository, ".git", "index"))).toEqual(indexBefore);
+    }
+  }, 30_000);
+
+  it("refuses current source result, packet, registration and publication-receipt tampering before remediation authority", async () => {
+    const fixture = repositoryFixture();
+    const source = await completeCriticalStandaloneReview(fixture.repository, fixture.runsRoot);
+    applyRepair(fixture.repository);
+    const before = readFileSync(join(fixture.repository, ".git", "index"));
+    const requests = source.source.readIssuedRequests();
+    if (!requests.ok) throw new Error(requests.error.message);
+    const reviewer = requests.value.find(({ program }) => program === "standalone-review")!;
+    const receiptDirectory = join(source.source.runDirectory, "receipts");
+    const receiptName = readdirSync(receiptDirectory).find((name) => JSON.parse(readFileSync(join(receiptDirectory, name), "utf8")).kind === "artifact-set-published");
+    if (receiptName === undefined) throw new Error("real result publication receipt required");
+    const cases = [
+      { label: "result-basis", path: join(source.source.runDirectory, "result.json"), field: "basis" },
+      { label: "program", path: join(source.source.runDirectory, "program.json"), field: "reviewerProtocol" },
+      { label: "context", path: join(source.source.runDirectory, "contexts", `${reviewer.contextDigest}.json`), field: "reviewerProtocol" },
+      { label: "receipt", path: join(receiptDirectory, receiptName), field: null },
+    ];
+    for (const entry of cases) {
+      const original = readFileSync(entry.path);
+      unlinkSync(entry.path);
+      if (entry.field !== null) {
+        const corrupted = JSON.parse(original.toString());
+        if (entry.field === "basis") delete corrupted.surviving_critical_findings[0].basis;
+        else delete corrupted[entry.field];
+        writeFileSync(entry.path, JSON.stringify(corrupted, null, 2));
+      }
+      try {
+        const prepared = await prepareRemediationFacadeStart({ input: { sourceRunsRoot: fixture.runsRoot, sourceRun: source.sourceRun,
+          supportPaths: ["tests/repair.test.mjs"], defectFamily: defectFamily(source.findingId) },
+          repositoryStartPath: fixture.repository, remediationRunsRoot: fixture.runsRoot, remediationRun: `run.tamper-${entry.label}` });
+        expect(prepared.ok, entry.label).toBe(false);
+        expect(readFileSync(join(fixture.repository, ".git", "index"))).toEqual(before);
+      } finally {
+        if (entry.field !== null) unlinkSync(entry.path);
+        writeFileSync(entry.path, original, { mode: 0o444 });
+      }
     }
   }, 30_000);
 
@@ -762,9 +841,9 @@ describe.sequential("Defect-Family Accounting production facade", () => {
     expect(readFileSync(join(fixture.repository, ".git", "index"))).toEqual(indexBefore);
   });
 
-  it("runs one distinct fixed check and installs the exact repair-checked index through real production APIs", async () => {
+  it("runs one distinct fixed check and installs the exact repair-checked index from a mixed Claude/Pi native source", async () => {
     const fixture = repositoryFixture();
-    const source = await completeCriticalStandaloneReview(fixture.repository, fixture.runsRoot);
+    const source = await completeCriticalStandaloneReview(fixture.repository, fixture.runsRoot, true);
     applyRepair(fixture.repository);
 
     const remediationRun = "run.remediation-p3";

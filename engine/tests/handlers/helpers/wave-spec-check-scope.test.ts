@@ -15,6 +15,7 @@ import type { TaskGraph, WaveReviewEpochAuthority } from "../../../src/types";
 import { parseTaskGraph, StateManager } from "../../../src/state-manager";
 import { taskFixture } from "../../fixtures/task-lifecycle";
 import { WAVE_REVIEW_AGENTS } from "../../../src/core/model-profiles";
+import { CURRENT_REVIEWER_PROTOCOL } from "../../../src/core/reviewer-contract";
 import {
   decideWaveReviewEpochReplay,
   prepareWaveReviewBatch,
@@ -486,6 +487,27 @@ describe("Wave reviewer slot identity projection", () => {
     expect(identitiesFor(restarted, 1)).toEqual(baseline);
     expect(identitiesFor(orphanRecovered, 1)).toEqual(baseline);
     expect(identitiesFor(reordered, 1)).toEqual(baseline);
+  });
+
+  it("changes only reviewer identities when protocol changes, retaining exact spec-check bytes and batch epoch", () => {
+    const runId = parseOrchestrationRunId("run.protocol-identity");
+    if (!runId.ok) throw new Error(runId.error.message);
+    fc.assert(fc.property(fc.integer({ min: 0, max: 1000 }), (generation) => {
+      const graph = { ...preparedGraph, tasks: preparedGraph.tasks.map((task) => ({ ...task, review_generation: generation })) };
+      const legacy = { ...plain, schemaVersion: 1 as const, input: { wave: 1 } };
+      const current = { ...legacy, schemaVersion: 2 as const, reviewerProtocol: CURRENT_REVIEWER_PROTOCOL };
+      const workspace = [{ taskId: "T1", scope: ["engine/src/core/wave-review-authority.ts"], headSha: "b".repeat(64) }];
+      const observation = observeWaveSpecCheckDocuments(null, null);
+      const first = prepareWaveReviewBatch(runId.value, legacy, graph, 1, workspace, observation);
+      const second = prepareWaveReviewBatch(runId.value, current, graph, 1, workspace, observation);
+      if (!first.ok || !second.ok) throw new Error("versioned preparation must succeed");
+      expect(second.value.batchEpoch).toBe(first.value.batchEpoch);
+      expect(second.value.requests[0]).toEqual(first.value.requests[0]);
+      expect(second.value.packets[0]).toEqual(first.value.packets[0]);
+      expect(second.value.settledFloor).toEqual(first.value.settledFloor);
+      expect(second.value.packets.slice(1).every(({ schemaVersion }) => schemaVersion === 2)).toBe(true);
+      expect(second.value.requests.slice(1)).not.toEqual(first.value.requests.slice(1));
+    }), { numRuns: 20, seed: 4301 });
   });
 
   it("still moves when the reviewed authority itself moves", () => {

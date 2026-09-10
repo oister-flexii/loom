@@ -11,10 +11,13 @@
  */
 
 import { describe, it, expect, afterAll } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { execFile } from "node:child_process";
 import { join } from "node:path";
-import cleanup, {
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+import {
   runCleanupStaleSubagents,
   sessionOfEntry,
   staleEntries,
@@ -25,11 +28,12 @@ import {
   SESSION_SUFFIXES,
   TASK_GRAPH_POINTER_BINDING_SUFFIX,
 } from "../../../src/machine";
-import { SUBAGENT_DIR } from "../../../src/config";
+import { disposeFixturePiSessions, fixturePiEnvironment } from "../../fixtures/pi-session";
 
 const subDir = mkdtempSync(join(tmpdir(), "loom-sweep-"));
 
 afterAll(() => {
+  disposeFixturePiSessions();
   rmSync(subDir, { recursive: true, force: true });
 });
 
@@ -226,20 +230,60 @@ describe("sweepStaleSessions (fs)", () => {
   });
 
   it("SessionStart surfaces best-effort cleanup failures through systemMessage", async () => {
-    mkdirSync(SUBAGENT_DIR, { recursive: true });
-    const path = join(SUBAGENT_DIR, `cleanup-diagnostic-${process.pid}-${Date.now()}.active`);
-    symlinkSync(path, path);
+    // SUBAGENT_DIR freezes at the first config import, so the ACTUAL default
+    // handler runs in a fresh disposable child process whose LOOM_SUBAGENT_DIR
+    // points at a private owned temp dir — never the real
+    // /tmp/claude-subagents. The child imports the package-owned module and
+    // awaits cleanup("", []).
+    const privateDir = mkdtempSync(join(tmpdir(), "loom-handler-"));
+    const ambientDir = mkdtempSync(join(tmpdir(), "loom-handler-ambient-"));
     try {
-      const result = await cleanup("", []);
+      const staleSentinel = join(privateDir, "stale-sentinel.orchestration-runs.json");
+      writeFileSync(staleSentinel, "x\n");
+      const old = new Date(Date.now() - 3_600_000);
+      utimesSync(staleSentinel, old, old); // older than STALE_SUBAGENT_TTL_MS
+
+      // Broken self-referential symlink → ELOOP on stat (best-effort
+      // diagnostic oracle); its session group becomes unobservable, so the
+      // sweep must PROTECT it rather than unlink it.
+      const looped = join(privateDir, `cleanup-diagnostic-${process.pid}-${Date.now()}.active`);
+      symlinkSync(looped, looped);
+
+      // Unrelated owned ambient control directory: outside the child's
+      // LOOM_SUBAGENT_DIR, so the actual handler must never touch it.
+      const ambientSentinel = join(ambientDir, "stale-sentinel.orchestration-runs.json");
+      writeFileSync(ambientSentinel, "x\n");
+      utimesSync(ambientSentinel, old, old);
+
+      const modulePath = fileURLToPath(
+        new URL("../../../src/handlers/session-start/cleanup-stale-subagents", import.meta.url),
+      );
+      const childEnv = { ...fixturePiEnvironment(privateDir), LOOM_SUBAGENT_DIR: privateDir };
+      const { stdout } = await promisify(execFile)("bun", [
+        "-e",
+        `import handler from ${JSON.stringify(modulePath)};\nconsole.log(JSON.stringify(await handler("", [])));`,
+      ], { cwd: privateDir, env: childEnv, timeout: 15_000 });
+
+      // Actual-run proof: the real default handler produced its passthrough
+      // result with the ELOOP stat diagnostic.
+      const result: unknown = JSON.parse(stdout);
       expect(result).toMatchObject({
         kind: "passthrough",
-        systemMessage: expect.stringContaining(`cleanup-stale-subagents: stat failed for ${path}`),
+        systemMessage: expect.stringContaining(`cleanup-stale-subagents: stat failed for ${looped}`),
       });
-      if (result.kind === "passthrough") {
-        expect(result.systemMessage).toMatch(/ELOOP|too many levels of symbolic links/i);
-      }
+      expect(result).toMatchObject({
+        systemMessage: expect.stringMatching(/ELOOP|too many levels of symbolic links/i),
+      });
+
+      // The stale sentinel was swept in the SELECTED private dir.
+      expect(existsSync(staleSentinel)).toBe(false);
+      // The protected looped symlink was NOT swept (negative ownership proof).
+      expect(lstatSync(looped).isSymbolicLink()).toBe(true);
+      // The unrelated owned ambient control directory was preserved.
+      expect(readFileSync(ambientSentinel, "utf8")).toBe("x\n");
     } finally {
-      rmSync(path, { force: true });
+      rmSync(privateDir, { recursive: true, force: true });
+      rmSync(ambientDir, { recursive: true, force: true });
     }
   });
 

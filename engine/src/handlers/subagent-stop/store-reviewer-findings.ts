@@ -143,6 +143,11 @@ const handler: HookHandler = async (stdin) => {
     return discarded(`${agentType} review names task ${taskId}, which is not in the task graph — findings NOT stored`);
   }
 
+  if (targetTask.review_run?.reviewer_protocol !== undefined ||
+      targetTask.accepted_review_authority?.reviewer_protocol !== undefined) {
+    return discarded(`${agentType} current reviewer requires registered capture and facade resume — legacy settlement refused`);
+  }
+
   const transcript = await readTranscriptWithRetry(rawPath, /\*{0,2}CRITICAL_COUNT:?\*{0,2}\s*\d+/);
   const unavailableMessage = `review transcript empty or unreadable at ${rawPath || "<unset>"}`;
   let resolution: ReviewResolution = {
@@ -158,6 +163,10 @@ const handler: HookHandler = async (stdin) => {
     tasks: s.tasks.map((t) => {
       if (t.id !== taskId) return t;
       taskFound = true;
+      if (t.review_run?.reviewer_protocol !== undefined ||
+          t.accepted_review_authority?.reviewer_protocol !== undefined) {
+        throw new Error("current reviewer authority changed before legacy settlement; registered facade resume required");
+      }
       resolution = transcript
         ? constrainReviewResolutionToScope(
             resolveTaskReviewFindings(

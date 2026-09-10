@@ -5,7 +5,9 @@
  * re-exported by index.ts so all existing import sites are unchanged.
  */
 import { createHash } from 'node:crypto';
-import { parseAgentRequestAuthority, parseIssuedSpawnRequest, type AgentRequestAuthority, type InitialSpawnRequestInput, type SpawnRequest } from '../../../core/orchestration-contract';
+import { CURRENT_REVIEWER_PROTOCOL } from '../../../core/reviewer-contract';
+import type { IssuedStandaloneReviewerProtocol, ReviewerProtocolAuthorityResolver } from '../../../core/review-output';
+import { sameAgentRequestAuthority, parseAgentRequestAuthority, parseIssuedSpawnRequest, type AgentRequestAuthority, type InitialSpawnRequestInput, type SpawnRequest } from '../../../core/orchestration-contract';
 import { aggregateStandaloneReview, bindStandaloneCaptureAuthority, captureStandaloneReviewerBytes, canonicalStandaloneResultArtifact, completeStandaloneReviewerCapture, parseStandaloneReviewScope, prepareFreshStandaloneReview, proveStandaloneRosterCompletion, serializeStandaloneReviewAuthority, serializeAdjudicatedStandaloneReview, admitStandaloneTranscript, type FrozenStandaloneReviewAuthority, type StandaloneTranscriptAdmission } from '../../../core/standalone-review';
 import { parseStandaloneReviewMachineState, reduceStandaloneReviewMachine, freezeStandaloneRefutationPanelAuthority, parseStandaloneRefutationCompletion, serializeStandaloneReviewMachineState, startStandaloneReviewMachine, type StandaloneReviewMachineState } from '../../../core/standalone-review-machine';
 import { buildStandaloneFindingBrief, defaultRefutationThreshold, reviewSignals, selectReviewLenses } from '../../../core/review-panel';
@@ -15,7 +17,7 @@ import { readRunBytesNoFollow, writeRunBytesExclusiveNoFollow } from '../../../o
 import { captureKey } from '../../../core/harness-capture';
 import { type RunDirHandle } from '../../../orchestration/run-directory-handle';
 import { resolveModelProfile, lowerModelProfile } from '../../../core/model-profiles';
-import { decodeReviewerTranscript, deriveChangedPaths, durableCaptureRejection, durablePublicationDigest, durableRefutationRequests, durableRequests, exactObject, executableRefutationRequests, failed, metadata, parsedAuthority, publicationFile, publicationResolver, publishInitialBatch, recoverOrPublishRefutationRetry, recoverOrPublishStandaloneRetry, refutationRejectionDiagnostic, renderSpawnTask, safeScope, standalonePackets, standalonePublicationEffectId, standaloneRetryEffectId, standaloneRetryTask, type FacadeDriveResult, type RegisteredStandaloneProgram } from './helpers';
+import { readPublishedStandaloneResult, reviewerProtocolResolver, deriveChangedPaths, durableCaptureRejection, durablePublicationDigest, durableRefutationRequests, durableRequests, exactObject, executableRefutationRequests, failed, metadata, readRegisteredStandaloneAuthority, publicationFile, publicationResolver, publishInitialBatch, recoverOrPublishRefutationRetry, recoverOrPublishStandaloneRetry, refutationRejectionDiagnostic, renderSpawnTask, safeScope, standalonePackets, standalonePublicationEffectId, standaloneRetryEffectId, standaloneRetryTask, type FacadeDriveResult, type ProgramParse, type RegisteredStandaloneProgram } from './helpers';
 
 export async function startStandaloneFacade(
   handle: RunDirHandle,
@@ -53,7 +55,8 @@ export async function startStandaloneFacade(
     });
     if (!prepared.ok) return failed(prepared.error.errors.join("; "));
     const registration: RegisteredStandaloneProgram = Object.freeze({
-      schemaVersion: 1,
+      schemaVersion: 2,
+      reviewerProtocol: CURRENT_REVIEWER_PROTOCOL,
       kind: "standalone-review",
       input,
       authority: JSON.parse(serializeStandaloneReviewAuthority(prepared.value.authority)),
@@ -288,7 +291,13 @@ function scopePacketProblem(
   handle: RunDirHandle,
   authority: FrozenStandaloneReviewAuthority,
   request: AgentRequestAuthority,
+  registration: RegisteredStandaloneProgram,
 ): string | null {
+  const protocol = reviewerProtocolResolver(handle, registration)(request);
+  if (!protocol.ok) return protocol.error.message;
+  if (protocol.value.protocolVersion !== authority.schemaVersion || !sameAgentRequestAuthority(protocol.value.request, request)) {
+    return "reviewed source protocol differs from the registered request authority";
+  }
   const packet = handle.readContext(request.contextDigest);
   if (!packet.ok) return packet.error.message;
   if (packet.value.requestId !== request.requestId || packet.value.role !== request.role) {
@@ -312,14 +321,14 @@ export function readStandaloneReviewedSource(
   handle: RunDirHandle,
   registration: RegisteredStandaloneProgram,
 ): Readonly<{ ok: true; value: StandaloneReviewedSource }> | Readonly<{ ok: false; message: string }> {
-  const authorityResult = parsedAuthority(registration);
+  const authorityResult = readRegisteredStandaloneAuthority(handle, registration);
   if (!authorityResult.ok) return authorityResult;
   const authority = authorityResult.value;
   let reviewed: StandaloneReviewedSource | null = null;
   let sectionDigest: string | null = null;
   for (const slot of authority.roster.orderedSlots) {
     const request = slot.attempts[0];
-    const packetProblem = scopePacketProblem(handle, authority, request);
+    const packetProblem = scopePacketProblem(handle, authority, request, registration);
     if (packetProblem !== null) return Object.freeze({ ok: false, message: packetProblem });
     const packet = handle.readContext(request.contextDigest);
     if (!packet.ok) return Object.freeze({ ok: false, message: packet.error.message });
@@ -412,7 +421,7 @@ export function replayStandaloneResultFromEvidence(
       : { ok: false as const, message: `capture ${key} changed after it was witnessed` };
   };
   try {
-    const authorityResult = parsedAuthority(registration);
+    const authorityResult = readRegisteredStandaloneAuthority(handle, registration);
     if (!authorityResult.ok) return failed(authorityResult.message);
     const authority = authorityResult.value;
     const resolver = publicationResolver(handle);
@@ -432,16 +441,16 @@ export function replayStandaloneResultFromEvidence(
     for (const slot of authority.roster.orderedSlots) {
       const attemptOne = initialBySlot.get(slot.slotId);
       if (attemptOne === undefined) return failed(`initial reviewer authority is missing for ${slot.slotId}`);
-      const packetProblem = scopePacketProblem(handle, authority, attemptOne.authority);
+      const packetProblem = scopePacketProblem(handle, authority, attemptOne.authority, registration);
       if (packetProblem !== null) return failed(packetProblem);
       const attemptOneKey = captureKey(slot.slotId, 1);
       if (captured.value.has(attemptOneKey)) {
         const bytes = witnessedBytes(attemptOne.authority);
         if (!bytes.ok) return failed(bytes.message);
         const admission = admitCapturedStandaloneTranscript(
-          authority.scope,
+          reviewerProtocolResolver(handle, registration),
+          attemptOne.authority,
           bytes.value,
-          attemptOne.authority.role,
         );
         if (admission.ok) {
           selected.push(attemptOne);
@@ -452,7 +461,7 @@ export function replayStandaloneResultFromEvidence(
 
       const retry = durableStandaloneRetryRequest(handle, slot, resolver);
       if (!retry.ok) return failed(retry.message);
-      const retryPacketProblem = scopePacketProblem(handle, authority, retry.value.authority);
+      const retryPacketProblem = scopePacketProblem(handle, authority, retry.value.authority, registration);
       if (retryPacketProblem !== null) return failed(retryPacketProblem);
       if (!captured.value.has(captureKey(slot.slotId, 2))) {
         return failed(`checkpoint-independent replay is missing ${retry.value.authority.requestId}`);
@@ -460,9 +469,9 @@ export function replayStandaloneResultFromEvidence(
       const retryBytes = witnessedBytes(retry.value.authority);
       if (!retryBytes.ok) return failed(retryBytes.message);
       const retryAdmission = admitCapturedStandaloneTranscript(
-        authority.scope,
+        reviewerProtocolResolver(handle, registration),
+        retry.value.authority,
         retryBytes.value,
-        retry.value.authority.role,
       );
       if (!retryAdmission.ok) {
         return failed(`checkpoint-independent replay rejected ${retry.value.authority.requestId}: ${retryAdmission.problems.join("; ")}`);
@@ -491,7 +500,7 @@ export function replayStandaloneResultFromEvidence(
       accepted.push(completed.value);
     }
 
-    const completion = proveStandaloneRosterCompletion(authority, resolver, accepted);
+    const completion = proveStandaloneRosterCompletion(authority, resolver, accepted, reviewerProtocolResolver(handle, registration));
     if (!completion.ok) return failed(completion.error.violations.map((entry) => JSON.stringify(entry)).join("; "));
     const awaiting = reduceStandaloneReviewMachine(startStandaloneReviewMachine(authority), {
       kind: "review-batch-published",
@@ -589,9 +598,10 @@ export function replayStandaloneResultFromEvidence(
         if (submitted.value.recordedEvent !== undefined) panelEvents.push(submitted.value.recordedEvent);
         if (submitted.value.action?.kind === "spawn-refutation-verifiers") {
           const retryAuthority = submitted.value.action.requests[0];
-          const prepared = preparation.retryInputs.find(({ input }) =>
-            (input.authority as AgentRequestAuthority).requestId === retryAuthority.requestId &&
-            JSON.stringify(input.authority) === JSON.stringify(retryAuthority));
+          const prepared = preparation.retryInputs.find(({ input }) => {
+            const candidate = parseAgentRequestAuthority(input.authority);
+            return candidate.ok && sameAgentRequestAuthority(candidate.value, retryAuthority);
+          });
           if (prepared === undefined) {
             return failed(`refutation retry ${retryAuthority.requestId} is not exact prepared attempt-2 authority`);
           }
@@ -723,14 +733,35 @@ async function appendStandaloneRejection(
 }
 
 function admitCapturedStandaloneTranscript(
-  scope: readonly string[],
+  reviewerProtocols: ReviewerProtocolAuthorityResolver,
+  request: AgentRequestAuthority,
   bytes: Uint8Array,
-  role: string,
 ): StandaloneTranscriptAdmission {
-  const decoded = decodeReviewerTranscript(bytes, role);
-  return decoded.ok
-    ? admitStandaloneTranscript(scope, decoded.text, role)
-    : Object.freeze({ ok: false, problems: Object.freeze([decoded.message]) });
+  const protocol = reviewerProtocols(request);
+  if (!protocol.ok) throw new Error(protocol.error.message);
+  if (protocol.value.subject.kind !== "standalone-review" || !sameAgentRequestAuthority(protocol.value.request, request)) {
+    throw new Error("resolved reviewer protocol differs from the exact standalone request");
+  }
+  return admitStandaloneTranscript(protocol.value as IssuedStandaloneReviewerProtocol, bytes);
+}
+
+/** Read-only LC-2 inspection: independent registration/protocol/publication proof, never checkpoint self-authority. */
+export async function inspectStandaloneFacade(
+  handle: RunDirHandle,
+  registration: RegisteredStandaloneProgram,
+): Promise<ProgramParse<StandaloneReviewMachineState>> {
+  try {
+    const authority = readRegisteredStandaloneAuthority(handle, registration);
+    if (!authority.ok) return authority;
+    const checkpoint = await handle.readCheckpoint();
+    if (checkpoint === null) return { ok: false, message: "standalone review checkpoint is missing" };
+    const state = parseStandaloneReviewMachineState(JSON.parse(checkpoint), publicationResolver(handle),
+      reviewerProtocolResolver(handle, registration), authority.value);
+    if (!state.ok) return { ok: false, message: state.error.message };
+    return state.value.kind === "done" ? readPublishedStandaloneResult(handle, state.value) : state;
+  } catch {
+    return { ok: false, message: "standalone review checkpoint cannot be inspected safely" };
+  }
 }
 
 export async function resumeStandaloneFacade(
@@ -738,7 +769,7 @@ export async function resumeStandaloneFacade(
   registration: RegisteredStandaloneProgram,
 ): Promise<FacadeDriveResult> {
   try {
-    const authorityResult = parsedAuthority(registration);
+    const authorityResult = readRegisteredStandaloneAuthority(handle, registration);
     if (!authorityResult.ok) return failed(authorityResult.message);
     const resolver = publicationResolver(handle);
     const checkpoint = await handle.readCheckpoint();
@@ -779,9 +810,12 @@ export async function resumeStandaloneFacade(
         );
       }
     }
-    const state = parseStandaloneReviewMachineState(rawState, resolver);
+    const state = parseStandaloneReviewMachineState(rawState, resolver, reviewerProtocolResolver(handle, registration), authorityResult.value);
     if (!state.ok) return failed(state.error.message);
-    if (state.value.kind === "done") return { ok: true, action: { kind: "done", runId: handle.runId, outcome: state.value.outcome } };
+    if (state.value.kind === "done") {
+      const published = readPublishedStandaloneResult(handle, state.value);
+      return published.ok ? { ok: true, action: { kind: "done", runId: handle.runId, outcome: published.value.outcome } } : failed(published.message);
+    }
     if (state.value.kind === "terminal-blocked" || state.value.kind === "recoverable-blocked") {
       return { ok: true, action: { kind: "blocked", runId: handle.runId, diagnostic: state.value } };
     }
@@ -925,7 +959,6 @@ export async function resumeStandaloneFacade(
     const captured = handle.readCapturedAttempts();
     if (!captured.ok) return failed(captured.error.message);
     const pendingBySlot = new Map(state.value.pending.map(({ slotId, expectedAttempt }) => [slotId, expectedAttempt] as const));
-    const scope = activeAuthority.scope;
 
     // Phase A — admission check for every attempt-1 slot the machine still
     // expects at attempt 1. Two independent refusal classes both REJECT the
@@ -954,9 +987,9 @@ export async function resumeStandaloneFacade(
       const bytes = handle.readTranscriptBytes(attemptOne.authority);
       if (!bytes.ok) return failed(bytes.error.message);
       const admission = admitCapturedStandaloneTranscript(
-        scope,
+        reviewerProtocolResolver(handle, registration),
+        attemptOne.authority,
         bytes.value,
-        attemptOne.authority.role,
       );
       if (!admission.ok) rejected.push({ slot: attemptOne.authority, problems: [...admission.problems] });
     }
@@ -1015,6 +1048,16 @@ export async function resumeStandaloneFacade(
     const missing: SpawnRequest[] = [];
     for (const request of issued) {
       if (!captured.value.has(captureKey(request.authority.slotId, request.authority.attempt))) {
+        const rejection = request.authority.attempt === 2 ? await durableCaptureRejection(handle, request.authority) : null;
+        if (rejection !== null) {
+          const terminal = reduceStandaloneReviewMachine(machine, { kind: "result-rejected", request: request.authority, message: rejection });
+          if (!terminal.ok || terminal.value.kind !== "terminal-blocked") {
+            return failed(terminal.ok ? "final capture rejection did not terminal-block" : terminal.error.message);
+          }
+          await handle.writeCheckpoint(serializeStandaloneReviewMachineState(terminal.value));
+          await appendStandaloneRejection(handle, request.authority, 2, rejection);
+          return { ok: true, action: { kind: "blocked", runId: handle.runId, diagnostic: terminal.value } };
+        }
         missing.push(request);
         continue;
       }
@@ -1022,9 +1065,9 @@ export async function resumeStandaloneFacade(
       if (!bytes.ok) return failed(bytes.error.message);
       if (request.authority.attempt === 2) {
         const admission = admitCapturedStandaloneTranscript(
-          scope,
+          reviewerProtocolResolver(handle, registration),
+          request.authority,
           bytes.value,
-          request.authority.role,
         );
         if (!admission.ok) {
           const problems = [...admission.problems];
@@ -1081,13 +1124,13 @@ export async function resumeStandaloneFacade(
           return {
             ...request,
             task: request.authority.attempt === 2
-              ? standaloneRetryTask(task, rejectedDiagnostics.get(request.authority.slotId) ?? null)
+              ? standaloneRetryTask(task, rejectedDiagnostics.get(request.authority.slotId) ?? null, activeAuthority)
               : task,
           };
         }),
       } };
     }
-    const completion = proveStandaloneRosterCompletion(activeAuthority, resolver, accepted);
+    const completion = proveStandaloneRosterCompletion(activeAuthority, resolver, accepted, reviewerProtocolResolver(handle, registration));
     if (!completion.ok) return failed(completion.error.violations.map((entry) => JSON.stringify(entry)).join("; "));
     let reduced = reduceStandaloneReviewMachine(machine, { kind: "complete-roster-proved", completion: completion.value });
     if (!reduced.ok) return failed(reduced.error.message);

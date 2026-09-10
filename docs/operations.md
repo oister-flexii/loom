@@ -97,6 +97,15 @@ bun "$LOOM_DIR/engine/src/cli.ts" helper orchestration inspect \
 
 It reports the registered program, the machine state read through that program’s own checkpoint shape, every issued slot with its attempt, capture status and the diagnostic that refused it, the event tail, and any abandonment marker. Facts it cannot read are reported as `unavailable` with the cause, never defaulted — so an unreadable checkpoint is distinguishable from a run that never wrote one. Prefer it over hand-reading `authority.json`, `program.json`, `checkpoint.json`, and `events/`. Like `status`, it stays available during a Pi runtime-revision skew, because it is exactly what diagnosing that skew needs.
 
+For standalone review, `inspect` calls `inspectStandaloneFacade`, re-proving
+independent registration, issued protocol, publication, checkpoint and actual
+result/receipt bytes. Only an authenticated done result gets
+`renderStandaloneReviewSummary`: emitted/admitted counts, after-refutation counts,
+and escaped rows with IDs, reviewers, locations, claims and full current
+basis/reason. The canonical result is `result.json` at the Run Directory root,
+not `artifacts/result.json`. JSON inspection retains its existing shape; no
+summary artifact or model-authored arithmetic becomes authority.
+
 ### Retiring a superseded run
 
 Run directories are never deleted — they hold the evidence. When a newer run replaces one, record it so the directory listing stays honest:
@@ -113,6 +122,111 @@ The marker removes nothing. It is written once and is immutable: an identical re
 ### Pi batch limit
 
 Pi’s native subagent transport accepts at most eight requests per call. Partition a larger engine-issued batch into ordered chunks of at most eight without changing any request. Resume only after all chunks finish.
+
+## Reviewer Protocol v2
+
+**Source status:** implemented in this feature checkout; P4 is not yet independently
+reviewed, merged, published, or cut over into the loaded runtime. These are the
+implemented contracts, not permission to bypass admission. See [ADR-0009](adr/ADR-0009-versioned-reviewer-protocol.md).
+
+Fresh standalone/Wave registrations select v2 internally. There is no protocol
+input flag. Every reviewer reads the issued Context Packet first: its independent
+registration/publication joins, exact `reviewer-payload-schema` and
+`reviewer-impact-rubric` bytes select admission, never output sniffing. Emit exactly
+one JSON object with `findings`, no fences, narrative, Machine Summary, tallies,
+new IDs, or second lifecycle object. Wave additionally echoes issued packetId and
+generation and assesses each prior ID exactly once in packet order. Empty findings
+is explicit success only with all issued prior obligations satisfied.
+
+A critical's six fields are claim plus basis evidence, violatedContract,
+consequence, truthConfidence, and severityRationale. Evidence may be reproduction
+or concrete execution trace; executing a repro is not universally required.
+Advisories require a concise reason; optional basis must be complete. Reviewer
+execution claims are not engine receipts. Blocking requires a concrete consequence
+to supported behavior, safety/authority, explicit acceptance/verification
+obligations, or safe operator use. Factual error, confidence, style, shallowness,
+or a missing test alone is insufficient. Filled fields prove neither truth,
+impact, reachability, execution, nor semantic test adequacy.
+
+Current admission rejects the whole response on malformed JSON, duplicate keys,
+missing basis, foreign location, wrong binding or incomplete prior roster. It
+creates no synthetic Finding or P3 obligation. Limits include 1,048,576 final UTF-8
+bytes, 32 containers, 128 new findings and 4,096 priors; these are semantic
+admission bounds, not pre-capture transcript or whole-process memory limits.
+Accepted strings/order/duplicates remain exact; the engine attributes IDs and
+derives counts. Stored/refuted/resolved/panel/P3 records retain full basis.
+
+The existing default three-lens panel, complete critical-ID coverage and strict
+majority are unchanged. It assesses assertions including their stated preconditions,
+contract and consequence. A true assertion is not refuted merely because repair
+seems unimportant. A surviving critical stays blocking. There is no automatic
+severity downgrade or new standalone severity-dispute authority. The old explicit
+Wave `helper store-review-findings` operator override (including `--dismiss-all`)
+is unchanged, separately audited, and **never automatic fallback** for failed
+reviewer evidence; an operator override does not prove an assertion false.
+
+Claude current reviewer stop captures exact final bytes then returns; registered
+resume owns Wave semantic settlement. Pi retains its native tool-call/index/agent
+and session-run capture binding and run-bound short-circuit. Neither routes current
+reviewers into legacy concatenation or CRITICAL_COUNT polling. Missing/ambiguous
+final output gets only the existing retry and terminal-blocks attempt 2; current
+transcript locator/read infrastructure failure stays unavailable without a semantic
+rejection tombstone. Missing/corrupt current registration cannot become legacy.
+
+### Historical reviewer evidence
+
+Completed **and unfinished issued reviewer v1** runs keep their original protocol,
+normalization, synthetic-shortfall behavior, IDs, retries and result bytes.
+All seven reviewer tasks carry a concrete `LOOM_CONTEXT_READ_COMMAND`: a shell-quoted
+`bun` invocation of the admitted package's `scripts/read-context-packet.ts`, with
+the actual immutable `LOOM_CONTEXT_PATH` and expected request/digest/role/Skill.
+Run it with Claude `Bash` or Pi `bash`; no `readContextPacket` harness tool exists.
+The command first returns a bounded section index. Append `--section LABEL` to
+browse decoded sections or `--file EXACT_SOURCE_PATH` for frozen standalone source
+text, then `--offset N --limit 4096` to continue. Text offsets count UTF-16 units;
+index offsets count section entries (at most 32 per page). Section browsing omits
+source contents and binary/base64 fields; explicit binary-file selection fails.
+The helper uses existing no-follow regular-file reads, fatal UTF-8, the packet
+parser and expected identity checks. Its 128 MiB input/48 KiB output limits are
+helper resource bounds, not changes to protocol admission. Missing tools/paths,
+unsafe filesystem entries, invalid digests/identity or page bounds fail visibly.
+References remain data: no execution, network, frozen-file writes, Run/state/index
+mutation, or authority minting. Supplied expected IDs are not independent
+publication proof; that proof belongs to engine delivery. Both v1 and v2 use
+this helper without changing their frozen context bytes.
+
+Packet-first bootstrap delivers archived role plus shared fragment from
+`references/reviewer-protocol-v1/` at all four prefixes: initial publication,
+outstanding attempt-1 reissue, newly issued attempt 2, and already-published
+attempt-2 recovery, for standalone and registered Wave. Missing archive/authority
+fails visibly. Archives preserve baseline implementation instructions; old packets
+did not freeze a full rubric/persona, so these are not invented original Agent
+inputs. Nothing is appended to or rehashed into frozen old packets.
+
+This differs deliberately from ADR-0008: unfinished **remediation v1** remains
+refused. P3 can consume an opaque published review result v1 or v2, preserving
+original IDs, full basis and the original canonical result digest. Its selected
+operator checks, report freshness, accounting and installation authority are unchanged.
+
+The two completed historical goldens retain **90 exact logical files,
+20,250,407 bytes**, in two lossless gzip packs totaling **3,395,759 bytes**.
+Every decoded path/length/hash is independently checked against the unchanged
+original inventory. No receipt is newly authored and original anchoring metadata
+is untouched. Production pure parsers replay those bytes through in-memory
+resolvers: semantic/result-byte compatibility, **not relocated native filesystem
+admission**. Separate legitimate disposable fixtures exercise both native adapters,
+publication/reload/witness replay and actual P3 repair-check/index installation.
+Scripted basis is not a real product defect or semantic proof.
+
+### Implementation evidence limitations
+
+B5's early inherited checkout-cwd CLI calls and mismatched fixture handshakes are
+not positive native evidence. Corrected tests use disposable cwd and explicit
+matching child-only runtime identity with `PI_CODING_AGENT:true`; final native/P3
+checks use the actual source loader and guarded fixture installation. The bounded
+scheduler-only yield in `machine-purity.test.ts` changes no audit assertion or
+capability grant. The normal root verify process-environment policy is unchanged
+and is not substituted for independently admitted native evidence.
 
 ## Protected state rules
 
@@ -282,7 +396,7 @@ Completed schema-v1 remediation runs remain read-only and inspect as `done — h
 
 Completed-v2 replay parses both checkpoint audit-path arrays before assessing retained observations. Missing or malformed arrays produce `remediation checkpoint audit paths are missing or malformed`, not invented empty-path evidence. If installation succeeds but checkpoint recording fails, preserve the explicit installed-index diagnostic and actual receipt: that failure does not mean rollback or “nothing was installed.” Do not hand-repair the checkpoint or reinstall from its prose; use read-only inspection and retain the interrupted evidence.
 
-**Runtime bootstrap:** after external validation, the currently admitted CLI and loaded Skill 3.1 may review and install this feature under their existing protocol. That bootstrap is not a schema-v2 `repair-checked` publication; after reload, its completed v1 run is historical-unknown. New live P3 operation requires the updated package and matching runtime revision: run `/reload` or restart Pi. Do not unset runtime-admission variables or use a fresh checkout's CLI against an older loaded extension. Installation/publication remains the parent's registered workflow, not a documentation operation.
+**Runtime publication:** P4 source review/merge/publication and loaded-runtime cutover remain pending. The parent uses its actually admitted CLI/Skill for subsequent registered review and installation; do not infer remediation v1 from reviewer v1. Existing P3 v2 command/report/install policy remains unchanged. The Skill 3.1 bootstrap in ADR-0008 is historical P3 context, not this wire migration's installation recipe. After package installation, `/reload` or restart Pi to match runtime identity. Never unset runtime-admission variables or use a feature CLI against an older loaded extension. Development validation/documentation is not a registered installation receipt.
 
 ### Enrolling a critical-repair check
 
@@ -377,6 +491,12 @@ Root `verify` delegates to engine `verify`: prerequisites → typecheck → exis
 4. `scripts/smoke-orchestration-facades.ts`
 5. `scripts/smoke-pi-resources.sh`
 6. `artifacts/tests/test-validate-task-graph.sh`
+
+The review-panel and standalone helper smokes explicitly retain historical/manual
+coverage. The façade smoke covers current issued payloads, bounded scope retries,
+refutation, advisory decisions, durable replay and actual disposable index
+installation; it supplies a matching runtime identity only to its CLI children.
+These scripted smokes do not spawn live Agents.
 
 The one Vitest invocation retains the default console reporter and also writes `.loom/completion-reports/verify.junit.xml` at the repository root. Its script uses `--reporter=default --reporter=junit --outputFile=../.loom/completion-reports/verify.junit.xml` because npm runs it from `engine/`. JUnit contains only Vitest test facts, including skipped/failed cases; it does not contain compiler or smoke testcases. Normal zero exit of the entire fixed command proves those other tiers passed too. A later smoke failure leaves the green unit report but the root command remains nonzero. Focused `test:unit` invocations overwrite the same file with focused facts: report existence alone is never full-gate or registered remediation evidence.
 

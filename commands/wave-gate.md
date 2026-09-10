@@ -77,9 +77,32 @@ raw final bytes directly into engine-declared slots. Never write transcripts,
 build manifests, select models, tally findings, mutate the protected State File,
 or stage deterministic operation output in the parent.
 
+## Reviewer evidence
+
+Fresh registrations issue Reviewer Protocol v2, exactly one JSON final payload
+under the published `reviewer-payload-schema` and `reviewer-impact-rubric`.
+Wave reviewers must echo the issued packetId/generation and assess every prior
+Finding ID exactly once in packet order. Counts and new IDs are engine-derived;
+no Machine Summary or separate lifecycle object. Critical basis is mandatory;
+structural admission proves neither truth nor blocking impact. Malformed current
+output is failed evidence, not a synthetic Finding or advisory conversion.
+
+The same complete-roster Refutation Panel and strict majority remain in force.
+A true assertion is not refuted because fixing it seems unimportant; surviving
+criticals block. The existing explicit `helper store-review-findings` Wave
+operator override is unchanged and separate: never invoke it automatically on
+parser failure or as a new standalone severity vote. Full original basis and IDs
+remain in audit. Issued v1 reviews, including unfinished retries, keep their
+original protocol and packet-first archived instructions. Spec-check grammar,
+identity, and Requirement Coverage floor are unchanged.
+
+Native current Claude/Pi paths capture exact final bytes; registered resume owns
+settlement, without historical concatenation or CRITICAL_COUNT polling. See
+[operations](../docs/operations.md#reviewer-protocol-v2).
+
 ## Completion suite and Project Verification Coverage
 
-The registered program executes the frozen quiescent Wave completion suite after implementation proof/test readiness and before review publication. It owns command execution, immutable results, protected acceptance, and replay; do not run a substitute command or create a receipt manually. Loom's own `.loom/verification-manifest.json` configures `project:verify`: root `npm run verify`, Wave scope, cwd `.`, 30-minute timeout, report not required. Local development and Linux CI (including tags) use that same root command: prerequisites → engine typecheck → the entire existing Vitest suite → all six smokes. Install both frozen dependency graphs first; do not add selectors, drop a smoke, use bare `bun test`, or make `verify` recurse into manifest/Wave Gate execution. See `docs/operations.md` for tools, compiler policy, and platform-skip reporting.
+The registered program executes the frozen quiescent Wave completion suite after implementation proof/test readiness and before review publication. It owns command execution, immutable results, protected acceptance, and replay; do not run a substitute command or create a receipt manually. Loom's own `.loom/verification-manifest.json` configures `project:verify`: root `npm run verify`, Wave scope, cwd `.`, 30-minute timeout, required report `.loom/completion-reports/verify.junit.xml`. Local development and Linux CI (including tags) use that same root command: prerequisites → engine typecheck → the entire existing Vitest suite → all six smokes. Install both frozen dependency graphs first; do not add selectors, drop a smoke, use bare `bun test`, or make `verify` recurse into manifest/Wave Gate execution. See `docs/operations.md` for tools, compiler policy, and platform-skip reporting.
 
 Read coverage through the existing read-only status seam, including after `done`:
 

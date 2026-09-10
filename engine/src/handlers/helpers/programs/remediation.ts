@@ -80,7 +80,7 @@ import {
   type RemediationStartInputV2,
 } from "./remediation-registration";
 import type { RemediationInspectionLabel } from "../../../core/run-inspection";
-import { failed, publicationResolver, type FacadeDriveResult } from "./helpers";
+import { readPublishedStandaloneResult, failed, parsedAuthority, parseRegistration, publicationResolver, reviewerProtocolResolver, type FacadeDriveResult } from "./helpers";
 
 export function remediationBlocked(handle: RunDirHandle, message: string): FacadeDriveResult {
   return {
@@ -125,11 +125,19 @@ async function authoritativeSource(
   let raw: unknown;
   try { raw = JSON.parse(checkpoint) as unknown; }
   catch (cause) { return { ok: false, message: `source standalone review checkpoint is invalid JSON: ${messageOf(cause)}` }; }
-  const parsed = parseStandaloneReviewMachineState(raw, publicationResolver(source.value));
+  const program = source.value.readProgramRegistration();
+  if (!program.ok) return { ok: false, message: program.error.message };
+  const registration = parseRegistration(program.value);
+  if (!registration.ok) return registration;
+  const authority = parsedAuthority(registration.value);
+  if (!authority.ok) return authority;
+  const parsed = parseStandaloneReviewMachineState(raw, publicationResolver(source.value),
+    reviewerProtocolResolver(source.value, registration.value), authority.value);
   if (!parsed.ok || parsed.value.kind !== "done") {
     return { ok: false, message: parsed.ok ? "source standalone review is not done" : parsed.error.message };
   }
-  return { ok: true, state: parsed.value };
+  const published = readPublishedStandaloneResult(source.value, parsed.value);
+  return published.ok ? { ok: true, state: published.value } : published;
 }
 
 function standaloneResultResolver(source: StandaloneDoneState) {

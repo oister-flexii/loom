@@ -1,9 +1,10 @@
 /**
  * The Wire Contract's stamping seam (see CONTEXT.md: Wire Contract).
  *
- * The contract text a review Agent must follow lives in ONE fragment
- * (agents/_shared/wire-contract.md); each reviewer agent file carries a
- * stamped copy between the markers below. This module owns the pure
+ * renderReviewerWireContract() owns the generated shared fragment
+ * (agents/_shared/wire-contract.md); each reviewer agent file carries its
+ * stamped copy between the markers below. The marker spelling is retained
+ * for historical tooling, not permission to hand-edit the generated fragment. This module owns the pure
  * region-replacement so the stamp script and the drift test share one
  * implementation — a test proving regions equal the fragment through a
  * DIFFERENT parser than the stamper writes with would be two contracts again.

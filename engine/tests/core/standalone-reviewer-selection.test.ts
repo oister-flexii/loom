@@ -11,7 +11,8 @@ import { selectStandaloneReviewers, type StandaloneReviewKind, type StandaloneRe
  */
 const metadata = (
   overrides: Partial<StandaloneReviewMetadata> & { requestedKinds: readonly StandaloneReviewKind[] },
-): StandaloneReviewMetadata => ({
+): StandaloneReviewMetadata => {
+  const value = {
   docsOnly: false,
   sourceOrTestChanged: false,
   typesChanged: false,
@@ -22,7 +23,12 @@ const metadata = (
   languages: ["typescript"],
   ...overrides,
   requestedKinds: Object.freeze([...overrides.requestedKinds]) as StandaloneReviewMetadata["requestedKinds"],
-});
+  };
+  if (value.docsOnly && (value.sourceOrTestChanged || !value.commentsChanged)) throw new Error("contradictory fixture metadata");
+  return value.docsOnly
+    ? { ...value, docsOnly: true, sourceOrTestChanged: false, commentsChanged: true }
+    : { ...value, docsOnly: false };
+};
 
 describe("selectStandaloneReviewers: code-simplifier membership", () => {
   it("explicit simplify kind always selects code-simplifier, even without source changes", () => {

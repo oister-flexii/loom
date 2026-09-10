@@ -1,0 +1,10 @@
+### Machine Summary
+CRITICAL_COUNT: 0
+ADVISORY_COUNT: 2
+CRITICAL: none
+ADVISORY: repeated   benefit
+ADVISORY: repeated benefit
+
+```findings
+[{"severity":"advisory","file":"src/x.ts","line":4,"claim":"  repeated\n benefit  "},{"severity":"advisory","file":"src/x.ts","line":4,"claim":"repeated benefit"},{"severity":"critical","file":null,"line":null,"claim":"none"}]
+```

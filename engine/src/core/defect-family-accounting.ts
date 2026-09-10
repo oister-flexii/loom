@@ -29,7 +29,7 @@ import {
   isAuthoritativeStandaloneReviewResult,
   type AuthoritativeStandaloneReviewResult,
 } from "./standalone-review-machine";
-import type { Finding, RefutedFinding } from "./findings";
+import { parseStoredFindings, type Finding, type RefutedFinding } from "./findings";
 import { parseReviewPath, sha256Hex, type ReviewPath } from "./review-packet";
 import {
   parseFrozenVerificationManifest,
@@ -246,15 +246,23 @@ function reviewPath(raw: unknown, path: string, code: DefectFamilyFailureCode): 
 }
 
 function cloneFinding(finding: Finding): Finding {
-  return Object.freeze({
+  if (finding.protocolVersion === 2) {
+    const [copy] = parseStoredFindings([finding]);
+    if (copy === undefined) throw new Error("source inventory requires valid current Finding authority");
+    return copy;
+  }
+  const legacy = {
     severity: finding.severity,
     file: finding.file,
     line: finding.line,
     claim: finding.claim,
     id: finding.id,
     agent: finding.agent,
-    ...(finding.review_generation === undefined ? {} : { review_generation: finding.review_generation }),
-    ...(finding.review_packet_id === undefined ? {} : { review_packet_id: finding.review_packet_id }),
+  };
+  return Object.freeze(finding.review_generation === undefined ? legacy : {
+    ...legacy,
+    review_generation: finding.review_generation,
+    review_packet_id: finding.review_packet_id,
   });
 }
 

@@ -49,8 +49,8 @@ The Pi-only parent-relayed RPC child transport for one interactive phase Agent. 
 _Avoid_: Question-file fallback, parent interview, interactive subagent (that is the tool surface, not the transport contract)
 
 **Wire Contract**:
-The exact machine-readable output shape a review Agent must emit — Machine Summary counts and marker lines, the fenced findings block, and the review_lifecycle assessment schema. Owned by the parser that consumes it; the copy in each reviewer Agent file is stamped from one shared fragment, never hand-edited, and the contract tests execute that fragment against the real parser.
-_Avoid_: Output format, response template, Machine Summary (that is one section of the contract, not the whole)
+The exact machine-readable output shape a review Agent must emit. Fresh reviewer issuance in this checkout uses Reviewer Protocol v2: one JSON payload with engine-derived counts and IDs. The executable schema/rubric generate the shared fragment and seven stamped shims; never hand-edit those copies. Completed and unfinished issued v1 contracts retain their original markers/block/lifecycle parsing. [ADR-0009](docs/adr/ADR-0009-versioned-reviewer-protocol.md) records the boundary; P4 source review, merge, publication and runtime cutover remain pending.
+_Avoid_: Output format, response template, Machine Summary (that is one historical v1 section, not the current contract)
 
 **Wave Gate**:
 A quality checkpoint between waves. Requires test evidence, spec alignment, code review, and — whenever the wave holds critical **Findings** — the adjudication of a **Refutation Panel** before advancing.
@@ -59,6 +59,18 @@ _Avoid_: Gate, barrier, checkpoint (alone — always qualify as "wave gate")
 **Finding**:
 One assertion a review agent made about the code, carrying a severity (critical or advisory), an optional file/line, and a derived id. The unit a **Refutation Panel** votes on. Ids are derived from (agent, ordinal), never agent-chosen — an agent-chosen id collides across runs and reviewers, and a k-of-n vote needs an item two verifiers can agree they are discussing. A finding a reviewer merely emitted is a *draft finding*; it becomes a finding when attribution gives it identity.
 _Avoid_: Issue, comment, violation, remark
+
+**Issued Reviewer Protocol**:
+The nominal authority joining independent registration, published request and Context Packet to reviewer admission. Current packets freeze exact reviewer schema and impact rubric bytes; genuine v1 issuance retains its original contract without inventing a retrospectively frozen rubric. Output shape and caller version hints never select the decoder.
+_Avoid_: Payload version authority, decoder fallback, current prompt
+
+**Finding Basis**:
+A reviewer's structured evidence or execution trace, violated contract, consequence and evidence limits, truth confidence, and severity rationale accompanying one claim. Required for a v2 critical; optional but complete for an advisory, which requires a concise reason. These six critical fields (claim plus five basis fields) are semantic assertions, not engine-proven truth, impact, reachability, execution, or test adequacy.
+_Avoid_: Proof of defect, impact score, execution receipt
+
+**Reviewer Protocol Failure**:
+Unusable reviewer evidence under its Issued Reviewer Protocol, consuming only existing bounded evidence-retry authority and creating no v2 product Finding or Defect-Family repair obligation. Infrastructure observation failure instead remains unavailable at the same semantic attempt.
+_Avoid_: Synthetic critical, advisory downgrade, clean review
 
 **Refutation Panel**:
 The wave gate's adjudication step. N verifiers, each committed to one **Lens**, each covering ALL of the wave's critical **Findings**, try to REFUTE them. A finding survives unless a strict majority refutes it — ties favour keeping it, because a false positive costs a cycle while a false negative ships a bug.
@@ -356,6 +368,9 @@ _Avoid_: Constraint (too generic), rule (alone), enforced guideline (advisory ru
 - The **Orchestration Façade** materializes each batch as **Agent Request Authority** plus a **Context Packet**
 - An **Effect Receipt** makes an authorized side effect reconcilable and idempotent across resume
 - A **Standalone Review Run** feeds identified critical Findings through the same **Refutation Panel** without creating a Task or mutating the State File
+- An **Issued Reviewer Protocol** binds the same parser/rubric through capture admission, retry, replay, panel projection, and publication; completed and unfinished issued v1 reviews retain their original contract
+- A **Finding Basis** distinguishes truth confidence from consequence; structural admission proves neither, and an admitted surviving critical stays blocking without a new severity-dispute authority
+- A **Reviewer Protocol Failure** blocks evidence completion, not product-defect accounting; the existing explicit Wave operator override remains separate from reviewer settlement
 - A **Skill** is loaded into an **Agent** to provide domain expertise
 - **Hooks** and explicitly whitelisted StateManager-backed CLI helpers enforce mutation invariants on the **State File** — no other actor writes to it
 - A **Spec** contains **Clarification Markers** resolved by the clarify **Phase**

@@ -57,6 +57,35 @@ Implementation Agents are the only TaskGraph Agent values that actually execute 
 
 `review-verifier-agent` is deliberately not a normal reviewer: it emits verdict JSON, not Findings. Routing it through Finding capture would mark valid verifier output as missing reviewer evidence.
 
+### Reviewer wire
+
+The seven reviewer shims execute the task's concrete `LOOM_CONTEXT_READ_COMMAND`
+FIRST using Claude `Bash` or Pi `bash`. The read-only Bun script at the admitted
+package root checks packet integrity and supplied identity, returns a section
+index, and supports `--section LABEL`, `--file EXACT_SOURCE_PATH`, and bounded
+`--offset N --limit 4096` text pages. Raw byte arrays/base64 are not reviewer input.
+The helper grants no publication authority; engine delivery already proved issuance.
+Missing command, unsafe/unavailable file, bad identity/digest or invalid page fails
+visibly, never selecting a fallback protocol. Fresh schema-2
+requests use its frozen `reviewer-payload-schema` and `reviewer-impact-rubric`:
+exactly one JSON final payload, no Machine Summary/tallies/new IDs. Criticals
+require claim plus complete basis; advisories require reason. Fields are semantic
+assertions, not proof of truth, impact or execution. The same panel/majority
+assesses assertions, not whether a true assertion seems worth fixing.
+
+Genuine schema-1 requests instead read archived role and shared instructions under
+`references/reviewer-protocol-v1/`; current guidance is inapplicable. Missing
+archive/issuance fails visibly. Archives preserve baseline instructions, not
+invented original inputs for an unfrozen historical rubric/persona. Both completed
+and unfinished issued v1 reviews retain their protocol and retry bytes.
+
+The shared fragment and all seven regions are generated from the executable
+contract. Run `bun scripts/stamp-wire-contract.ts --check` to detect drift; never
+hand-edit stamped schema/rubric copies. Spec-check, verifiers, designers/judges,
+security-agent and skill-content-reviewer are not reviewer-wire targets.
+See [protocol operations](../docs/operations.md#reviewer-protocol-v2). P4 source
+review, merge, publication and loaded-runtime cutover remain pending.
+
 ## Utility/domain Agents
 
 | Agent | Role | Preloaded Skill |

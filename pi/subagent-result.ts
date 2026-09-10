@@ -362,6 +362,10 @@ export function piReviewAuthorityProblem(
   agentType: string,
   reservedAuthority: PiReviewAttemptAuthority | null | undefined,
 ): string | null {
+  if (task.review_run?.reviewer_protocol !== undefined ||
+      task.accepted_review_authority?.reviewer_protocol !== undefined) {
+    return "requires registered capture and facade resume; legacy settlement refused";
+  }
   const currentAuthority = reviewAuthorityForTask(task, agentType);
   if (reservedAuthority == null) {
     return isExplicitlyLegacyTask(task)

@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { legacyStandaloneContext, legacyFixtureReviewerProtocols, standaloneFixtureRegistration } from "../fixtures/standalone-reviewer-protocol";
+import { parsedAuthority } from "../../src/handlers/helpers/programs/helpers";
+import type { IssuedStandaloneReviewerProtocol, ReviewerProtocolAuthorityResolver } from "../../src/core/review-output";
 import { describe, expect, it } from "vitest";
 import fc from "fast-check";
 import { buildStandaloneFindingBrief, parseFindingBriefJson, serializeFindingBrief, type ReviewLens, type WaveFindingId } from "../../src/core/review-panel";
@@ -196,7 +199,7 @@ describe("standalone review aggregate", () => {
 
   describe("admitStandaloneTranscript", () => {
     it("admits an in-scope transcript carrying its parsed findings", () => {
-      const admission = admitStandaloneTranscript(["src/x.ts"], transcript(["blocker"]), "code-reviewer");
+      const admission = admitIssuedLegacyTranscript(["src/x.ts"], transcript(["blocker"]));
       expect(admission.ok).toBe(true);
       if (admission.ok) {
         expect(admission.findings.drafts).toHaveLength(1);
@@ -205,7 +208,7 @@ describe("standalone review aggregate", () => {
     });
 
     it("names every out-of-scope finding exactly as aggregation does", () => {
-      const admission = admitStandaloneTranscript(["src/inside.ts"], transcript(["blocker"]), "code-reviewer");
+      const admission = admitIssuedLegacyTranscript(["src/inside.ts"], transcript(["blocker"]));
       expect(admission.ok).toBe(false);
       if (!admission.ok) {
         expect(admission.problems).toEqual([
@@ -215,7 +218,7 @@ describe("standalone review aggregate", () => {
     });
 
     it("reports evidence failure with the aggregation prefix", () => {
-      const admission = admitStandaloneTranscript(["src/x.ts"], "not a machine summary", "code-reviewer");
+      const admission = admitIssuedLegacyTranscript(["src/x.ts"], "not a machine summary");
       expect(admission.ok).toBe(false);
       if (!admission.ok) {
         expect(admission.problems.length).toBe(1);
@@ -231,7 +234,7 @@ describe("standalone review aggregate", () => {
       // aggregate boundary could drift.
       const output = transcript(["in scope blocker"]);
       const scope = ["src/x.ts"];
-      const admission = admitStandaloneTranscript(scope, output, "code-reviewer");
+      const admission = admitIssuedLegacyTranscript(scope, output);
       const result = aggregateLegacyStandaloneReview({
         runId: "run.abc",
         scope,
@@ -549,7 +552,7 @@ const reviewerBindings = {
   },
 } as const;
 
-function rawStandaloneAuthority(role: keyof typeof reviewerBindings, slot: number, attempt: 1 | 2) {
+function rawStandaloneAuthority(role: keyof typeof reviewerBindings, slot: number, attempt: 1 | 2, scope: readonly string[] = ["src/x.ts"]) {
   const binding = reviewerBindings[role];
   return {
     runId: "run.review-1",
@@ -561,7 +564,7 @@ function rawStandaloneAuthority(role: keyof typeof reviewerBindings, slot: numbe
     modelProfile: binding.profile,
     harnessBinding: { pi: binding.pi, claude: binding.claude },
     requiredSkill: null,
-    contextDigest: (slot * 10 + attempt).toString(16).padStart(64, "0"),
+    contextDigest: legacyStandaloneContext({ runId: "run.review-1", requestId: `request:${slot}:${attempt}`, role, attempt, requiredSkill: null }, scope).digest,
     outputSlot: `transcripts/slot-${slot}/attempt-${attempt}.raw`,
   };
 }
@@ -616,6 +619,7 @@ interface ProvenCapturedRoster {
   readonly roster: CompleteRoster<AcceptedAgentResult<CapturedReviewerResult>>;
   readonly completion: StandaloneRosterCompletionProof;
   readonly resolver: PublicationAuthorityResolver;
+  readonly reviewerProtocols: ReviewerProtocolAuthorityResolver;
 }
 
 function completeCapturedRoster(
@@ -678,7 +682,7 @@ function completeCapturedRoster(
     return result.value;
   });
   const registration = createPublicationAuthorityResolver(() => ({ ok: true, value: bytes }));
-  const exact = parseExactRoster(rawStandaloneRoster());
+  const exact = parseExactRoster(authority.roster.orderedSlots);
   expect(exact.ok).toBe(true);
   if (!exact.ok) throw new Error("exact roster failed");
   const complete = parseCompleteRoster(
@@ -689,14 +693,35 @@ function completeCapturedRoster(
   );
   expect(complete.ok).toBe(true);
   if (!complete.ok) throw new Error(complete.error.violations.map(({ kind }) => kind).join(","));
+  const reviewerProtocols = legacyFixtureReviewerProtocols(authority, registration, action.value.requests);
   const completion = proveStandaloneRosterCompletion(
     authority,
     registration,
     completionOrder.map((index) => accepted[index]),
+    reviewerProtocols,
   );
   expect(completion.ok).toBe(true);
   if (!completion.ok) throw new Error(completion.error.violations.map(({ kind }) => kind).join(","));
-  return { roster: complete.value, completion: completion.value, resolver: registration };
+  return { roster: complete.value, completion: completion.value, resolver: registration, reviewerProtocols };
+}
+
+function admitIssuedLegacyTranscript(scope: readonly string[], output: string) {
+  const prepared = prepareStandaloneReview(preparationInput({ explicitScope: scope,
+    scopeSafety: scope.map((path) => ({ path, status: "safe" })),
+    roster: (["code-reviewer", "type-design-analyzer"] as const).map((role, index) => ({ slotId: `slot:${index + 1}`,
+      attempts: [rawStandaloneAuthority(role, index + 1, 1, scope), rawStandaloneAuthority(role, index + 1, 2, scope)] })),
+  }));
+  if (!prepared.ok) throw new Error(JSON.stringify(prepared));
+  const complete = completeCapturedRoster(prepared.value.authority, [transcript(), transcript()]);
+  const protocol = complete.reviewerProtocols(prepared.value.initialRequests[0]);
+  if (!protocol.ok || protocol.value.subject.kind !== "standalone-review") throw new Error(JSON.stringify(protocol));
+  return admitStandaloneTranscript(protocol.value as IssuedStandaloneReviewerProtocol, Buffer.from(output));
+}
+
+function registeredFixtureAuthority(authority: FrozenStandaloneReviewAuthority) {
+  const parsed = parsedAuthority(standaloneFixtureRegistration(authority));
+  if (!parsed.ok) throw new Error(parsed.message);
+  return parsed.value;
 }
 
 function aggregationEntry(authority: FrozenStandaloneReviewAuthority) {
@@ -977,13 +1002,10 @@ describe("standalone v1 authority and byte-aware complete-roster aggregation", (
     const reproved = proveStandaloneRosterCompletion(authority, complete.resolver, [
       accepted.value,
       complete.roster.ordered[1]!,
-    ]);
-    expect(reproved.ok).toBe(true);
-    if (!reproved.ok) return;
-    const aggregated = aggregateStandaloneReview({ authority, completion: reproved.value });
-    expect(aggregated.ok).toBe(false);
-    expect(!aggregated.ok && aggregated.errors.join("\n")).toContain("not valid UTF-8 semantic output");
-    expect(!aggregated.ok && aggregated.errors.join("\n")).not.toContain("CRITICAL_COUNT marker not found");
+    ], complete.reviewerProtocols);
+    expect(reproved.ok).toBe(false);
+    expect(JSON.stringify(reproved)).toContain("not valid UTF-8");
+    expect(JSON.stringify(reproved)).not.toContain("CRITICAL_COUNT marker not found");
   });
 
   it("fails closed when captured byte metadata is stale", () => {
@@ -1464,7 +1486,7 @@ describe("LC-2 standalone lifecycle machine", () => {
 
     const structuralClone = structuredClone(complete.completion) as StandaloneRosterCompletionProof;
     expect(aggregateStandaloneReview({ authority, completion: structuralClone }).ok).toBe(false);
-    const rehydrated = parseStandaloneRosterCompletionProof(authority, complete.resolver, structuralClone);
+    const rehydrated = parseStandaloneRosterCompletionProof(authority, complete.resolver, structuralClone, complete.reviewerProtocols);
     expect(rehydrated.ok).toBe(true);
     if (rehydrated.ok) expect(aggregateStandaloneReview({ authority, completion: rehydrated.value }).ok).toBe(true);
     expect(reduceStandaloneReviewMachine(awaiting.value, {
@@ -1480,7 +1502,7 @@ describe("LC-2 standalone lifecycle machine", () => {
     } as unknown as StandaloneRosterCompletionProof;
     expect(aggregateStandaloneReview({ authority, completion: forged }).ok).toBe(false);
 
-    const malformed = parseStandaloneRosterCompletionProof(authority, complete.resolver, {});
+    const malformed = parseStandaloneRosterCompletionProof(authority, complete.resolver, {}, complete.reviewerProtocols);
     expect(malformed.ok).toBe(false);
     if (!malformed.ok) {
       expect(malformed.error.violations).toEqual([expect.objectContaining({
@@ -1568,6 +1590,8 @@ describe("LC-2 standalone lifecycle machine", () => {
       const parsed = parseStandaloneReviewMachineState(
         JSON.parse(serializeStandaloneReviewMachineState(state)),
         resolver,
+        legacyFixtureReviewerProtocols(authority, resolver, "completion" in state ? state.completion.results.map(({ issuedRequest }) => issuedRequest) : []),
+        registeredFixtureAuthority(authority),
       );
       expect(parsed.ok, parsed.ok ? "" : parsed.error.message).toBe(true);
       if (!parsed.ok) throw new Error(parsed.error.message);
@@ -1695,7 +1719,7 @@ describe("LC-2 standalone lifecycle machine", () => {
     };
     const reloadedReady = parseStandaloneReviewMachineState(
       JSON.parse(serializeStandaloneReviewMachineState(ready.value)),
-      durableResolver,
+      durableResolver, roster.reviewerProtocols, registeredFixtureAuthority(authority),
     );
     expect(reloadedReady.ok, reloadedReady.ok ? "" : reloadedReady.error.message).toBe(true);
     if (!reloadedReady.ok || reloadedReady.value.kind !== "ready-to-finalize") return;
@@ -1715,7 +1739,7 @@ describe("LC-2 standalone lifecycle machine", () => {
     if (!done.ok || done.value.kind !== "done") return;
     const reloadedDone = parseStandaloneReviewMachineState(
       JSON.parse(serializeStandaloneReviewMachineState(done.value)),
-      durableResolver,
+      durableResolver, roster.reviewerProtocols, registeredFixtureAuthority(authority),
     );
     expect(reloadedDone.ok, reloadedDone.ok ? "" : reloadedDone.error.message).toBe(true);
     if (reloadedDone.ok && reloadedDone.value.kind === "done") {
@@ -1828,6 +1852,7 @@ describe("LC-2 standalone lifecycle machine", () => {
     const restored = parseStandaloneReviewMachineState(
       JSON.parse(serializeStandaloneReviewMachineState(terminal.value)),
       createPublicationAuthorityResolver(() => ({ ok: true, value: [] })),
+      complete.reviewerProtocols, registeredFixtureAuthority(authority),
     );
     expect(restored.ok && restored.value.kind).toBe("terminal-blocked");
     if (restored.ok && restored.value.kind === "terminal-blocked") {
@@ -1840,6 +1865,7 @@ describe("LC-2 standalone lifecycle machine", () => {
     expect(parseStandaloneReviewMachineState(
       forged,
       createPublicationAuthorityResolver(() => ({ ok: true, value: [] })),
+      complete.reviewerProtocols, registeredFixtureAuthority(authority),
     ).ok).toBe(false);
   });
 
@@ -1883,6 +1909,7 @@ describe("LC-2 standalone lifecycle machine", () => {
       const { slot, state } = rejectedAtAttemptOne("ADVISORY_COUNT marker not found");
       const restored = parseStandaloneReviewMachineState(
         JSON.parse(serializeStandaloneReviewMachineState(state)), resolver(),
+        legacyFixtureReviewerProtocols(preparedAuthority(), resolver(), []), registeredFixtureAuthority(preparedAuthority()),
       );
       expect(restored.ok).toBe(true);
       if (!restored.ok) return;
@@ -1898,7 +1925,7 @@ describe("LC-2 standalone lifecycle machine", () => {
         const { rejectionDiagnostic: _dropped, ...rest } = entry;
         return rest;
       });
-      const restored = parseStandaloneReviewMachineState(legacy, resolver());
+      const restored = parseStandaloneReviewMachineState(legacy, resolver(), legacyFixtureReviewerProtocols(preparedAuthority(), resolver(), []), registeredFixtureAuthority(preparedAuthority()));
       expect(restored.ok).toBe(true);
       if (!restored.ok) return;
       const retried = restored.value.pending.find(({ slotId }) => slotId === slot.slotId);
@@ -1911,14 +1938,14 @@ describe("LC-2 standalone lifecycle machine", () => {
       const illTyped = JSON.parse(serializeStandaloneReviewMachineState(state));
       illTyped.pending = illTyped.pending.map((entry: Record<string, unknown>) =>
         entry.slotId === slot.slotId ? { ...entry, rejectionDiagnostic: { message: "nope" } } : entry);
-      expect(parseStandaloneReviewMachineState(illTyped, resolver()).ok).toBe(false);
+      expect(parseStandaloneReviewMachineState(illTyped, resolver(), legacyFixtureReviewerProtocols(preparedAuthority(), resolver(), []), registeredFixtureAuthority(preparedAuthority())).ok).toBe(false);
 
       const misplaced = JSON.parse(serializeStandaloneReviewMachineState(state));
       misplaced.pending = misplaced.pending.map((entry: Record<string, unknown>) =>
         entry.slotId === slot.slotId
           ? { ...entry, rejectionDiagnostic: null }
           : { ...entry, rejectionDiagnostic: "smuggled onto an attempt-1 slot" });
-      expect(parseStandaloneReviewMachineState(misplaced, resolver()).ok).toBe(false);
+      expect(parseStandaloneReviewMachineState(misplaced, resolver(), legacyFixtureReviewerProtocols(preparedAuthority(), resolver(), []), registeredFixtureAuthority(preparedAuthority())).ok).toBe(false);
     });
   });
 
@@ -2015,7 +2042,8 @@ describe("LC-2 standalone lifecycle machine", () => {
     expect(acceptedRetry.ok && acceptedSibling.ok).toBe(true);
     if (!acceptedRetry.ok || !acceptedSibling.ok) return;
 
-    const completion = proveStandaloneRosterCompletion(authority, resolver, [acceptedRetry.value, acceptedSibling.value]);
+    const reviewerProtocols = legacyFixtureReviewerProtocols(authority, resolver, [retryRequest, siblingRequest]);
+    const completion = proveStandaloneRosterCompletion(authority, resolver, [acceptedRetry.value, acceptedSibling.value], reviewerProtocols);
     expect(completion.ok).toBe(true);
     if (!completion.ok) throw new Error(completion.error.violations.map(({ kind }) => kind).join(","));
 
@@ -2062,7 +2090,7 @@ describe("LC-2 standalone lifecycle machine", () => {
     // replay the rejection that advanced the slot and reach the same terminal
     // state instead of refusing the attempt-2 proof entry as stale.
     const serialized = serializeStandaloneReviewMachineState(done.value);
-    const reloaded = parseStandaloneReviewMachineState(JSON.parse(serialized), resolver);
+    const reloaded = parseStandaloneReviewMachineState(JSON.parse(serialized), resolver, reviewerProtocols, registeredFixtureAuthority(authority));
     expect(reloaded.ok, reloaded.ok ? "" : reloaded.error.message).toBe(true);
     if (!reloaded.ok || reloaded.value.kind !== "done") return;
     expect(reloaded.value.outcome).toEqual(done.value.outcome);
@@ -2071,7 +2099,8 @@ describe("LC-2 standalone lifecycle machine", () => {
     // resolve the attempt-2 request, so the checkpoint is refused rather than
     // silently replayed from a partial registration.
     const batchOnlyResolver = createPublicationAuthorityResolver(() => ({ ok: true, value: batchBytes }));
-    expect(parseStandaloneReviewMachineState(JSON.parse(serialized), batchOnlyResolver).ok).toBe(false);
+    expect(parseStandaloneReviewMachineState(JSON.parse(serialized), batchOnlyResolver,
+      legacyFixtureReviewerProtocols(authority, batchOnlyResolver, [retryRequest, siblingRequest]), registeredFixtureAuthority(authority)).ok).toBe(false);
   });
 
   it("restores the exact predecessor only from a matching recovery receipt", () => {
@@ -2096,8 +2125,10 @@ describe("LC-2 standalone lifecycle machine", () => {
     expect(blocked.ok && blocked.value.kind).toBe("recoverable-blocked");
     if (!blocked.ok || blocked.value.kind !== "recoverable-blocked") return;
     const resolver = createPublicationAuthorityResolver(() => ({ ok: true, value: [] }));
+    const reviewerProtocols = legacyFixtureReviewerProtocols(authority, resolver, []);
+    const registeredAuthority = registeredFixtureAuthority(authority);
     const serializedBlocked = JSON.parse(serializeStandaloneReviewMachineState(blocked.value));
-    const restoredBlocked = parseStandaloneReviewMachineState(serializedBlocked, resolver);
+    const restoredBlocked = parseStandaloneReviewMachineState(serializedBlocked, resolver, reviewerProtocols, registeredAuthority);
     expect(restoredBlocked.ok && restoredBlocked.value.kind).toBe("recoverable-blocked");
     if (restoredBlocked.ok && restoredBlocked.value.kind === "recoverable-blocked") {
       expect(serializeStandaloneReviewMachineState(restoredBlocked.value.predecessor)).toBe(
@@ -2108,19 +2139,19 @@ describe("LC-2 standalone lifecycle machine", () => {
     }
     const staleDigest = structuredClone(serializedBlocked);
     staleDigest.expectedIntentDigest = "0".repeat(64);
-    expect(parseStandaloneReviewMachineState(staleDigest, resolver).ok).toBe(false);
+    expect(parseStandaloneReviewMachineState(staleDigest, resolver, reviewerProtocols, registeredAuthority).ok).toBe(false);
     const malformedIntent = structuredClone(serializedBlocked);
     malformedIntent.expectedIntent.requests = [];
     malformedIntent.expectedIntentDigest = createHash("sha256")
       .update(JSON.stringify(malformedIntent.expectedIntent))
       .digest("hex");
-    expect(parseStandaloneReviewMachineState(malformedIntent, resolver).ok).toBe(false);
+    expect(parseStandaloneReviewMachineState(malformedIntent, resolver, reviewerProtocols, registeredAuthority).ok).toBe(false);
     const malformedDiagnostic = structuredClone(serializedBlocked);
     malformedDiagnostic.diagnostic.message = " padded diagnostic ";
-    expect(parseStandaloneReviewMachineState(malformedDiagnostic, resolver).ok).toBe(false);
+    expect(parseStandaloneReviewMachineState(malformedDiagnostic, resolver, reviewerProtocols, registeredAuthority).ok).toBe(false);
     const changedPredecessor = structuredClone(serializedBlocked);
     changedPredecessor.predecessor.kind = "done";
-    expect(parseStandaloneReviewMachineState(changedPredecessor, resolver).ok).toBe(false);
+    expect(parseStandaloneReviewMachineState(changedPredecessor, resolver, reviewerProtocols, registeredAuthority).ok).toBe(false);
 
     const replacement = {
       ...intent,
