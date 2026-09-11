@@ -38,9 +38,11 @@ import {
   type InitialBatchPublicationIntent,
   type SpawnBatchAction,
   type SpawnRequest,
+  type PublicationAuthorityResolver,
 } from "../../src/core/orchestration-contract";
 import {
   aggregateStandaloneReview,
+  standaloneCurrentPanelCriticals,
   capturedReviewerResultFromText,
   prepareStandaloneReview,
   proveStandaloneRosterCompletion,
@@ -159,7 +161,7 @@ function rawRequest(request: AgentRequestAuthority) {
  * unwrapped the action — verbatim. A fixture that publishes differently from its
  * sibling proves nothing about the contract the tests share.
  */
-function publishBatch(
+export function publishBatch(
   intent: InitialBatchPublicationIntent,
   requests: readonly unknown[],
 ): Readonly<{ action: SpawnBatchAction; receiptBytes: readonly number[] }> {
@@ -187,22 +189,24 @@ function publishBatch(
   return { action: action.value, receiptBytes };
 }
 
-function upholdStandaloneCriticals(
+export function upholdStandaloneCriticals(
   standaloneAuthority: FrozenStandaloneReviewAuthority,
   aggregate: StandaloneReviewAggregate,
+  refute = false,
 ): Readonly<{
   frozen: FrozenStandalonePanelAuthority;
   authority: RefutationPanelAuthority;
   completion: StandaloneRefutationCompletionReceipt;
+  resolver: PublicationAuthorityResolver;
 }> {
-  const panelRunId = "run.remediation-refutation-1";
-  const lenses = ["reproduction", "intent"] as const;
+  const panelRunId = standaloneAuthority.schemaVersion === 3 ? `${standaloneAuthority.runId}-refutation` : "run.remediation-refutation-1";
+  const lenses = standaloneAuthority.schemaVersion === 3 ? ["reproduction", "intent", "blast-radius"] as const : ["reproduction", "intent"] as const;
   const binding = {
     profile: "refutation",
     pi: { harness: "pi", provider: "openai-codex", model: "gpt-5.6-sol", thinking: "high" },
     claude: { harness: "claude-code", model: "opus" },
   } as const;
-  const brief = buildStandaloneFindingBrief(aggregate);
+  const brief = buildStandaloneFindingBrief({ subjectId: aggregate.subjectId, findings: standaloneCurrentPanelCriticals(aggregate) });
   // Verifier roster identities are semantic: each slot derives from the run,
   // its lens, and the exact finding set.
   const findingIds = brief.findings.map(({ id }) => id) as unknown as NonEmpty<WaveFindingId>;
@@ -261,8 +265,8 @@ function upholdStandaloneCriticals(
         criterion: lenses[index],
         verdicts: parsedAuthority.value.findings.map((finding) => ({
           finding_id: finding.id,
-          verdict: "upheld",
-          reasoning: `${lenses[index]} confirms ${finding.id}`,
+          verdict: refute ? "refuted" : "upheld",
+          reasoning: `${lenses[index]} ${refute ? "refutes" : "confirms"} ${finding.id}`,
         })),
       }),
     );
@@ -279,7 +283,7 @@ function upholdStandaloneCriticals(
     completedPanelState: completed.value.state,
   });
   if (!completion.ok) throw new Error(completion.error.message);
-  return { frozen: frozen.value, authority: parsedAuthority.value, completion: completion.value };
+  return { frozen: frozen.value, authority: parsedAuthority.value, completion: completion.value, resolver };
 }
 
 export type AuthoritativeStandaloneInput = Readonly<{
@@ -297,8 +301,9 @@ const standaloneFixtureCache = new Map<string, AuthoritativeStandaloneFixture>()
 export function standaloneFixture(
   scope: readonly string[] = ["src/main.ts", "src/deleted.ts"],
   withCritical = false,
+  options: Readonly<{ firstTranscript?: string; refute?: boolean }> = {},
 ): AuthoritativeStandaloneFixture {
-  const cacheKey = JSON.stringify({ scope, withCritical });
+  const cacheKey = JSON.stringify({ scope, withCritical, options });
   const cached = standaloneFixtureCache.get(cacheKey);
   if (cached !== undefined) return cached;
   const prepared = prepareStandaloneReview({
@@ -325,7 +330,7 @@ export function standaloneFixture(
   const issuedBySlot = new Map(action.requests.map((request) => [request.authority.slotId, request] as const));
   const accepted = authority.roster.orderedSlots.map(({ slotId }, index) => {
     const request = issuedBySlot.get(slotId) as SpawnRequest;
-    const transcript = withCritical && index === 0 ? criticalTranscript : cleanTranscript;
+    const transcript = index === 0 ? (options.firstTranscript ?? (withCritical ? criticalTranscript : cleanTranscript)) : cleanTranscript;
     const bytes = Buffer.from(transcript, "utf8");
     const artifact = parseArtifactRef({
       runId: authority.runId,
@@ -358,7 +363,7 @@ export function standaloneFixture(
         aggregate: aggregate.value.aggregate,
       })
     : (() => {
-        const panel = upholdStandaloneCriticals(authority, aggregate.value.aggregate);
+        const panel = upholdStandaloneCriticals(authority, aggregate.value.aggregate, options.refute);
         const routed = reduceStandaloneReviewMachine(aggregating.value, {
           kind: "aggregate-has-criticals",
           aggregate: aggregate.value.aggregate,

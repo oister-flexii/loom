@@ -26,12 +26,23 @@ import { assertAnchoredFilesystemPlatformSupported } from "./orchestration/no-fo
 const FAILURE_EXIT_CODE = failureExitCode(process.argv[2], process.argv[3]);
 const PACKAGE_ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
+// Bound this new ingress before chunk retention/concatenation; legacy routes retain their existing policy.
+const dispositionStart = process.argv.slice(2, 6).join("/") === "helper/orchestration/start/standalone-disposition";
+const standaloneStart = process.argv.slice(2, 6).join("/") === "helper/orchestration/start/standalone-review";
+const maximumStdinBytes = dispositionStart || standaloneStart ? 16_777_216 : Number.POSITIVE_INFINITY;
 // Eagerly buffer stdin before any async work (bun drains piped data during dynamic imports)
 const stdinPromise: Promise<string> = process.stdin.isTTY
   ? Promise.resolve("")
   : new Promise((resolve, reject) => {
       const chunks: Buffer[] = [];
-      process.stdin.on("data", (chunk) => chunks.push(chunk));
+      let total = 0;
+      process.stdin.on("data", (chunk: Buffer) => {
+        total += chunk.length;
+        if (total > maximumStdinBytes) {
+          chunks.length = 0;
+          reject(new Error("standalone input exceeds 16777216 byte limit"));
+        } else chunks.push(chunk);
+      });
       process.stdin.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
       process.stdin.on("error", reject);
     });

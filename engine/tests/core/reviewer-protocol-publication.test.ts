@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { prepareStandaloneLineageSource, findingOf } from "../../src/core/standalone-lineage";
 import { describe, expect, it } from "vitest";
 import fc from "fast-check";
 import { buildReviewerContextPacket, encodeByteSection } from "../../src/core/context-packets";
@@ -93,6 +94,10 @@ describe("current standalone publication authority", () => {
       expect(renderStandaloneReviewSummary(replay.result)).toContain(`Emitted/admitted: 0 critical; ${count} advisory.`);
       expect(renderStandaloneReviewSummary(replay.result)).not.toContain("<claim>");
       expect(Object.isFrozen(replay.result.advisories[0]?.basis?.evidence)).toBe(true);
+      const lineage = value(prepareStandaloneLineageSource(replay.result, "/owned/current-publication"));
+      expect(lineage.inventory.map(findingOf)).toEqual(replay.result.advisories);
+      expect(lineage.publication.resultDigest).toBe(c.done.outcome.digest);
+      expect(lineage.inventory.every(row => "draft" in row.finding && row.finding.protocolVersion === 2)).toBe(true);
     }), { seed: 2409, numRuns: 25 });
   });
 

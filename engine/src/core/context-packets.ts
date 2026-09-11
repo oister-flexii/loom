@@ -15,6 +15,7 @@
  */
 
 import { match } from "ts-pattern";
+import { STANDALONE_REVIEWER_PROTOCOL_V3, STANDALONE_REVIEWER_FIXED_SECTIONS_V3, parseStandaloneReviewerProtocolV3 } from "./standalone-lineage-contract";
 import { sha256Bytes, sha256Hex } from "./review-packet";
 import { isStandaloneReviewAgent } from "./model-profiles";
 import { readExactDataRecord } from "./orchestration-contract/bytes";
@@ -78,8 +79,12 @@ export type ReviewerContextPacketV2 = Readonly<Omit<LegacyContextPacket, "schema
   schemaVersion: typeof REVIEWER_CONTEXT_PACKET_SCHEMA_VERSION;
   reviewerProtocol: ReviewerProtocolDescriptor;
 }>;
+export type StandaloneReviewerContextPacketV3 = Readonly<Omit<LegacyContextPacket, "schemaVersion"> & {
+  schemaVersion: 3;
+  reviewerProtocol: typeof STANDALONE_REVIEWER_PROTOCOL_V3;
+}>;
 export type ContextPacket = LegacyContextPacket | ReviewerContextPacketV2;
-type ContextPacketIdentity = Omit<LegacyContextPacket, "digest"> | Omit<ReviewerContextPacketV2, "digest">;
+type ContextPacketIdentity = Omit<LegacyContextPacket, "digest"> | Omit<ReviewerContextPacketV2, "digest"> | Omit<StandaloneReviewerContextPacketV3, "digest">;
 
 export type ContextPacketError = Readonly<{
   kind: "invalid-context-packet";
@@ -93,6 +98,10 @@ const failure = <T>(field: string, message: string): DomainResult<T, ContextPack
 const success = <T>(value: T): DomainResult<T, ContextPacketError> => ({ ok: true, value });
 
 const encoder = new TextEncoder();
+// Membership covers only deeply immutable constructor/parser outputs, never caller-frozen objects.
+const sealedSections = new WeakSet<object>();
+const sealedSuccessorPackets = new WeakSet<object>();
+const sealedSectionJson = new WeakMap<ByteSection, string>();
 
 const isByte = (value: unknown): value is number =>
   typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 255;
@@ -110,12 +119,10 @@ export function encodeByteSection(label: string, text: string): DomainResult<Byt
   const bytes = Array.from(encoder.encode(text));
   const byteLength = parseArtifactByteLength(bytes.length);
   if (!byteLength.ok) return failure("byteLength", byteLength.error.message);
-  return success(canonicalRecord({
-    label,
-    byteLength: byteLength.value,
-    digest: digestBytes(bytes) as ArtifactDigest,
-    bytes: Object.freeze([...bytes]),
-  }));
+  const section = canonicalRecord({ label, byteLength: byteLength.value,
+    digest: digestBytes(bytes) as ArtifactDigest, bytes: Object.freeze(bytes) });
+  sealedSections.add(section);
+  return success(section);
 }
 
 /**
@@ -134,7 +141,7 @@ function packetIdentity(packet: ContextPacketIdentity): string {
     outputContract: packet.outputContract,
     ...match(packet)
       .with({ schemaVersion: 1 }, () => ({}))
-      .with({ schemaVersion: 2 }, ({ reviewerProtocol }) => ({ reviewerProtocol }))
+      .with({ schemaVersion: 2 }, { schemaVersion: 3 }, ({ reviewerProtocol }) => ({ reviewerProtocol }))
       .exhaustive(),
     fixedContext: packet.fixedContext.map(section),
     variableContext: packet.variableContext.map(section),
@@ -175,6 +182,7 @@ export function buildContextPacket(input: ContextPacketInput): DomainResult<Lega
       return failure(`${field}.label`, `a context section label must be unique: ${section.label}`);
     }
     labels.add(section.label);
+    if (sealedSections.has(section)) { canonicalSections.push(section); continue; }
     // Array.from materializes sparse holes as `undefined`; Array#every on the
     // caller's array would skip them and incorrectly accept a non-byte value.
     const bytes = Array.from(section.bytes);
@@ -231,19 +239,52 @@ function reviewerPacket(base: LegacyContextPacket): DomainResult<ReviewerContext
   return success(canonicalRecord({ ...identity, digest: contextPacketDigest(identity) }));
 }
 
-/** Current reviewer issuance only; callers cannot provide or replace the reserved contract. */
-export function buildReviewerContextPacket(input: Omit<ContextPacketInput, "outputContract">): DomainResult<ReviewerContextPacketV2, ContextPacketError> {
+/** Reserved sections are always engine-owned, whichever explicit grammar is issued. */
+function buildReviewerContractBase(input: Omit<ContextPacketInput, "outputContract">,
+  sections: readonly Readonly<{ label: string; text: string }>[],
+): DomainResult<LegacyContextPacket, ContextPacketError> {
   if ([...input.fixedContext, ...input.variableContext].some((section) => reservedLabel(section.label))) {
     return failure("sections", "caller sections must not collide with reserved reviewer contract labels");
   }
   const fixed: ByteSection[] = [...input.fixedContext];
-  for (const section of REVIEWER_FIXED_SECTIONS) {
+  for (const section of sections) {
     const encoded = encodeByteSection(section.label, section.text);
     if (!encoded.ok) return encoded;
     fixed.push(encoded.value);
   }
-  const base = buildContextPacket({ ...input, outputContract: REVIEWER_OUTPUT_CONTRACT, fixedContext: fixed });
+  return buildContextPacket({ ...input, outputContract: REVIEWER_OUTPUT_CONTRACT, fixedContext: fixed });
+}
+
+/** Independent standalone and Wave issuance remain v2. */
+export function buildReviewerContextPacket(input: Omit<ContextPacketInput, "outputContract">): DomainResult<ReviewerContextPacketV2, ContextPacketError> {
+  const base = buildReviewerContractBase(input, REVIEWER_FIXED_SECTIONS);
   return base.ok ? reviewerPacket(base.value) : base;
+}
+
+function standaloneSuccessorPacket(base: LegacyContextPacket): DomainResult<StandaloneReviewerContextPacketV3, ContextPacketError> {
+  if (!isStandaloneReviewAgent(base.role) || base.outputContract !== REVIEWER_OUTPUT_CONTRACT) {
+    return failure("role", "standalone v3 requires a reviewer and the exact output contract");
+  }
+  if (base.variableContext.some(section => reservedLabel(section.label))) return failure("variableContext", "reviewer contract sections must be fixed");
+  for (const expected of STANDALONE_REVIEWER_FIXED_SECTIONS_V3) {
+    const actual = base.fixedContext.find(section => section.label === expected.label);
+    const bytes = encoder.encode(expected.text);
+    if (actual === undefined || actual.bytes.length !== bytes.length || actual.bytes.some((byte, index) => byte !== bytes[index])) {
+      return failure("fixedContext", `standalone v3 section ${expected.label} must contain the exact supported bytes`);
+    }
+  }
+  const identity = { schemaVersion: 3 as const, requestId: base.requestId, role: base.role, requiredSkill: base.requiredSkill,
+    outputContract: base.outputContract, reviewerProtocol: STANDALONE_REVIEWER_PROTOCOL_V3,
+    fixedContext: base.fixedContext, variableContext: base.variableContext };
+  const packet = canonicalRecord({ ...identity, digest: contextPacketDigest(identity) });
+  sealedSuccessorPackets.add(packet);
+  return success(packet);
+}
+
+/** Explicit future successor issuance; independent standalone and Wave builders remain v2. */
+export function buildStandaloneReviewerContextPacketV3(input: Omit<ContextPacketInput, "outputContract">): DomainResult<StandaloneReviewerContextPacketV3, ContextPacketError> {
+  const base = buildReviewerContractBase(input, STANDALONE_REVIEWER_FIXED_SECTIONS_V3);
+  return base.ok ? standaloneSuccessorPacket(base.value) : base;
 }
 
 function requiredFieldProblem(input: ContextPacketInput): Readonly<{ field: string; message: string }> | null {
@@ -291,12 +332,10 @@ function parseSection(raw: unknown, field: string): DomainResult<ByteSection, Co
   if (record["digest"] !== digest) {
     return failure(`${field}.digest`, "a context section digest must cover its exact bytes");
   }
-  return success(canonicalRecord({
-    label: record["label"],
-    byteLength: byteLength.value,
-    digest: digest as ArtifactDigest,
-    bytes: Object.freeze([...materialised]),
-  }));
+  const section = canonicalRecord({ label: record["label"], byteLength: byteLength.value,
+    digest: digest as ArtifactDigest, bytes: Object.freeze(materialised) });
+  sealedSections.add(section);
+  return success(section);
 }
 
 function parseSections(raw: unknown, field: string): DomainResult<readonly ByteSection[], ContextPacketError> {
@@ -317,18 +356,54 @@ function parseSections(raw: unknown, field: string): DomainResult<readonly ByteS
  */
 export function parseContextPacket(raw: unknown): DomainResult<ContextPacket, ContextPacketError> {
   try {
-    return parseContextPacketRecord(raw);
+    const parsed = parseContextPacketRecord(raw);
+    if (!parsed.ok) return parsed;
+    return parsed.value.schemaVersion === 3
+      ? failure("schemaVersion", "standalone v3 requires explicit successor Context Packet parsing") : success(parsed.value);
   } catch {
     return failure("packet", "context packet could not be inspected safely");
   }
 }
 
-function parseContextPacketRecord(raw: unknown): DomainResult<ContextPacket, ContextPacketError> {
+export function parseStandaloneReviewerContextPacketV3(raw: unknown): DomainResult<StandaloneReviewerContextPacketV3, ContextPacketError> {
+  try {
+    if (typeof raw === "object" && raw !== null && sealedSuccessorPackets.has(raw)) return success(raw as StandaloneReviewerContextPacketV3);
+    const parsed = parseContextPacketRecord(raw);
+    if (!parsed.ok) return parsed;
+    return parsed.value.schemaVersion === 3 ? success(parsed.value)
+      : failure("schemaVersion", "standalone successor Context Packet must declare schema version 3");
+  } catch {
+    return failure("packet", "standalone successor context packet could not be inspected safely");
+  }
+}
+
+/** Exact JSON.stringify bytes; reuse only constructor/parser-owned immutable sections across the roster. */
+export function serializeStandaloneReviewerContextPacketV3(raw: StandaloneReviewerContextPacketV3): DomainResult<string, ContextPacketError> {
+  const parsed = parseStandaloneReviewerContextPacketV3(raw);
+  if (!parsed.ok) return parsed;
+  const sectionJson = (section: ByteSection): string => {
+    const retained = sealedSectionJson.get(section);
+    if (retained !== undefined) return retained;
+    const text = JSON.stringify(section);
+    sealedSectionJson.set(section, text);
+    return text;
+  };
+  const packet = parsed.value;
+  return success("{" + Object.entries(packet).map(([key, value]) => {
+    const prefix = JSON.stringify(key) + ":";
+    if (key === "fixedContext") return prefix + "[" + packet.fixedContext.map(sectionJson).join(",") + "]";
+    if (key === "variableContext") return prefix + "[" + packet.variableContext.map(sectionJson).join(",") + "]";
+    return prefix + JSON.stringify(value);
+  }).join(",") + "}");
+}
+
+function parseContextPacketHeader(raw: unknown): DomainResult<Record<string, unknown>, ContextPacketError> {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
     return failure("packet", "a context packet must be an object");
   }
   let record = raw as Record<string, unknown>;
-  const current = record["schemaVersion"] === REVIEWER_CONTEXT_PACKET_SCHEMA_VERSION;
+  const successor = record["schemaVersion"] === 3;
+  const current = record["schemaVersion"] === REVIEWER_CONTEXT_PACKET_SCHEMA_VERSION || successor;
   if (current) {
     const inspected = readExactDataRecord(raw, [...CONTEXT_PACKET_FIELDS, "reviewerProtocol"], "reviewer context packet");
     if (!inspected.ok) return failure("packet", "reviewer context packet must contain only own data fields");
@@ -342,9 +417,16 @@ function parseContextPacketRecord(raw: unknown): DomainResult<ContextPacket, Con
     return failure("schemaVersion", "a context packet must declare supported schema version 1 or 2");
   }
   if (current) {
-    const descriptor = parseReviewerProtocolDescriptor(record["reviewerProtocol"]);
+    const descriptor = successor ? parseStandaloneReviewerProtocolV3(record["reviewerProtocol"]) : parseReviewerProtocolDescriptor(record["reviewerProtocol"]);
     if (!descriptor.ok) return failure("reviewerProtocol", descriptor.error.message);
   }
+  return success(record);
+}
+
+function parseContextPacketRecord(raw: unknown): DomainResult<ContextPacket | StandaloneReviewerContextPacketV3, ContextPacketError> {
+  const header = parseContextPacketHeader(raw);
+  if (!header.ok) return header;
+  const record = header.value;
   const fixedContext = parseSections(record["fixedContext"], "fixedContext");
   if (!fixedContext.ok) return fixedContext;
   const variableContext = parseSections(record["variableContext"], "variableContext");
@@ -368,7 +450,10 @@ function parseContextPacketRecord(raw: unknown): DomainResult<ContextPacket, Con
     variableContext: variableContext.value,
   });
   if (!built.ok) return built;
-  const packet = current ? reviewerPacket(built.value) : built;
+  const packet = match(record["schemaVersion"])
+    .with(3, () => standaloneSuccessorPacket(built.value))
+    .with(2, () => reviewerPacket(built.value))
+    .otherwise(() => built);
   if (!packet.ok) return packet;
   if (record["digest"] !== packet.value.digest) {
     return failure("digest", "a context packet digest must cover its exact identity and sections");

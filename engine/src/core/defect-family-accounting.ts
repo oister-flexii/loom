@@ -24,12 +24,14 @@ import {
   type CompletionTimeoutMs,
   type RepositoryRelativePath,
 } from "./completion-suite";
-import { canonicalStandaloneResultArtifact } from "./standalone-review";
+import { canonicalStandaloneResultArtifact, serializeAdjudicatedStandaloneReview } from "./standalone-review";
 import {
   isAuthoritativeStandaloneReviewResult,
+  readStandaloneReviewPublication,
   type AuthoritativeStandaloneReviewResult,
 } from "./standalone-review-machine";
 import { parseStoredFindings, type Finding, type RefutedFinding } from "./findings";
+import { STANDALONE_LINEAGE_LIMITS } from "./standalone-lineage-contract";
 import { parseReviewPath, sha256Hex, type ReviewPath } from "./review-packet";
 import {
   parseFrozenVerificationManifest,
@@ -46,6 +48,7 @@ const immutableArray = <T>(values: readonly T[]): readonly T[] => Object.freeze(
 
 type DefectFamilyFailureCode =
   | "invalid-source-authority"
+  | "critical-coverage-limited"
   | "invalid-declaration"
   | "source-declaration-mismatch"
   | "missing-critical-disposition"
@@ -284,7 +287,14 @@ export type SourceFindingInventory = Readonly<{
   survivingCriticals: readonly Finding[];
   refutedCriticals: readonly RefutedFinding[];
   advisories: readonly Finding[];
-}>;
+}> & (
+  | Readonly<{ sourceVersion?: never; sourceResultJson?: never }>
+  | Readonly<{
+      sourceVersion: 3;
+      /** Exact canonical publication, including every origin, decision, assessment and prior generation. */
+      sourceResultJson: string;
+    }>
+);
 
 const sourceInventoryCache = new WeakSet<object>();
 
@@ -300,7 +310,13 @@ function createSourceFindingInventory(
         "source inventory requires the opaque authoritative Standalone Review result",
       )]);
     }
-    const artifact = canonicalStandaloneResultArtifact(source);
+    if (source.schemaVersion === 3 && source.lineage.currentCriticalCoverage.kind === "limited") {
+      return accountingFailure([problem("critical-coverage-limited", "source.lineage.currentCriticalCoverage",
+        `current critical coverage is limited for origin(s): ${source.lineage.currentCriticalCoverage.origins.join(", ")}; remediation cannot authorize checks or installation`)]);
+    }
+    const artifact = source.schemaVersion === 3
+      ? readStandaloneReviewPublication(source, STANDALONE_LINEAGE_LIMITS.retainedBytes)
+      : canonicalStandaloneResultArtifact(source);
     if (!artifact.ok) {
       return accountingFailure([problem("invalid-source-authority", "source", artifact.error.message)]);
     }
@@ -323,14 +339,17 @@ function createSourceFindingInventory(
         "authoritative Standalone Review finding classifications are inconsistent or overlap",
       )]);
     }
-    const inventory = canonicalRecord({
+    const partitions = {
       sourceRunId: artifact.value.runId,
       sourceResultDigest: artifact.value.digest,
       sourceResultByteLength: artifact.value.byteLength,
       survivingCriticals: immutableArray(survivingCriticals),
       refutedCriticals: immutableArray(refutedCriticals),
       advisories: immutableArray(advisories),
-    });
+    };
+    const inventory: SourceFindingInventory = source.schemaVersion === 3
+      ? canonicalRecord({ ...partitions, sourceVersion: 3, sourceResultJson: serializeAdjudicatedStandaloneReview(source) })
+      : canonicalRecord(partitions);
     sourceInventoryCache.add(inventory);
     return success(inventory);
   } catch {

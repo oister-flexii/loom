@@ -471,6 +471,31 @@ export function piFinalPayloadCandidates(
   return { ok: true, value: Object.freeze(candidates) };
 }
 
+/** Bound decoded native input before the legacy adapter allocates copied message/block arrays. */
+function successorTranscriptBudgetProblem(raw: unknown): string | null {
+  const pending: { value: unknown; depth: number }[] = [{ value: raw, depth: 0 }];
+  let remainingValues = 65_536;
+  let remainingText = 16_777_216;
+  while (pending.length > 0) {
+    const { value, depth } = pending.pop()!;
+    if (--remainingValues < 0 || depth > 32) return "successor native transcript exceeds decoded work/depth budget";
+    if (typeof value === "string") remainingText -= Buffer.byteLength(value, "utf8");
+    if (remainingText < 0) return "successor native transcript exceeds 16777216 text-byte budget";
+    if (typeof value !== "object" || value === null) continue;
+    if (Array.isArray(value) && value.length > remainingValues - pending.length) return "successor native transcript exceeds array budget";
+    const keys = Reflect.ownKeys(value);
+    if (keys.length > remainingValues - pending.length + 1) return "successor native transcript exceeds object budget";
+    for (const key of keys) {
+      if (Array.isArray(value) && key === "length") continue;
+      const field = Object.getOwnPropertyDescriptor(value, key);
+      if (typeof key !== "string" || field === undefined || !("value" in field)) return "successor native transcript must contain only own data";
+      remainingText -= Buffer.byteLength(key, "utf8");
+      pending.push({ value: field.value, depth: depth + 1 });
+    }
+  }
+  return remainingText < 0 ? "successor native transcript exceeds text-byte budget" : null;
+}
+
 /**
  * Every candidate final payload from a whole Pi subagent RESULT.
  *
@@ -487,7 +512,14 @@ export function piFinalPayloadCandidates(
  */
 export function piResultFinalPayloadCandidates(
   messages: unknown,
+  purpose?: "standalone-successor",
 ): PiTranscriptResult<readonly Readonly<{ origin: string; text: string }>[]> {
+  if (purpose === "standalone-successor") {
+    try {
+      const problem = successorTranscriptBudgetProblem(messages);
+      if (problem !== null) return { ok: false, errors: [problem] };
+    } catch { return { ok: false, errors: ["successor native transcript cannot be inspected safely"] }; }
+  }
   const parsed = parsePiMessages(messages);
   if (!parsed.ok) return parsed;
   for (let index = parsed.value.length - 1; index >= 0; index -= 1) {

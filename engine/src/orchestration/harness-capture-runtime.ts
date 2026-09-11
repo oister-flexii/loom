@@ -19,15 +19,22 @@
 import { match } from "ts-pattern";
 import {
   bindCapture,
+  captureKey,
+  nativeCaptureObservation,
+  recoverNativeCaptureArtifact,
   captureRejectionAuditRecord,
   captureRejectionDedupKey,
   parseFinalPayload,
   type CaptureReceipt,
+  type FinalPayload,
   type FinalPayloadCandidate,
   type HarnessResultIdentity,
 } from "../core/harness-capture";
-import type { AgentRequestAuthority } from "../core/orchestration-contract";
-import { openRunDirectory, type HarnessCorrelatorBinding, type RunDirHandle } from "./run-directory-handle";
+import { parseEffectId, type AgentRequestAuthority, type ArtifactRef, type DomainResult } from "../core/orchestration-contract";
+import { createHash } from "node:crypto";
+import { parseStandaloneReviewerProtocolV3 } from "../core/standalone-lineage-contract";
+import { verifyStandalonePanelView } from "./standalone-panel-context";
+import { openRegisteredRunDirectory, type HarnessCorrelatorBinding, type RunDirHandle } from "./run-directory-handle";
 
 /**
  * Where a run directory is announced.
@@ -203,7 +210,7 @@ export function resolveCorrelatedRequest(args: Readonly<{
     };
   }
 
-  const opened = openRunDirectory(args.runsRoot, args.runDirectory);
+  const opened = openRegisteredRunDirectory(args.runsRoot, args.runDirectory);
   if (!opened.ok) {
     return { ok: false, outcome: retriableFailure("run-directory", opened.error.message) };
   }
@@ -277,8 +284,10 @@ export function resolveCorrelatedRequest(args: Readonly<{
  * `no-reservation`, `run-authority`, `run-directory`, `correlator`,
  * `requests`, and `unknown-request` — never reached one. And
  * `duplicate-capture` reached a reservation that is already durably FILLED:
- * `rejectCapture` refuses to tombstone a captured attempt by design, since the
- * accepted evidence is the record.
+ * `rejectCapture` refuses to tombstone a captured attempt by design. Current v3
+ * alone may recover a missing receipt, after a fresh native observation proves
+ * the original write-ahead request/context/correlator and exact captured bytes.
+ * Existing receipts and legacy duplicates remain refusals; replay cannot recover.
  *
  * The adapter supplies the two harness-native facts — the native correlator and
  * every candidate final payload it observed — and nothing else differs between
@@ -298,6 +307,20 @@ type CaptureHarnessInput = Readonly<{
   | Readonly<{ candidates: readonly FinalPayloadCandidate[]; observe?: never }>
 );
 
+type NativeCapturePurpose = "legacy" | "standalone-successor";
+
+function readNativeCapturePurpose(handle: RunDirHandle): DomainResult<NativeCapturePurpose, string> {
+  const registration = handle.readProgramRegistration(16_777_216);
+  if (!registration.ok) return { ok: false, error: registration.error.message };
+  const raw = registration.value;
+  const successor = typeof raw === "object" && raw !== null && Object.getOwnPropertyDescriptor(raw, "schemaVersion")?.value === 3 &&
+    Object.getOwnPropertyDescriptor(raw, "kind")?.value === "standalone-review";
+  if (successor && !parseStandaloneReviewerProtocolV3(Object.getOwnPropertyDescriptor(raw, "reviewerProtocol")?.value).ok) {
+    return { ok: false, error: "successor capture requires the exact registered protocol descriptor" };
+  }
+  return { ok: true, value: successor ? "standalone-successor" : "legacy" };
+}
+
 export async function captureHarnessResult(args: CaptureHarnessInput): Promise<CaptureOutcome> {
   const resolved = resolveCorrelatedRequest(args);
   if (!resolved.ok) return resolved.outcome;
@@ -313,6 +336,11 @@ export async function captureHarnessResult(args: CaptureHarnessInput): Promise<C
   if (observation.kind === "terminal-refusal") {
     return terminalizeCaptureRejection(handle, request, observation);
   }
+  const purpose = readNativeCapturePurpose(handle);
+  if (!purpose.ok) return retriableFailure("registration", purpose.error);
+  if (purpose.value === "standalone-successor" && observation.candidates.some(candidate => Buffer.byteLength(candidate.text, "utf8") > 1_048_576)) {
+    return reject("payload-byte-limit", "native successor final exceeds the unchanged 1048576-byte reviewer budget");
+  }
   const payload = parseFinalPayload(observation.candidates);
   if (!payload.ok) return reject(payload.error.reason, payload.error.message);
 
@@ -322,7 +350,9 @@ export async function captureHarnessResult(args: CaptureHarnessInput): Promise<C
     issued,
     identity,
     payload: payload.value,
-    alreadyCaptured: captured.value,
+    // Only current native capture can reconcile an unreceipted write. Its durable
+    // observation and exact bytes are proved below; legacy duplicate rules stay intact.
+    alreadyCaptured: purpose.value === "standalone-successor" ? new Set() : captured.value,
   });
   if (!bound.ok) {
     // `duplicate-capture` is the one bind refusal that must NOT tombstone: the
@@ -339,16 +369,21 @@ export async function captureHarnessResult(args: CaptureHarnessInput): Promise<C
       `native ${args.harness} result is bound as ${correlatorRole}, not ${request.role}`,
     );
   }
-  return persistBoundCapture(handle, request, bound.value, payload.value.bytes);
+  return persistBoundCapture(handle, request, bound.value, payload.value, purpose.value,
+    captured.value.has(captureKey(request.slotId, request.attempt)) ? "recapture" : "fresh");
 }
 
 async function persistBoundCapture(
   handle: RunDirHandle,
   request: AgentRequestAuthority,
   receipt: CaptureReceipt,
-  bytes: readonly number[],
+  payload: FinalPayload,
+  purpose: NativeCapturePurpose,
+  observation: "fresh" | "recapture",
 ): Promise<CaptureOutcome> {
-  const context = handle.readContext(request.contextDigest);
+  const context = purpose === "standalone-successor" && request.program === "standalone-review"
+    ? handle.readStandaloneSuccessorContext(request.contextDigest, 16_777_216)
+    : handle.readContext(request.contextDigest);
   if (!context.ok) return retriableFailure("context", context.error.message);
   if (context.value.requestId !== request.requestId || context.value.role !== request.role) {
     return terminalizeCaptureRejection(handle, request, terminalCaptureRefusal(
@@ -356,7 +391,13 @@ async function persistBoundCapture(
       `context ${request.contextDigest} does not describe request ${request.requestId}/${request.role}`,
     ));
   }
-  const written = await handle.captureTranscript(request, bytes);
+  if (purpose === "standalone-successor" && request.program === "refutation-panel") {
+    if (context.value.schemaVersion === 3) return retriableFailure("context", "refutation uses its own explicit packet contract");
+    const view = verifyStandalonePanelView(handle, context.value);
+    if (!view.ok) return retriableFailure("context", view.error);
+  }
+  if (purpose === "standalone-successor") return persistNativeCapture(handle, request, receipt, payload, observation);
+  const written = await handle.captureTranscript(request, payload.bytes);
   if (!written.ok) {
     const rejection = handle.readCaptureRejection(request);
     return rejection.ok && rejection.value !== null
@@ -364,6 +405,56 @@ async function persistBoundCapture(
       : retriableFailure("transcript", written.error.message);
   }
 
+  return { kind: "captured", receipt };
+}
+
+async function observeNativeCaptureArtifact(
+  handle: RunDirHandle,
+  request: AgentRequestAuthority,
+  receipt: CaptureReceipt,
+  payload: FinalPayload,
+  observation: "fresh" | "recapture",
+): Promise<DomainResult<ArtifactRef, string>> {
+  const path = `native-capture-observations/${request.requestId}.json`;
+  if (observation === "recapture") {
+    const prior = handle.readArtifactBytes(path, 16_384);
+    if (!prior.ok) return { ok: false, error: prior.error.message };
+    const bytes = handle.readTranscriptBytes(request, 1_048_576);
+    if (!bytes.ok) return { ok: false, error: bytes.error.message };
+    return recoverNativeCaptureArtifact({ request, receipt, payload, observation: prior.value, capturedBytes: bytes.value });
+  }
+  const bytes = Buffer.from(nativeCaptureObservation(request, receipt, payload.origin));
+  if (bytes.length > 16_384) return { ok: false, error: "native capture observation exceeds 16384-byte bound" };
+  // Freeze request/context/native identity BEFORE the exclusive raw write. This is
+  // inert write-ahead evidence, not a receipt; replay never promotes it to authority.
+  const observed = await handle.publishArtifactSet([{ relativePath: path, bytes: [...bytes] }]);
+  if (!observed.ok) return { ok: false, error: observed.error.message };
+  const written = await handle.captureTranscript(request, payload.bytes);
+  return written.ok ? written : { ok: false, error: written.error.message };
+}
+
+async function persistNativeCapture(
+  handle: RunDirHandle,
+  request: AgentRequestAuthority,
+  receipt: CaptureReceipt,
+  payload: FinalPayload,
+  observation: "fresh" | "recapture",
+): Promise<CaptureOutcome> {
+  const effect = parseEffectId(`effect:capture:${createHash("sha256").update(`${request.requestId}:${request.attempt}`).digest("hex")}`);
+  if (!effect.ok) return retriableFailure("receipt", effect.error.message);
+  const existing = handle.readReceipt(effect.value, 16_384);
+  if (!existing.ok) return retriableFailure("receipt", existing.error.message);
+  // Any existing receipt (including a foreign/contradictory one) precludes repair.
+  // Normal already-receipted duplicate delivery remains a refusal, not a new witness.
+  if (existing.value !== null) return { kind: "terminal-rejection", reason: "duplicate-capture", message: "native capture already has a durable receipt; duplicate delivery cannot replace it" };
+  const rejected = handle.readCaptureRejection(request);
+  if (!rejected.ok) return retriableFailure("transcript", rejected.error.message);
+  if (rejected.value !== null) return { kind: "terminal-rejection", reason: "transcript", message: rejected.value };
+  const artifact = await observeNativeCaptureArtifact(handle, request, receipt, payload, observation);
+  if (!artifact.ok) return retriableFailure("transcript", artifact.error);
+  const recorded = await handle.recordReceipt({ kind: "raw-transcript-captured", effectId: effect.value,
+    runId: handle.runId, requestId: request.requestId, artifact: artifact.value });
+  if (!recorded.ok) return retriableFailure("receipt", `native bytes captured but durable receipt unavailable: ${recorded.error.message}`);
   return { kind: "captured", receipt };
 }
 

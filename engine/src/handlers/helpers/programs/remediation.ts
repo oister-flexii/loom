@@ -31,10 +31,8 @@ import {
   type RemediationState,
   type RepositorySnapshotWitness,
 } from "../../../core/remediation-machine";
-import {
-  parseStandaloneReviewMachineState,
-  type StandaloneDoneState,
-} from "../../../core/standalone-review-machine";
+import type { StandaloneDoneState } from "../../../core/standalone-review-machine";
+import { readAuthenticatedStandaloneSource } from "./standalone-source";
 import {
   freezeVerificationManifest,
   parseFrozenVerificationManifest,
@@ -63,7 +61,6 @@ import {
 } from "../../../orchestration/git-remediation";
 import { readRunBytesNoFollow } from "../../../orchestration/no-follow-fs";
 import {
-  openRunDirectory,
   parseRunDirectoryReference,
   type RunDirHandle,
 } from "../../../orchestration/run-directory-handle";
@@ -80,7 +77,7 @@ import {
   type RemediationStartInputV2,
 } from "./remediation-registration";
 import type { RemediationInspectionLabel } from "../../../core/run-inspection";
-import { readPublishedStandaloneResult, failed, parsedAuthority, parseRegistration, publicationResolver, reviewerProtocolResolver, type FacadeDriveResult } from "./helpers";
+import { failed, type FacadeDriveResult } from "./helpers";
 
 export function remediationBlocked(handle: RunDirHandle, message: string): FacadeDriveResult {
   return {
@@ -112,32 +109,6 @@ export function witness(repository: GitRepository):
 
 function messageOf(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
-}
-
-async function authoritativeSource(
-  sourceRunsRoot: string,
-  sourceRun: string,
-): Promise<Readonly<{ ok: true; state: StandaloneDoneState }> | Readonly<{ ok: false; message: string }>> {
-  const source = openRunDirectory(sourceRunsRoot, sourceRun);
-  if (!source.ok) return { ok: false, message: `source run: ${source.error.message}` };
-  const checkpoint = await source.value.readCheckpoint();
-  if (checkpoint === null) return { ok: false, message: "source standalone review checkpoint is missing" };
-  let raw: unknown;
-  try { raw = JSON.parse(checkpoint) as unknown; }
-  catch (cause) { return { ok: false, message: `source standalone review checkpoint is invalid JSON: ${messageOf(cause)}` }; }
-  const program = source.value.readProgramRegistration();
-  if (!program.ok) return { ok: false, message: program.error.message };
-  const registration = parseRegistration(program.value);
-  if (!registration.ok) return registration;
-  const authority = parsedAuthority(registration.value);
-  if (!authority.ok) return authority;
-  const parsed = parseStandaloneReviewMachineState(raw, publicationResolver(source.value),
-    reviewerProtocolResolver(source.value, registration.value), authority.value);
-  if (!parsed.ok || parsed.value.kind !== "done") {
-    return { ok: false, message: parsed.ok ? "source standalone review is not done" : parsed.error.message };
-  }
-  const published = readPublishedStandaloneResult(source.value, parsed.value);
-  return published.ok ? { ok: true, state: published.value } : published;
 }
 
 function standaloneResultResolver(source: StandaloneDoneState) {
@@ -207,9 +178,9 @@ export async function prepareRemediationFacadeStart(
 ): Promise<Readonly<{ ok: true; value: PreparedRemediationFacadeStart }> | Readonly<{ ok: false; message: string }>> {
   const runReference = parseRunDirectoryReference(request.remediationRunsRoot, request.remediationRun);
   if (!runReference.ok) return { ok: false, message: runReference.error.message };
-  const source = await authoritativeSource(request.input.sourceRunsRoot, request.input.sourceRun);
+  const source = await readAuthenticatedStandaloneSource(request.input.sourceRunsRoot, request.input.sourceRun);
   if (!source.ok) return source;
-  const accounting = prepareDefectFamilyAccounting(source.state.result, request.input.defectFamily);
+  const accounting = prepareDefectFamilyAccounting(source.value.result, request.input.defectFamily);
   if (!accounting.ok) return { ok: false, message: accounting.error.failures.map(({ message }) => message).join("; ") };
   const repository = openGitRepository(request.repositoryStartPath);
   if (!repository.ok) return { ok: false, message: repository.error.message };
@@ -223,7 +194,7 @@ export async function prepareRemediationFacadeStart(
   if (plan.value.kind === "blocked-declaration") {
     return { ok: false, message: plan.value.failures.map(({ message }) => message).join("; ") };
   }
-  const paths = pathState(source.state, request.input.supportPaths);
+  const paths = pathState(source.value, request.input.supportPaths);
   if (!paths.ok) return paths;
   const repositoryWitness = witness(repository.value);
   if (!repositoryWitness.ok) return repositoryWitness;
@@ -306,9 +277,9 @@ async function rehydrateV2(
   handle: RunDirHandle,
   registration: RegisteredRemediationProgramV2,
 ): Promise<Readonly<{ ok: true; value: RuntimeV2 }> | Readonly<{ ok: false; message: string }>> {
-  const source = await authoritativeSource(registration.input.sourceRunsRoot, registration.input.sourceRun);
+  const source = await readAuthenticatedStandaloneSource(registration.input.sourceRunsRoot, registration.input.sourceRun);
   if (!source.ok) return source;
-  const accounting = prepareDefectFamilyAccounting(source.state.result, registration.input.defectFamily);
+  const accounting = prepareDefectFamilyAccounting(source.value.result, registration.input.defectFamily);
   if (!accounting.ok) return { ok: false, message: accounting.error.failures.map(({ message }) => message).join("; ") };
   let manifest: FrozenVerificationManifest | null = null;
   if (registration.verification.kind === "selected-operator-checks") {
@@ -331,11 +302,11 @@ async function rehydrateV2(
   if (!rebuilt.ok || !canonicalStructuralEquals(rebuilt.value, registration)) {
     return { ok: false, message: rebuilt.ok ? "schema-v2 registration does not match canonical source/check/candidate authority" : rebuilt.error.message };
   }
-  const paths = pathState(source.state, rebuilt.value.input.supportPaths);
+  const paths = pathState(source.value, rebuilt.value.input.supportPaths);
   if (!paths.ok) return paths;
   return { ok: true, value: Object.freeze({
     registration: rebuilt.value,
-    source: source.state,
+    source: source.value,
     plan: plan.value,
     pathState: paths.state,
   }) };

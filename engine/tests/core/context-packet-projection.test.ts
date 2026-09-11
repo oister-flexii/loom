@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
 import fc from "fast-check";
+import { match } from "ts-pattern";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, realpathSync, rmSync, writeFileSync, symlinkSync, mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildContextPacket, buildReviewerContextPacket, encodeByteSection } from "../../src/core/context-packets";
+import { buildContextPacket, buildReviewerContextPacket, buildStandaloneReviewerContextPacketV3, encodeByteSection } from "../../src/core/context-packets";
 import { parseContextProjectionArguments, projectContextPacket } from "../../src/core/context-packet-projection";
 import { parseRequestId } from "../../src/core/orchestration-contract";
 
@@ -16,26 +17,38 @@ const value = <T>(result: { ok: true; value: T } | { ok: false }): T => {
   if (!result.ok) throw new Error("fixture parse failed");
   return result.value;
 };
-function fixture(version: 1 | 2 = 2) {
+function fixture(version: 1 | 2 | 3 = 2) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "loom-reader-")));
   roots.push(root);
   const text = "export const literal = 'do not execute $(touch /tmp/not-authority)';\n".repeat(1500);
   const section = value(encodeByteSection("standalone-frozen-source", JSON.stringify({ schemaVersion: 1, headRevision: "fixture", files: [
-    { path: "src/a.ts", kind: "text", content: text },
+    version === 3 ? { path: "src/a.ts", kind: "binary", contentBase64: Buffer.from(text).toString("base64") }
+      : { path: "src/a.ts", kind: "text", content: text },
     { path: "image.bin", kind: "binary", contentBase64: "BINARY_SECRET_SHOULD_NOT_RENDER" },
   ] })));
   const input = { requestId: value(parseRequestId("request:reader-fixture")), role: "code-reviewer", requiredSkill: "none", fixedContext: [section], variableContext: [] };
-  const packet = version === 1 ? value(buildContextPacket({ ...input, outputContract: "Historical contract" })) : value(buildReviewerContextPacket(input));
+  const packet = match(version)
+    .with(1, () => value(buildContextPacket({ ...input, outputContract: "Historical contract" })))
+    .with(2, () => value(buildReviewerContextPacket(input)))
+    .with(3, () => value(buildStandaloneReviewerContextPacketV3(input)))
+    .exhaustive();
   const path = join(root, "packet.json");
   const bytes = JSON.stringify(packet);
   writeFileSync(path, bytes);
-  const args = ["--packet", path, "--request", packet.requestId, "--digest", packet.digest, "--role", packet.role, "--skill", packet.requiredSkill];
+  const args = ["--packet", path, "--request", packet.requestId, "--digest", packet.digest, "--role", packet.role, "--skill", packet.requiredSkill, ...(version === 3 ? ["--purpose", "standalone-successor"] : [])];
   return { root, packet, path, text, args, bytes };
 }
 const run = (args: readonly string[]) => spawnSync("bun", [script, ...args], { encoding: "utf8" });
 
 describe("read-only packet command", () => {
-  it.each([1, 2] as const)("decodes schema %s single-line packets larger than generic read limits without dumping source or binary", (version) => {
+  it("requires explicit successor purpose and refuses current packets on the legacy arm", () => {
+    const current = fixture(3);
+    expect(run(current.args.slice(0, -2)).status).toBe(1);
+    const legacy = fixture(2);
+    expect(run([...legacy.args, "--purpose", "standalone-successor"]).status).toBe(1);
+    expect(run([...current.args, "--purpose", "standalone-successor"]).status).toBe(1);
+  });
+  it.each([1, 2, 3] as const)("decodes schema %s single-line packets larger than generic read limits without dumping source or binary", (version) => {
     const f = fixture(version);
     expect(Buffer.byteLength(f.bytes)).toBeGreaterThan(50 * 1024);
     expect(f.bytes.split("\n")).toHaveLength(1);

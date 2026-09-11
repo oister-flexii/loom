@@ -136,6 +136,7 @@ const REVIEWER_RUNTIME: ReadonlyMap<string, AuditedRuntime> = new Map(REVIEWER_R
 }]));
 const AUDITED_RUNTIME = new Map([...SAX_RUNTIME, ...REVIEWER_RUNTIME]);
 const CONTRACT = "engine/src/core/reviewer-contract.ts";
+const LINEAGE_CONTRACT = "engine/src/core/standalone-lineage-contract.ts";
 const CODEC = "engine/src/core/reviewer-protocol.ts";
 const REVIEWER_ENTRIES = new Map([
   ["zod/v4", "zod/v4/index.js"], ["jsonc-parser", "jsonc-parser/lib/umd/main.js"],
@@ -217,7 +218,7 @@ function auditClosure(roots: readonly string[], overlays: ReadonlyMap<string, st
           ? DEFAULT_PURE_MODULES.includes(candidate) : runtime.dependencies.includes(specifier) && AUDITED_RUNTIME.has(candidate));
         if (target === undefined) errors.push(`${mod}: ${specifier} leaves the declared pure closure`);
         else queue.push(target);
-      } else if ((mod === CONTRACT && specifier === "zod/v4") || (mod === CODEC && specifier === "jsonc-parser")) {
+      } else if (([CONTRACT, LINEAGE_CONTRACT].includes(mod) && specifier === "zod/v4") || (mod === CODEC && specifier === "jsonc-parser")) {
         const entry = REVIEWER_ENTRIES.get(specifier);
         if (entry !== undefined) queue.push(entry);
       } else if ((mod === PARSER && specifier === "saxes") || runtime?.dependencies.includes(specifier)) {
@@ -390,7 +391,7 @@ describe("audited reviewer runtime closure", () => {
     expect(zod.exports["./v4"].import).toBe("./v4/index.js");
     expect(zod.dependencies).toBeUndefined();
     expect(requireFromEngine.resolve("jsonc-parser")).toBe(REVIEWER_RUNTIME.get("jsonc-parser/lib/umd/main.js")?.path);
-    const audit = auditClosure([CONTRACT, CODEC, "engine/src/core/context-packets.ts"]);
+    const audit = auditClosure([CONTRACT, LINEAGE_CONTRACT, CODEC, "engine/src/core/standalone-successor-reviewer.ts", "engine/src/core/context-packets.ts"]);
     expect(audit.errors).toEqual([]);
     for (const mod of REVIEWER_RUNTIME.keys()) expect(audit.visited).toContain(mod);
   });
@@ -419,9 +420,9 @@ describe("audited reviewer runtime closure", () => {
       .toMatchObject([{ line: 131, text: "str += chars[Math.floor(Math.random() * chars.length)];" }]);
   });
 
-  it.each([CONTRACT, CODEC, "engine/src/core/context-packets.ts"].flatMap((mod) =>
+  it.each([CONTRACT, LINEAGE_CONTRACT, CODEC, "engine/src/core/standalone-lineage.ts", "engine/src/core/standalone-successor-reviewer.ts", "engine/src/core/context-packets.ts"].flatMap((mod) =>
     [...IMPURE_PROBES, 'import "zod";', 'import "zod/v4/core";', 'import "zod/v4/other";', 'import "jsonc-parser/lib/umd/main.js";', 'import "jsonc-parser-extra";',
-      ...(mod === CONTRACT ? ['import "jsonc-parser";'] : ['import "zod/v4";']),
+      ...([CONTRACT, LINEAGE_CONTRACT].includes(mod) ? ['import "jsonc-parser";'] : ['import "zod/v4";']),
       ...(mod === CODEC ? [] : ['import "jsonc-parser";'])].map((probe) => [mod, probe] as const),
   ))("%s refuses additional capability: %s", (mod, probe) => {
     const audit = auditClosure([mod], new Map([[mod, `${readSource(mod)}\n${probe}`]]));

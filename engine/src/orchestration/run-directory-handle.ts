@@ -57,6 +57,7 @@ import { captureKey, type CaptureKey } from "../core/harness-capture";
 import { parseSemanticAttempt } from "../core/implementation-completion";
 import { canonicalJson, parseJsonValue } from "../core/review-packet";
 import type { ContextPacket } from "./context-packets";
+import { parseStandaloneReviewerContextPacketV3, serializeStandaloneReviewerContextPacketV3, type StandaloneReviewerContextPacketV3 } from "../core/context-packets";
 import { parseContextPacket } from "./context-packets";
 import {
   ensureRelativeDirectoryNoFollow,
@@ -482,6 +483,7 @@ const eventDirectoryLimit = (policy: RunEventResourcePolicy | undefined): number
   policy === undefined ? undefined : policy.maxRecords + 8;
 
 export interface RunDirHandle extends ProgramJournal {
+  readCheckpoint(maximumBytes?: number): Promise<string | null>;
   readEvents(policy?: RunEventResourcePolicy): Promise<readonly ProgramEventRecord[]>;
   appendEvent(record: ProgramEventRecord, policy?: RunEventResourcePolicy): Promise<void>;
   readonly identity: RunDirectoryIdentity;
@@ -489,22 +491,23 @@ export interface RunDirHandle extends ProgramJournal {
   readonly runDirectory: string;
   readAuthority(): DomainResult<RunAuthority, RunDirectoryError>;
   registerProgram(registration: unknown): Promise<DomainResult<OrchestrationRunId, RunDirectoryError>>;
-  readProgramRegistration(): DomainResult<unknown | null, RunDirectoryError>;
+  readProgramRegistration(maximumBytes?: number): DomainResult<unknown | null, RunDirectoryError>;
   /** Terminal, immutable, and idempotent on identical input; never deletes anything. */
   abandonRun(input: RunAbandonmentInput): Promise<DomainResult<RunAbandonment, RunDirectoryError>>;
   /** `success(null)` = never abandoned; a failure = marked but unreadable. */
   readAbandonment(): DomainResult<RunAbandonment | null, RunDirectoryError>;
   /** True only when authority, optional program, and otherwise-empty canonical directories are the entire run (`requests/` may contain only the empty `correlators/` child). */
   isPristine(): DomainResult<boolean, RunDirectoryError>;
-  publishContext(packet: ContextPacket): Promise<DomainResult<ContextPublishedReceipt, RunDirectoryError>>;
-  readContext(digest: ContextPacket["digest"]): DomainResult<ContextPacket, RunDirectoryError>;
+  publishContext(packet: ContextPacket | StandaloneReviewerContextPacketV3): Promise<DomainResult<ContextPublishedReceipt, RunDirectoryError>>;
+  readStandaloneSuccessorContext(digest: ContextPacket["digest"], maximumBytes?: number): DomainResult<StandaloneReviewerContextPacketV3, RunDirectoryError>;
+  readContext(digest: ContextPacket["digest"], maximumBytes?: number): DomainResult<ContextPacket, RunDirectoryError>;
   publishDecisionContext(
     digest: ContextDigest,
     bytes: readonly number[],
   ): Promise<DomainResult<ContextPublishedReceipt, RunDirectoryError>>;
   reserveRequest(authority: AgentRequestAuthority): Promise<DomainResult<TranscriptReserved, RunDirectoryError>>;
-  readIssuedRequests(): DomainResult<readonly AgentRequestAuthority[], RunDirectoryError>;
-  readCapturedAttempts(): DomainResult<ReadonlySet<CaptureKey>, RunDirectoryError>;
+  readIssuedRequests(maximumBytes?: number, maximumEntries?: number): DomainResult<readonly AgentRequestAuthority[], RunDirectoryError>;
+  readCapturedAttempts(maximumSlots?: number): DomainResult<ReadonlySet<CaptureKey>, RunDirectoryError>;
   /** Atomically mark one attempt terminally rejected; fails if bytes already landed. */
   rejectCapture(authority: AgentRequestAuthority, diagnostic?: string): Promise<DomainResult<CaptureKey, RunDirectoryError>>;
   readCaptureRejection(authority: AgentRequestAuthority): DomainResult<string | null, RunDirectoryError>;
@@ -520,13 +523,13 @@ export interface RunDirHandle extends ProgramJournal {
     bytes: readonly number[],
   ): Promise<DomainResult<ArtifactRef, RunDirectoryError>>;
   /** Read captured bytes back exactly, for parity and byte-equality proofs. */
-  readTranscriptBytes(authority: AgentRequestAuthority): DomainResult<Uint8Array, RunDirectoryError>;
+  readTranscriptBytes(authority: AgentRequestAuthority, maximumBytes?: number): DomainResult<Uint8Array, RunDirectoryError>;
   /** Read one parser-proven immutable artifact slot; null means only that the slot is absent. */
-  readArtifactBytes(relativePath: unknown): DomainResult<Uint8Array | null, RunDirectoryError>;
+  readArtifactBytes(relativePath: unknown, maximumBytes?: number): DomainResult<Uint8Array | null, RunDirectoryError>;
   publishArtifactSet(staged: readonly StagedArtifactInput[]): Promise<DomainResult<readonly ArtifactRef[], RunDirectoryError>>;
   recordReceipt(receipt: EffectReceipt): Promise<DomainResult<EffectId, RunDirectoryError>>;
   /** `success(null)` = never recorded; a failure = recorded but unreadable. */
-  readReceipt(effectId: EffectId): DomainResult<EffectReceipt | null, RunDirectoryError>;
+  readReceipt(effectId: EffectId, maximumBytes?: number): DomainResult<EffectReceipt | null, RunDirectoryError>;
 }
 
 /**
@@ -566,8 +569,8 @@ function contextDigestOf(bytes: readonly number[]): ContextDigest {
   return parsed.value;
 }
 
-function readJsonNoFollow(path: string): unknown {
-  return JSON.parse(readRunFileNoFollow(path)) as unknown;
+function readJsonNoFollow(path: string, maximumBytes?: number): unknown {
+  return JSON.parse(readRunBytesNoFollow(path, maximumBytes).toString("utf8")) as unknown;
 }
 
 /** The event records only; the retained descriptor also contains the lock. */
@@ -720,6 +723,27 @@ export function openRunDirectory(
   return success(buildHandle(identity.value, authority, directory, authorityPath));
 }
 
+/** Open existing custody without creating layout or reissuing missing authority. */
+export function openRegisteredRunDirectory(
+  runsRoot: string,
+  runDirectory: string,
+  maximumAuthorityBytes = 16_384,
+): DomainResult<RunDirHandle, RunDirectoryError> {
+  const identity = parseRunDirectoryIdentity(runsRoot, runDirectory);
+  if (!identity.ok) return identity;
+  const directory = identity.value.runDirectory;
+  const authority: RunAuthority = canonicalRecord({ schemaVersion: RUN_DIRECTORY_SCHEMA_VERSION,
+    runId: identity.value.runId, runsRoot: identity.value.runsRoot, runDirectory: directory });
+  try {
+    withOwnedAnchor(() => openDirectoryNoFollow(directory), `registered Run read for ${directory}`, () => undefined);
+    const authorityPath = join(directory, AUTHORITY_FILE);
+    const stored = readRunAuthority(authority, authorityPath, maximumAuthorityBytes);
+    return stored.ok ? success(buildHandle(identity.value, stored.value, directory, authorityPath)) : stored;
+  } catch (cause) {
+    return failure("authority", `registered Run is unavailable: ${errorDetail(cause)}`);
+  }
+}
+
 /**
  * Create one fresh Run Directory under its runs-root, then open it.
  *
@@ -793,6 +817,7 @@ function buildHandle(
 function readRunAuthority(
   expected: RunAuthority,
   authorityPath: string,
+  maximumBytes = 16_384,
 ): DomainResult<RunAuthority, RunDirectoryError> {
   // The read cause is CARRIED, not discarded. It used to be captured into
   // `{ __unreadable: message }` and then dropped: a sentinel object reaches the
@@ -804,7 +829,7 @@ function readRunAuthority(
   // is the one the generic message hides.
   const read = ((): Readonly<{ ok: true; value: unknown }> | Readonly<{ ok: false; cause: string }> => {
     try {
-      return { ok: true, value: readJsonNoFollow(authorityPath) };
+      return { ok: true, value: readJsonNoFollow(authorityPath, maximumBytes) };
     } catch (error) {
       return { ok: false, cause: error instanceof Error ? error.message : String(error) };
     }
@@ -896,9 +921,9 @@ function programOperations(runId: OrchestrationRunId, directory: string) {
       return success(runId);
     },
 
-    readProgramRegistration(): DomainResult<unknown | null, RunDirectoryError> {
+    readProgramRegistration(maximumBytes?: number): DomainResult<unknown | null, RunDirectoryError> {
       try {
-        return success(JSON.parse(readRunFileNoFollow(join(directory, PROGRAM_FILE))) as unknown);
+        return success(readJsonNoFollow(join(directory, PROGRAM_FILE), maximumBytes));
       } catch (error) {
         return (error as NodeJS.ErrnoException).code === "ENOENT"
           ? success(null)
@@ -1034,9 +1059,9 @@ function readEventsOperation(directory: string) {
 }
 
 function readCheckpointOperation(directory: string) {
-  return async (): Promise<string | null> => {
+  return async (maximumBytes?: number): Promise<string | null> => {
     try {
-      return readRunFileNoFollow(join(directory, CHECKPOINT_FILE));
+      return readRunBytesNoFollow(join(directory, CHECKPOINT_FILE), maximumBytes).toString("utf8");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw error;
@@ -1073,9 +1098,9 @@ function contextPublished(
   return success(canonicalRecord({ kind: "context-published" as const, runId, digest, slotPath: path }));
 }
 
-function readContextPacket(directory: string, digest: ContextPacket["digest"]): DomainResult<ContextPacket, RunDirectoryError> {
+function readContextPacket(directory: string, digest: ContextPacket["digest"], maximumBytes?: number): DomainResult<ContextPacket, RunDirectoryError> {
   try {
-    const parsed = parseContextPacket(readJsonNoFollow(join(directory, CONTEXTS, `${digest}.json`)));
+    const parsed = parseContextPacket(readJsonNoFollow(join(directory, CONTEXTS, `${digest}.json`), maximumBytes));
     if (!parsed.ok) return failure("context", parsed.error.message);
     return parsed.value.digest === digest
       ? success(parsed.value)
@@ -1106,17 +1131,34 @@ function decisionContextBody(rawDigest: ContextDigest, bytes: readonly number[])
 
 /** Content-addressed context packets. */
 function contextOperations(runId: OrchestrationRunId, directory: string) {
+  // Cache only parsing, never observation: every lookup reopens and compares exact bounded bytes.
+  const successorPackets = new Map<string, Readonly<{ bytes: Buffer; packet: StandaloneReviewerContextPacketV3 }>>();
   return {
-    async publishContext(packet: ContextPacket): Promise<DomainResult<ContextPublishedReceipt, RunDirectoryError>> {
+    async publishContext(packet: ContextPacket | StandaloneReviewerContextPacketV3): Promise<DomainResult<ContextPublishedReceipt, RunDirectoryError>> {
       const path = join(directory, CONTEXTS, `${packet.digest}.json`);
-      const claimed = claimIdempotentWrite(path, JSON.stringify(packet), "context",
+      const encoded = packet.schemaVersion === 3 ? serializeStandaloneReviewerContextPacketV3(packet) : success(JSON.stringify(packet));
+      if (!encoded.ok) return failure("context", encoded.error.message);
+      const claimed = claimIdempotentWrite(path, encoded.value, "context",
         (cause) => `cannot publish context packet: ${cause}`,
         "a different context packet already occupies this digest");
       return claimed.ok ? contextPublished(runId, packet.digest, path) : claimed;
     },
 
-    readContext: (digest: ContextPacket["digest"]): DomainResult<ContextPacket, RunDirectoryError> =>
-      readContextPacket(directory, digest),
+    readStandaloneSuccessorContext(digest: ContextPacket["digest"], maximumBytes = 16_777_216): DomainResult<StandaloneReviewerContextPacketV3, RunDirectoryError> {
+      try {
+        const bytes = readRunBytesNoFollow(join(directory, CONTEXTS, `${digest}.json`), maximumBytes);
+        const prior = successorPackets.get(digest);
+        if (prior !== undefined && prior.bytes.equals(bytes)) return success(prior.packet);
+        const parsed = parseStandaloneReviewerContextPacketV3(JSON.parse(bytes.toString("utf8")));
+        if (!parsed.ok) return failure("context", parsed.error.message);
+        if (parsed.value.digest !== digest) return failure("context", "successor packet differs from its immutable slot");
+        successorPackets.set(digest, Object.freeze({ bytes, packet: parsed.value }));
+        return success(parsed.value);
+      } catch (cause) { return failure("context", `successor packet unavailable: ${errorDetail(cause)}`); }
+    },
+
+    readContext: (digest: ContextPacket["digest"], maximumBytes?: number): DomainResult<ContextPacket, RunDirectoryError> =>
+      readContextPacket(directory, digest, maximumBytes),
 
     async publishDecisionContext(
       rawDigest: ContextDigest,
@@ -1230,18 +1272,18 @@ function reserveRequestOperation(runId: OrchestrationRunId, directory: string): 
 }
 
 function readIssuedRequestsOperation(runId: OrchestrationRunId, directory: string): RunDirHandle["readIssuedRequests"] {
-  return () => {
+  return (maximumBytes, maximumEntries) => {
     try {
       return withOwnedAnchor(
         () => openDirectoryNoFollow(join(directory, REQUESTS)),
         "issued-request inspection",
         (requests) => {
           const issued: AgentRequestAuthority[] = [];
-          for (const name of listDirectoryNamesNoFollow(requests)) {
+          for (const name of listDirectoryNamesNoFollow(requests, maximumEntries)) {
             if (!name.endsWith(".json")) continue;
             let raw: unknown;
             try {
-              raw = JSON.parse(readDirectoryFileNoFollow(requests, name).toString("utf-8")) as unknown;
+              raw = JSON.parse(readDirectoryFileNoFollow(requests, name, maximumBytes).toString("utf-8")) as unknown;
             } catch (error) {
               throw new Error(`request authority ${name} is unreadable: ${(error as Error).message}`, { cause: error });
             }
@@ -1265,15 +1307,15 @@ function readIssuedRequestsOperation(runId: OrchestrationRunId, directory: strin
 }
 
 function readCapturedAttemptsOperation(directory: string): RunDirHandle["readCapturedAttempts"] {
-  return () => {
+  return (maximumSlots) => {
     try {
       return withOwnedAnchor(
         () => openDirectoryNoFollow(join(directory, TRANSCRIPTS)),
         "captured-attempt inspection",
         (transcripts) => {
           const captured = new Set<CaptureKey>();
-          for (const slot of listDirectoryNamesNoFollow(transcripts)) {
-            const inspected = inspectCapturedSlot(transcripts, slot, captured);
+          for (const slot of listDirectoryNamesNoFollow(transcripts, maximumSlots)) {
+            const inspected = inspectCapturedSlot(transcripts, slot, captured, maximumSlots === undefined ? undefined : 16);
             if (!inspected.ok) throw new Error(inspected.error.message);
           }
           return success(captured);
@@ -1289,6 +1331,7 @@ function inspectCapturedSlot(
   transcripts: AnchoredDirectory,
   slot: string,
   captured: Set<CaptureKey>,
+  maximumEntries?: number,
 ): DomainResult<void, RunDirectoryError> {
   if (slot === "capture.lock" || slot === "capture.lock.recovery" || slot.startsWith("capture.lock.tomb-")) {
     return success(undefined);
@@ -1298,7 +1341,7 @@ function inspectCapturedSlot(
       () => openChildDirectoryNoFollow(transcripts, slot),
       `transcript-slot inspection for ${slot}`,
       (slotDirectory) => {
-        for (const name of listDirectoryNamesNoFollow(slotDirectory)) {
+        for (const name of listDirectoryNamesNoFollow(slotDirectory, maximumEntries)) {
           const match = /^attempt-([12])\.raw$/.exec(name);
           if (match === null) continue;
           // The ATTEMPT itself is parsed by the domain rule that owns the concept,
@@ -1643,7 +1686,7 @@ function readTranscriptBytesOperation(
   runId: OrchestrationRunId,
   directory: string,
 ): RunDirHandle["readTranscriptBytes"] {
-  return (authority) => {
+  return (authority, maximumBytes) => {
     const supplied = verifiedReservationAddress(directory, runId, authority, {
       label: "transcript read",
       unreserved: "failure",
@@ -1651,7 +1694,7 @@ function readTranscriptBytesOperation(
     if (!supplied.ok) return supplied;
     if (supplied.value === null) return failure("request", "internal transcript reservation resolution failed");
     try {
-      return success(new Uint8Array(readRunBytesNoFollow(transcriptSlotPath(directory, supplied.value))));
+      return success(new Uint8Array(readRunBytesNoFollow(transcriptSlotPath(directory, supplied.value), maximumBytes)));
     } catch (error) {
       return failure("transcript", `cannot read captured transcript: ${(error as Error).message}`);
     }
@@ -1904,11 +1947,11 @@ function stageAndPromoteArtifactSet(
 }
 
 function readArtifactBytesOperation(directory: string) {
-  return (relativePath: unknown): DomainResult<Uint8Array | null, RunDirectoryError> => {
+  return (relativePath: unknown, maximumBytes?: number): DomainResult<Uint8Array | null, RunDirectoryError> => {
     const parsed = parseArtifactRelativePath(relativePath);
     if (!parsed.ok) return parsed;
     try {
-      return success(new Uint8Array(readRunBytesNoFollow(join(directory, ARTIFACTS, parsed.value))));
+      return success(new Uint8Array(readRunBytesNoFollow(join(directory, ARTIFACTS, parsed.value), maximumBytes)));
     } catch (error) {
       return (error as NodeJS.ErrnoException).code === "ENOENT"
         ? success(null)
@@ -1998,7 +2041,7 @@ function receiptOperations(directory: string) {
      * would let a truncated receipt read as "never ran", and the effect runner
      * would re-execute an effect it already performed.
      */
-    readReceipt(effectId: EffectId): DomainResult<EffectReceipt | null, RunDirectoryError> {
+    readReceipt(effectId: EffectId, maximumBytes?: number): DomainResult<EffectReceipt | null, RunDirectoryError> {
       const path = join(directory, RECEIPTS, `${effectId}.json`);
       try {
         // PARSED, not asserted. A bare `as EffectReceipt` typed whatever JSON
@@ -2006,7 +2049,7 @@ function receiptOperations(directory: string) {
         // reached the effect runner as authority to SKIP an effect — the exact
         // outcome this method's own doc says must never be indistinguishable
         // from "never ran".
-        const parsed = parseEffectReceipt(readJsonNoFollow(path));
+        const parsed = parseEffectReceipt(readJsonNoFollow(path, maximumBytes));
         return parsed.ok
           ? success(parsed.value)
           : failure("receipt", `receipt for effect ${effectId} is malformed: ${parsed.error.message}`);

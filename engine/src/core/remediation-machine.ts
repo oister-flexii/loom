@@ -1,9 +1,12 @@
 import { createHash } from "node:crypto";
+import { match } from "ts-pattern";
 import { parseReviewerProtocolDescriptor } from "./reviewer-contract";
+import { parseStandaloneReviewerProtocolV3 } from "./standalone-lineage-contract";
 import { compareStrings } from "./ordering";
 import { frozenSet } from "./frozen";
 import {
   canonicalRecord,
+  canonicalStructuralEquals,
   fieldFailureError,
   parseArtifactDigest,
   parseArtifactRef,
@@ -628,13 +631,19 @@ function parsedCanonicalStandaloneResult(
       message: "authoritative standalone result is not valid canonical JSON",
     }));
   }
+  const version = typeof raw === "object" && raw !== null && "schema_version" in raw ? raw.schema_version : undefined;
+  const versionFields = match(version)
+    .with(2, () => ["reviewer_protocol"])
+    .with(3, () => ["reviewer_protocol", "successor", "lineage"])
+    .otherwise(() => []);
   const record = exactRecord(raw, [
     "schema_version", "run_id", "subject_id", "scope", "reviewer_evidence",
     "surviving_critical_findings", "advisory_findings", "refuted_critical_findings", "panel",
-    ...(typeof raw === "object" && raw !== null && "schema_version" in raw && raw.schema_version === 2 ? ["reviewer_protocol"] : []),
+    ...versionFields,
   ], "standaloneResult");
-  if (!record.ok || (record.value.schema_version !== 1 && record.value.schema_version !== 2) ||
+  if (!record.ok || (record.value.schema_version !== 1 && record.value.schema_version !== 2 && record.value.schema_version !== 3) ||
       (record.value.schema_version === 2 && !parseReviewerProtocolDescriptor(record.value.reviewer_protocol).ok) ||
+      (record.value.schema_version === 3 && !parseStandaloneReviewerProtocolV3(record.value.reviewer_protocol).ok) ||
       record.value.subject_id !== "standalone-review") {
     return fail(canonicalRecord({
       kind: "invalid-path-authority",
@@ -644,6 +653,18 @@ function parsedCanonicalStandaloneResult(
         ? "authoritative standalone result schema or subject is invalid"
         : record.error,
     }));
+  }
+  // This is the path projection, not a second lineage authority parser. Initial input
+  // has LC-2 membership; rehydration independently joins the exact publication below.
+  // Preserve the complete serialization, and never let historical critical uncertainty
+  // acquire path authority merely because the current active partition is empty.
+  if (record.value.schema_version === 3) {
+    const lineage = exactRecord(record.value.lineage,
+      ["inventory", "reports", "assessments", "dispositions", "currentCriticalCoverage", "counts"], "standaloneResult.lineage");
+    if (!lineage.ok || !canonicalStructuralEquals(lineage.value.currentCriticalCoverage, { kind: "complete", origins: [] })) {
+      return fail(canonicalRecord({ kind: "invalid-path-authority", field: "standaloneResult.lineage.currentCriticalCoverage",
+        path: null, message: "standalone successor requires complete current critical coverage before remediation path authority" }));
+    }
   }
   const reviewerEvidence = denseArray(record.value.reviewer_evidence, "standaloneResult.reviewer_evidence");
   const surviving = denseArray(record.value.surviving_critical_findings, "standaloneResult.surviving_critical_findings");

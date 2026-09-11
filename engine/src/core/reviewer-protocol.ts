@@ -5,6 +5,7 @@ import {
   REVIEWER_OUTPUT_CONTRACT, REVIEWER_PAYLOAD_EXAMPLE_V2, reviewerPayloadV2Schema,
   type ReviewerPayloadV2, type ReviewerProtocolFailure,
 } from "./reviewer-contract";
+import { standaloneReviewerPayloadV3Schema, type StandaloneReviewerPayloadV3 } from "./standalone-lineage-contract";
 import { canonicalRecord, failure, success, type DomainResult } from "./orchestration-contract/identity";
 
 const encoder = new TextEncoder();
@@ -61,9 +62,10 @@ function uniqueMembers(text: string): DomainResult<true, ReviewerProtocolFailure
     : rejected("invalid-json", "JSON visitor did not complete.");
 }
 
-export function parseReviewerPayloadV2(rawBytes: Uint8Array): DomainResult<ReviewerPayloadV2, ReviewerProtocolFailure> {
-  if (rawBytes.byteLength > REVIEWER_PAYLOAD_LIMITS.bytes) {
-    return rejected("payload-too-large", "Reviewer payload exceeds 1048576 UTF-8 bytes.");
+/** Shared strict byte grammar; callers select a schema explicitly after this parse. */
+export function parseBoundedReviewerJson(rawBytes: Uint8Array, maximumBytes: number): DomainResult<unknown, ReviewerProtocolFailure> {
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1 || rawBytes.byteLength > maximumBytes) {
+    return rejected("payload-too-large", `Reviewer payload exceeds ${maximumBytes} UTF-8 bytes.`);
   }
   if (rawBytes[0] === 0xef && rawBytes[1] === 0xbb && rawBytes[2] === 0xbf) {
     return rejected("invalid-utf8", "Reviewer payload must not start with a UTF-8 BOM.", "", 0);
@@ -87,7 +89,31 @@ export function parseReviewerPayloadV2(rawBytes: Uint8Array): DomainResult<Revie
   try {
     const unique = uniqueMembers(text);
     if (!unique.ok) return unique;
-    const parsed = reviewerPayloadV2Schema.safeParse(raw);
+    return success(raw);
+  } catch {
+    return rejected("invalid-payload", "Reviewer payload could not be inspected safely.");
+  }
+}
+
+export function parseStandaloneReviewerPayloadV3(rawBytes: Uint8Array): DomainResult<StandaloneReviewerPayloadV3, ReviewerProtocolFailure> {
+  const decoded = parseBoundedReviewerJson(rawBytes, REVIEWER_PAYLOAD_LIMITS.bytes);
+  if (!decoded.ok) return decoded;
+  const value = decoded.value;
+  if (typeof value === "object" && value !== null && (
+    ("priorAssessments" in value && Array.isArray(value.priorAssessments) && value.priorAssessments.length > REVIEWER_PAYLOAD_LIMITS.priorFindings) ||
+    ("findings" in value && Array.isArray(value.findings) && value.findings.length > REVIEWER_PAYLOAD_LIMITS.findings))) {
+    return rejected("invalid-payload", "Standalone v3 inventory exceeds its pre-copy count budget.");
+  }
+  const parsed = standaloneReviewerPayloadV3Schema.safeParse(value);
+  return parsed.success ? success(parsed.data)
+    : rejected("invalid-payload", "Reviewer payload does not conform to the issued standalone v3 schema.", pointer(parsed.error.issues[0]?.path ?? []));
+}
+
+export function parseReviewerPayloadV2(rawBytes: Uint8Array): DomainResult<ReviewerPayloadV2, ReviewerProtocolFailure> {
+  const decoded = parseBoundedReviewerJson(rawBytes, REVIEWER_PAYLOAD_LIMITS.bytes);
+  if (!decoded.ok) return decoded;
+  try {
+    const parsed = reviewerPayloadV2Schema.safeParse(decoded.value);
     if (!parsed.success) {
       return rejected("invalid-payload", "Reviewer payload does not conform to the issued v2 schema.", pointer(parsed.error.issues[0]?.path ?? []));
     }

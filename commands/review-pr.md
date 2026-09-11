@@ -13,6 +13,17 @@ publication. This workflow never mutates the feature TaskGraph.
 
 **Arguments:** "$ARGUMENTS"
 
+## Availability and bootstrap
+
+P4 merged as `96153ed` and reload was verified. P5 lineage is implemented on the
+feature worktree; final validation, registered review and publication are pending.
+P5's own final review/remediation must use the admitted main CLI and Skill 5.0.0
+contract, including existing Plan advisory triage. That runtime
+(`sha256:086c472e4e913376c07d69f5116c9ad9655546e22c91e40d28cba9fdd795bc79`)
+does not implement the new publisher. Do not switch the live parent to the feature
+CLI, unset admission or retrofit source review records. New P5 operations below
+apply after matching-runtime publication/reload or in explicitly owned fixtures.
+
 ## 1. Resolve Loom
 
 ```bash
@@ -56,7 +67,7 @@ per-Task review and Wave-wide adjudication.
 
 ## Reviewer wire and judgment
 
-Fresh registrations use Reviewer Protocol v2: exactly one JSON final payload,
+Fresh independent registrations use Reviewer Protocol v2: exactly one JSON final payload,
 no Machine Summary, markers, numeric tallies, or reviewer-chosen new IDs.
 The issued Context Packet freezes `reviewer-payload-schema` and
 `reviewer-impact-rubric`; payload contents never select the decoder.
@@ -72,10 +83,10 @@ assesses the assertion including its stated basis; a true assertion is not refut
 merely because repair seems unimportant. A surviving critical stays blocking;
 there is no standalone severity override.
 
-Completed and unfinished issued v1 reviews retain their original protocol.
-Read the issued packet first, then the archived role and shared contract under
-`references/reviewer-protocol-v1/` when instructed; do not apply current guidance
-to those requests. See [operations](../docs/operations.md#reviewer-protocol-v2).
+Completed and unfinished issued v1/v2 reviews retain initial/resume/both-attempt
+retry behavior and exact packet/result/receipt bytes. Read the issued packet first,
+then the archived v1 role/shared contract under `references/reviewer-protocol-v1/`
+when instructed; do not apply v2 guidance to v1 or successor grammar to either. See [operations](../docs/operations.md#reviewer-protocol-v2).
 
 ## 3. Start one fresh run
 
@@ -115,7 +126,12 @@ Execute only the single typed action returned by `start` or `resume`:
 - `done` — read/report the authoritative result receipt.
 
 Standalone review has no advisory `await-user` stage: it reports advisories; it
-does not choose remediation policy.
+does not choose remediation policy. When the parent triages them under operator
+instructions on a matching P5 runtime, publish the complete ordered decisions
+immediately with the separate no-agent `standalone-disposition` program—even if no
+fix or successor follows. Follow [publication operations](../docs/operations.md#immediate-advisory-publication)
+or [Skill Phase 2](../skills/review-and-fix/SKILL.md#phase-2--plan). Do not publish a
+placeholder policy just because this review completed.
 
 After a complete harness batch:
 
@@ -140,7 +156,8 @@ bun "$LOOM_DIR/engine/src/cli.ts" helper orchestration inspect \
 
 Inspection re-proves registered protocol/publication authority and reads canonical
 `result.json` at the Run Directory root. Its human summary derives emitted/admitted
-and after-refutation counts and Finding details from that published result;
+and after-refutation counts for v1/v2, or new/inherited/current disposition and
+critical-coverage counts for v3, plus Finding details from that published result;
 `--json` retains the existing inspection shape. Never author replacement tallies
 or a summary authority artifact. Report:
 
@@ -155,6 +172,36 @@ Do not merge refuted Findings into “fixed,” hide them, or summarize an
 incomplete/blocked run as a review result. A missing roster member, malformed
 attempt-2 output, or publication failure is blocked evidence—not a partial
 success.
+
+## Explicit successor and policy selection (matching P5 runtime)
+
+The slash-command arguments above still start an independent review. There is no
+`previousRun` inference or successor slash flag. For an explicitly requested successor,
+use the [exact schema-3 start input](../docs/operations.md#explicit-successor-review):
+explicit ordered files, `dryRun:false`, exact predecessor locator/Run/result digest,
+and exact published disposition revision or honest historical unavailability.
+Never silently fall back when expected current source/policy is missing or corrupt.
+
+`inspect --lineage` supplies authenticated source identity, full origin/decision
+inventory and ordered `advisoryInventory`; use those values, not hashes or IDs
+inferred from prose. Corrections name an exact prior published revision, while
+historical imports retain prose/reference as present-day DECLARED policy.
+
+Successors preserve every predecessor path and role, original Finding identity,
+assertion/severity/evidence and all history. Every current reviewer assesses every
+inherited origin once in order. Resolution requires whole-roster repair judgments
+with relevant changes against frozen bytes/modes, never merely passing checks.
+Reopening names an exact prior decision and supplies new evidence; only new criticals
+and explicit critical reopening reach a fresh full panel. Unchanged upheld criticals
+remain blocking without re-adjudication. Counts are canonical, not fresh-panel counts.
+No extra roster merely for a rerun, review reuse, branch join, similarity merge or
+severity override. Formal statements/digests are not semantic proof.
+
+Claude/Pi capture exact native final bytes and durable receipts. Issued v3 reader
+commands and panel views expose frozen current/predecessor context without mutable
+live scope. Pi's witness check accepts only its current Run, never an older fallback.
+`inspect --replay` is read-only evidence reconstruction, not a new publication;
+see [native/replay operations](../docs/operations.md#native-delivery-replay-and-p3).
 
 ## Examples
 
