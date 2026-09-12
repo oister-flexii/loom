@@ -137,13 +137,7 @@ export async function startStandaloneFacade(
     });
     const registered = await handle.registerProgram(registration);
     if (!registered.ok) return failed(registered.error.message);
-    const initialRequests = prepared.value.initialRequests.map((authority) => Object.freeze({
-      authority,
-      context: Object.freeze({
-        digest: authority.contextDigest,
-        slot: Object.freeze({ kind: "fixed-artifact-slot" as const, path: `contexts/${authority.contextDigest}.json` }),
-      }),
-    }));
+    const initialRequests = initialStandaloneRequests(prepared.value.authority);
     // Publish every attempt-1 AND attempt-2 context up front. Attempt 2 is the
     // engine's only recovery path for a semantically rejected reviewer slot; a
     // retry must find its frozen packet already content-addressed in the run

@@ -634,7 +634,8 @@ export function readStandaloneCaptureWitnesses(handle: RunDirHandle,
     if (!authority.ok) return { ok: false, message: authority.error.message };
     const issued = handle.readIssuedRequests(16_384, 128);
     const captured = handle.readCapturedAttempts(128);
-    if (!issued.ok || !captured.ok) return { ok: false, message: "captured reviewer roster is unavailable" };
+    if (!issued.ok) return { ok: false, message: `issued reviewer roster is unavailable: ${issued.error.message}` };
+    if (!captured.ok) return { ok: false, message: `captured reviewer roster is unavailable: ${captured.error.message}` };
     const witnesses = new Map<string, StandaloneCaptureWitness>();
     for (const request of issued.value) {
       const key = captureKey(request.slotId, request.attempt);

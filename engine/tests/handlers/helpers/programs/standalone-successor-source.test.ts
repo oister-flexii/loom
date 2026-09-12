@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync, writeFileSync, chmodSync, truncateSync, symlinkSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync, chmodSync, truncateSync, symlinkSync, lstatSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
@@ -53,6 +53,29 @@ describe.sequential("bounded successor source observation", () => {
       const absent = observeStandaloneSuccessorSource(["missing"], () => "a".repeat(40));
       expect(absent.ok).toBe(true); if (!absent.ok) return;
       expect(successorSourceSnapshot(absent.value, ["missing"])).toEqual({ ok: true, value: [{ kind: "absent", path: "missing" }] });
+    });
+  });
+  it("rejects disappearance during reading or the post-read stability probe after observing presence", async () => {
+    const p = root(); await owned(p, async () => {
+      const { observeStandaloneSuccessorSource } = await import("../../../../src/handlers/helpers/programs/standalone-successor-source");
+      const path = join(p, "raced"); writeFileSync(path, "bytes");
+      const present = lstatSync(path);
+      const missing = () => Object.assign(new Error("removed"), { code: "ENOENT" });
+      let heads = 0; const head = () => { heads += 1; return "a".repeat(40); };
+
+      const duringRead = observeStandaloneSuccessorSource([path], head, {
+        lstat: () => present,
+        read: () => { throw missing(); },
+      });
+      expect(duringRead).toEqual({ ok: false, message: `successor source unavailable: successor source ${path} changed during observation` });
+
+      let probes = 0;
+      const afterRead = observeStandaloneSuccessorSource([path], head, {
+        lstat: () => { probes += 1; if (probes === 1) return present; throw missing(); },
+        read: () => Buffer.from("bytes"),
+      });
+      expect(afterRead).toEqual({ ok: false, message: `successor source unavailable: successor source ${path} changed during observation` });
+      expect(heads).toBe(0);
     });
   });
 });

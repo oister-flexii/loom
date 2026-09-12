@@ -281,7 +281,7 @@ function standaloneSuccessorPacket(base: LegacyContextPacket): DomainResult<Stan
   return success(packet);
 }
 
-/** Explicit future successor issuance; independent standalone and Wave builders remain v2. */
+/** Explicit standalone successor v3 issuance; independent standalone and Wave builders remain v2. */
 export function buildStandaloneReviewerContextPacketV3(input: Omit<ContextPacketInput, "outputContract">): DomainResult<StandaloneReviewerContextPacketV3, ContextPacketError> {
   const base = buildReviewerContractBase(input, STANDALONE_REVIEWER_FIXED_SECTIONS_V3);
   return base.ok ? standaloneSuccessorPacket(base.value) : base;

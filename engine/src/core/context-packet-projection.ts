@@ -29,16 +29,19 @@ export function parseContextProjectionArguments(args: readonly string[]): Domain
   const path = fields.get("--packet"), requestId = fields.get("--request"), digest = fields.get("--digest");
   const role = fields.get("--role"), requiredSkill = fields.get("--skill");
   if (!path?.startsWith("/") || !requestId || !digest || !role || !requiredSkill) return failed("reader requires absolute packet path and expected request, digest, role and skill");
-  const number = (key: string, fallback: number) => {
+  const optionalInteger = (key: string, fallback: number) => {
     const raw = fields.get(key);
-    return raw === undefined ? fallback : /^(0|[1-9][0-9]*)$/.test(raw) ? Number(raw) : NaN;
+    if (raw === undefined) return fallback;
+    return /^(0|[1-9][0-9]*)$/.test(raw) ? Number(raw) : NaN;
   };
-  const offset = number("--offset", 0), limit = number("--limit", 4096);
+  const offset = optionalInteger("--offset", 0), limit = optionalInteger("--limit", 4096);
   if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 4096) return failed("offset must be nonnegative; limit must be 1..4096");
   const label = fields.get("--section"), file = fields.get("--file");
   if (label !== undefined && file !== undefined) return failed("select a section OR a source file");
-  const selection: Selection = file !== undefined ? { kind: "file", path: file, offset, limit }
-    : label !== undefined ? { kind: "section", label, offset, limit } : { kind: "index", offset, limit };
+  let selection: Selection;
+  if (file !== undefined) selection = { kind: "file", path: file, offset, limit };
+  else if (label !== undefined) selection = { kind: "section", label, offset, limit };
+  else selection = { kind: "index", offset, limit };
   const purpose = fields.get("--purpose");
   if (purpose !== undefined && purpose !== "standalone-successor") return failed("unsupported reader purpose");
   return { ok: true, value: { path, requestId, digest, role, requiredSkill, selection,

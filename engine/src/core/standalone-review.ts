@@ -1823,7 +1823,7 @@ function finalizeStandaloneSuccessor(aggregate: Extract<StandaloneReviewAggregat
     advisories: Object.freeze(advisories), refutedCriticals: Object.freeze(refutedCriticals), panel }));
 }
 
-/** Pure finalization: a critical can only be surviving or audibly refuted. */
+/** Legacy v1/v2 finalization: a critical can only be surviving or audibly refuted. */
 export function finalizeStandaloneReview(
   aggregate: StandaloneReviewAggregate,
   panel: ParsedPanelOutcomes | null,

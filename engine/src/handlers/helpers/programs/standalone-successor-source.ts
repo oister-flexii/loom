@@ -33,23 +33,39 @@ const hash = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("h
 const fail = (message: string): ProgramParse<never> => ({ ok: false, message });
 const sameStat = (a: Stats, b: Stats) =>
   a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mode === b.mode && a.ctimeMs === b.ctimeMs && a.mtimeMs === b.mtimeMs;
-export function observeStandaloneSuccessorSource(scope: readonly string[], readHeadRevision: () => string): ProgramParse<ByteSection> {
+type SourceObservationOperations = Readonly<{
+  lstat: (path: string) => Stats;
+  read: (path: string, maximumBytes: number) => Buffer;
+}>;
+const sourceObservationOperations: SourceObservationOperations = Object.freeze({
+  lstat: lstatSync,
+  read: readRunBytesNoFollow,
+});
+export function observeStandaloneSuccessorSource(scope: readonly string[], readHeadRevision: () => string,
+  operations: SourceObservationOperations = sourceObservationOperations): ProgramParse<ByteSection> {
   if (scope.length > STANDALONE_LINEAGE_LIMITS.paths) return fail("successor source exceeds path budget");
   try {
     let remaining = SUCCESSOR_SOURCE_BYTES;
     const files = scope.map(path => {
+      let before: Stats;
       try {
-        const before = lstatSync(path);
-        if (!before.isFile()) throw new Error(`successor source ${path} is not a regular no-follow file`);
-        const bytes = readRunBytesNoFollow(path, Math.min(remaining, SUCCESSOR_SOURCE_FILE_BYTES));
-        if (!sameStat(before, lstatSync(path))) throw new Error(`successor source ${path} changed during observation`);
-        remaining -= bytes.length;
-        return Object.freeze({ path, kind: "binary" as const, digest: hash(bytes), byteLength: bytes.length,
-          contentBase64: bytes.toString("base64"), mode: (before.mode & 0o111) === 0 ? "100644" as const : "100755" as const });
+        before = operations.lstat(path);
       } catch (cause) {
         if ((cause as NodeJS.ErrnoException).code === "ENOENT") return Object.freeze({ path, kind: "absent" as const, digest: null, byteLength: 0 });
         throw cause;
       }
+      if (!before.isFile()) throw new Error(`successor source ${path} is not a regular no-follow file`);
+      let bytes: Buffer;
+      try {
+        bytes = operations.read(path, Math.min(remaining, SUCCESSOR_SOURCE_FILE_BYTES));
+        if (!sameStat(before, operations.lstat(path))) throw new Error(`successor source ${path} changed during observation`);
+      } catch (cause) {
+        if ((cause as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`successor source ${path} changed during observation`);
+        throw cause;
+      }
+      remaining -= bytes.length;
+      return Object.freeze({ path, kind: "binary" as const, digest: hash(bytes), byteLength: bytes.length,
+        contentBase64: bytes.toString("base64"), mode: (before.mode & 0o111) === 0 ? "100644" as const : "100755" as const });
     });
     const section = encodeByteSection("standalone-frozen-source", JSON.stringify({ schemaVersion: 2, headRevision: readHeadRevision(), files }));
     return section.ok ? section : fail(section.error.message);

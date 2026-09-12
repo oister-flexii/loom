@@ -34,7 +34,7 @@ import { parseEffectId, type AgentRequestAuthority, type ArtifactRef, type Domai
 import { createHash } from "node:crypto";
 import { parseStandaloneReviewerProtocolV3 } from "../core/standalone-lineage-contract";
 import { verifyStandalonePanelView } from "./standalone-panel-context";
-import { openRegisteredRunDirectory, type HarnessCorrelatorBinding, type RunDirHandle } from "./run-directory-handle";
+import { openRegisteredRunDirectory, type RunDirHandle } from "./run-directory-handle";
 
 /**
  * Where a run directory is announced.
@@ -163,8 +163,6 @@ export async function terminalizeCaptureRejection(
  */
 export type CorrelatedRequest = Readonly<{
   handle: RunDirHandle;
-  /** The role the reservation recorded for this correlator — never the payload's say-so. */
-  correlatorRole: HarnessCorrelatorBinding["role"];
   issued: readonly AgentRequestAuthority[];
   identity: HarnessResultIdentity;
   request: AgentRequestAuthority;
@@ -264,7 +262,7 @@ export function resolveCorrelatedRequest(args: Readonly<{
   });
   return Object.freeze({
     ok: true,
-    value: Object.freeze({ handle, correlatorRole: binding.role, issued: issued.value, identity, request }),
+    value: Object.freeze({ handle, issued: issued.value, identity, request }),
   });
 }
 
@@ -324,7 +322,7 @@ function readNativeCapturePurpose(handle: RunDirHandle): DomainResult<NativeCapt
 export async function captureHarnessResult(args: CaptureHarnessInput): Promise<CaptureOutcome> {
   const resolved = resolveCorrelatedRequest(args);
   if (!resolved.ok) return resolved.outcome;
-  const { handle, correlatorRole, issued, identity, request } = resolved.value;
+  const { handle, issued, identity, request } = resolved.value;
 
   const reject = (reason: string, message: string): Promise<CaptureOutcome> =>
     terminalizeCaptureRejection(handle, request, terminalCaptureRefusal(reason, message));
@@ -363,12 +361,6 @@ export async function captureHarnessResult(args: CaptureHarnessInput): Promise<C
       : reject(bound.error.reason, bound.error.message);
   }
 
-  if (correlatorRole !== request.role) {
-    return reject(
-      "wrong-agent-role",
-      `native ${args.harness} result is bound as ${correlatorRole}, not ${request.role}`,
-    );
-  }
   return persistBoundCapture(handle, request, bound.value, payload.value, purpose.value,
     captured.value.has(captureKey(request.slotId, request.attempt)) ? "recapture" : "fresh");
 }

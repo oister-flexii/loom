@@ -106,10 +106,11 @@ export const startStandaloneDisposition = (registration: RegisteredStandaloneDis
 
 export function standaloneDispositionReceipt(registration: RegisteredStandaloneDispositionProgram): ArtifactSetPublished {
   const text = JSON.stringify(registration.input.record);
+  const digest = sha256Hex(text);
   // All components derive from parsed registration; parseEffectReceipt supplies branded kernel identity.
   const parsed = parseEffectReceipt({ kind: "artifact-set-published", runId: registration.runId,
-    effectId: `effect:standalone-disposition:${sha256Hex(text)}`, artifacts: [{ runId: registration.runId,
-      slot: { kind: "fixed-artifact-slot", path: "artifacts/disposition.json" }, digest: sha256Hex(text), byteLength: new TextEncoder().encode(text).length }] });
+    effectId: `effect:standalone-disposition:${digest}`, artifacts: [{ runId: registration.runId,
+      slot: { kind: "fixed-artifact-slot", path: "artifacts/disposition.json" }, digest, byteLength: new TextEncoder().encode(text).length }] });
   if (!parsed.ok || parsed.value.kind !== "artifact-set-published") throw new TypeError("parsed disposition registration invariant violated");
   return parsed.value;
 }
@@ -123,8 +124,9 @@ export function reduceStandaloneDisposition(registration: RegisteredStandaloneDi
     .with({ kind: "receipt-recorded" }, ({ receipt }) => {
       if (state.kind === "registered") return reject("receipt cannot precede artifact publication");
       const parsed = parseEffectReceipt(receipt);
-      if (!parsed.ok || !canonicalStructuralEquals(parsed.value, standaloneDispositionReceipt(registration))) return reject("disposition receipt differs from registered publication");
-      return success(canonicalRecord({ schemaVersion: 1, registrationDigest: registration.registrationDigest, kind: "done", receipt: standaloneDispositionReceipt(registration) }));
+      const expected = standaloneDispositionReceipt(registration);
+      if (!parsed.ok || !canonicalStructuralEquals(parsed.value, expected)) return reject("disposition receipt differs from registered publication");
+      return success(canonicalRecord({ schemaVersion: 1, registrationDigest: registration.registrationDigest, kind: "done", receipt: expected }));
     }).exhaustive();
 }
 
