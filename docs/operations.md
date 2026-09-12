@@ -153,8 +153,10 @@ Current admission rejects the whole response on malformed JSON, duplicate keys,
 missing basis, foreign location, wrong binding or incomplete prior roster. It
 creates no synthetic Finding or P3 obligation. Limits include 1,048,576 final UTF-8
 bytes, 32 containers, 128 new findings and 4,096 priors; these are semantic
-admission bounds, not pre-capture transcript or whole-process memory limits.
-Accepted strings/order/duplicates remain exact; the engine attributes IDs and
+admission bounds, not pre-capture transcript limits. The shared orchestration
+`submit` CLI separately refuses raw stdin above 16 MiB before handler invocation,
+chunk concatenation, byte-array expansion, or durable capture. Accepted
+strings/order/duplicates remain exact; the engine attributes IDs and
 derives counts. Stored/refuted/resolved/panel/P3 records retain full basis.
 
 The existing default three-lens panel, complete critical-ID coverage and strict
@@ -454,7 +456,7 @@ source resolution status.
 | Prepared lineage + current source + predecessor-section payload | 4 MiB before packet byte arrays |
 | Retained predecessor-section payload | 2 MiB, at most 15 sections |
 | Exact predecessor packet observations | 64 MiB, charged to carried traversal allowance |
-| Individual retained context/registration/result/source read; start stdin | 16 MiB |
+| Individual retained context/registration/result/source read; start/submit stdin | 16 MiB |
 | Predecessor traversal | 64 Runs, cycle refusal; 64 MiB carried primary/artifact observations |
 | Origins / decisions per origin / retained review generations | 4096 / 64 / 64 |
 | Disposition revision chain / retained import prose | 64 revisions / 65,536 UTF-8 bytes |
@@ -468,8 +470,8 @@ source resolution status.
 
 Request reads also cap at 16 KiB/128 entries; captured slots at 128 with bounded
 per-slot enumeration. Native write-ahead observations cap at 16 KiB and are inert
-evidence, not capture receipts or replay authority. Retained raw capture reads cap at 16 MiB; semantic admission
-still caps at 1 MiB. Disposition traversal has a separate 64 MiB read allowance.
+evidence, not capture receipts or replay authority. CLI submit and retained raw
+capture reads cap at 16 MiB; semantic admission still caps at 1 MiB. Disposition traversal has a separate 64 MiB read allowance.
 These simultaneous limits do not promise that all maxima fit together. Refuse,
 never truncate. They are **not** an all-reads cumulative, whole-Run or whole-process
 heap bound; JSON, byte arrays, repeated authenticated reads and native input can

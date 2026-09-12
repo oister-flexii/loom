@@ -500,10 +500,10 @@ function successorTranscriptBudgetProblem(raw: unknown): string | null {
  * Every candidate final payload from a whole Pi subagent RESULT.
  *
  * Claude's transcript makes "the final assistant text" unambiguous by
- * construction — one message per JSONL line, so the adapter reads the last
- * assistant line. Pi hands back a message list, so the equivalent is the LAST
- * assistant message's content blocks; anything earlier is mid-conversation, not
- * the Agent's answer.
+ * construction — one message per JSONL line, so its adapter accepts the final
+ * non-empty line only when that line is an assistant message. Pi hands back a
+ * message list, so the equivalent is the LAST assistant message's content
+ * blocks; anything earlier is mid-conversation, not the Agent's answer.
  *
  * Ambiguity inside that message is still refused rather than resolved here:
  * `piFinalPayloadCandidates` collects every text block and `parseFinalPayload`

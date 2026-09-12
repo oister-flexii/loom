@@ -17,7 +17,7 @@ import { parseRunDirectoryReference } from '../../../orchestration/run-directory
 import { publishStandalonePanelView } from '../../../orchestration/standalone-panel-context';
 import { CURRENT_REVIEWER_PROTOCOL } from '../../../core/reviewer-contract';
 import type { AgentRequestAuthority, SpawnRequest } from '../../../core/orchestration-contract';
-import { aggregateStandaloneReview, bindStandaloneCaptureAuthority, captureStandaloneReviewerBytes, canonicalStandaloneResultArtifact, completeStandaloneReviewerCapture, parseStandaloneReviewScope, prepareFreshStandaloneReview, proveStandaloneRosterCompletion, serializeStandaloneReviewAuthority, serializeAdjudicatedStandaloneReview } from '../../../core/standalone-review';
+import { aggregateStandaloneReview, bindStandaloneCaptureAuthority, captureStandaloneReviewerBytes, canonicalStandaloneResultArtifact, completeStandaloneReviewerCapture, parseStandaloneReviewScope, prepareFreshStandaloneReview, proveStandaloneRosterCompletion, serializeStandaloneReviewAuthority, serializeAdjudicatedStandaloneReview, type FrozenStandaloneReviewAuthority } from '../../../core/standalone-review';
 import { parseStandaloneReviewMachineState, reduceStandaloneReviewMachine, parseStandaloneRefutationCompletion, serializeStandaloneReviewMachineState, startStandaloneReviewMachine, type StandaloneReviewMachineState } from '../../../core/standalone-review-machine';
 import { completePersistentRefutationPanel, panelRequestIdentity, refutationPanelCheckpoint, rejectRefutationVerdict, startPersistentRefutationPanel, submitRefutationVerdict, type PersistentRefutationPanelEvent } from '../../../core/panel-program';
 import { readRunBytesNoFollow, writeRunBytesExclusiveNoFollow } from '../../../orchestration/no-follow-fs';
@@ -26,6 +26,33 @@ import { type RunDirHandle } from '../../../orchestration/run-directory-handle';
 import { standaloneReviewerProtocolResolver, readPublishedStandaloneResult, gitText, deriveChangedPaths, durableCaptureRejection, durablePublicationDigest, durableRefutationRequests, durableRequests, executableRefutationRequests, failed, metadata, readRegisteredStandaloneAuthority, publicationFile, publicationResolver, publishInitialBatch, recoverOrPublishRefutationRetry, recoverOrPublishStandaloneRetry, refutationRejectionDiagnostic, renderSpawnTask, safeScope, standalonePackets, standalonePublicationEffectId, standaloneRetryTask, type FacadeDriveResult, type ProgramParse, type RegisteredStandaloneProgram } from './helpers';
 
 const preparedSuccessorStarts = new WeakSet<object>();
+
+function preparationMetadata(reviewMetadata: ReturnType<typeof metadata>) {
+  return {
+    requested_kinds: reviewMetadata.requestedKinds,
+    docs_only: reviewMetadata.docsOnly,
+    source_or_test_changed: reviewMetadata.sourceOrTestChanged,
+    types_changed: reviewMetadata.typesChanged,
+    comments_changed: reviewMetadata.commentsChanged,
+    additions: reviewMetadata.additions,
+    file_count: reviewMetadata.fileCount,
+    new_structure: reviewMetadata.newStructure,
+    languages: reviewMetadata.languages,
+  };
+}
+
+function initialStandaloneRequests(authority: FrozenStandaloneReviewAuthority) {
+  return authority.roster.orderedSlots.map((slot) => {
+    const request = slot.attempts[0];
+    return Object.freeze({
+      authority: request,
+      context: Object.freeze({
+        digest: request.contextDigest,
+        slot: Object.freeze({ kind: "fixed-artifact-slot" as const, path: `contexts/${request.contextDigest}.json` }),
+      }),
+    });
+  });
+}
 
 export async function prepareStandaloneSuccessorFacadeStart(runsRoot: string, run: string, input: StandaloneSuccessorStartInput) {
   try {
@@ -41,10 +68,7 @@ export async function prepareStandaloneSuccessorFacadeStart(runsRoot: string, ru
     const prepared = prepareFreshStandaloneReview({ runId: destination.value.runId, explicitScope: input.files,
       changedPaths: changed.authority, successor: lineage.value.prepared, reviewerContexts: lineage.value.contexts,
       scopeSafety: lineage.value.prepared.snapshot.map(row => ({ path: row.path, status: row.kind === "absent" ? "absent" : "safe" })),
-      reviewMetadata: { requested_kinds: reviewMetadata.requestedKinds, docs_only: reviewMetadata.docsOnly,
-        source_or_test_changed: reviewMetadata.sourceOrTestChanged, types_changed: reviewMetadata.typesChanged,
-        comments_changed: reviewMetadata.commentsChanged, additions: reviewMetadata.additions, file_count: reviewMetadata.fileCount,
-        new_structure: reviewMetadata.newStructure, languages: reviewMetadata.languages } });
+      reviewMetadata: preparationMetadata(reviewMetadata) });
     if (!prepared.ok) return { ok: false as const, message: prepared.error.errors.join("; ") };
     const registration: RegisteredStandaloneSuccessorProgram = Object.freeze({ schemaVersion: 3, kind: "standalone-review",
       reviewerProtocol: STANDALONE_REVIEWER_PROTOCOL_V3, input, currentSource: source.value,
@@ -69,8 +93,7 @@ export async function startPreparedStandaloneSuccessor(handle: RunDirHandle,
     const published = await handle.publishContext(packet);
     if (!published.ok) return failed(published.error.message);
   }
-  const requests = prepared.authority.roster.orderedSlots.map(slot => ({ authority: slot.attempts[0],
-    context: { digest: slot.attempts[0].contextDigest, slot: `contexts/${slot.attempts[0].contextDigest}.json` } }));
+  const requests = initialStandaloneRequests(prepared.authority);
   const batch = await publishInitialBatch(handle, requests, prepared.packets.filter((_, index) => index % 2 === 0), "standalone-review");
   if (!batch.ok) return failed(batch.message);
   const awaiting = reduceStandaloneReviewMachine(startStandaloneReviewMachine(prepared.authority), { kind: "review-batch-published", runId: handle.runId });
@@ -100,17 +123,7 @@ export async function startStandaloneFacade(
       runId: handle.runId,
       ...(input.files === null ? {} : { explicitScope: scope }),
       changedPaths: changed.authority,
-      reviewMetadata: {
-        requested_kinds: reviewMetadata.requestedKinds,
-        docs_only: reviewMetadata.docsOnly,
-        source_or_test_changed: reviewMetadata.sourceOrTestChanged,
-        types_changed: reviewMetadata.typesChanged,
-        comments_changed: reviewMetadata.commentsChanged,
-        additions: reviewMetadata.additions,
-        file_count: reviewMetadata.fileCount,
-        new_structure: reviewMetadata.newStructure,
-        languages: reviewMetadata.languages,
-      },
+      reviewMetadata: preparationMetadata(reviewMetadata),
       scopeSafety: safeScope(scope),
       reviewerContexts: packetSet.contexts,
     });
@@ -293,22 +306,30 @@ export async function resumeStandaloneFacade(
       if (!effectId.ok) return failed(effectId.error.message);
       const publication = durablePublicationDigest(handle, effectId.value);
       if (publication.kind === "corrupt") return failed(publication.message);
-      if (publication.kind === "found") {
-        const reconstructed = reduceStandaloneReviewMachine(
-          startStandaloneReviewMachine(authorityResult.value),
-          { kind: "review-batch-published", runId: handle.runId },
-        );
-        if (!reconstructed.ok || reconstructed.value.kind !== "awaiting-results") {
-          return failed(reconstructed.ok
-            ? "standalone recovery did not reach awaiting-results"
-            : reconstructed.error.message);
+      if (publication.kind === "absent") {
+        if (registration.schemaVersion !== 3 || authenticated === undefined || !authenticated.ok) {
+          return failed("standalone review checkpoint is missing and no durable batch publication exists");
         }
-        const serialized = serializeStandaloneReviewMachineState(reconstructed.value);
-        await handle.writeCheckpoint(serialized);
-        rawState = JSON.parse(serialized) as unknown;
-      } else {
-        return failed("standalone review checkpoint is missing and no durable batch publication exists");
+        const published = await publishInitialBatch(
+          handle,
+          initialStandaloneRequests(authorityResult.value),
+          authenticated.value.packets.filter((_, index) => index % 2 === 0),
+          "standalone-review",
+        );
+        if (!published.ok) return failed(published.message);
       }
+      const reconstructed = reduceStandaloneReviewMachine(
+        startStandaloneReviewMachine(authorityResult.value),
+        { kind: "review-batch-published", runId: handle.runId },
+      );
+      if (!reconstructed.ok || reconstructed.value.kind !== "awaiting-results") {
+        return failed(reconstructed.ok
+          ? "standalone recovery did not reach awaiting-results"
+          : reconstructed.error.message);
+      }
+      const serialized = serializeStandaloneReviewMachineState(reconstructed.value);
+      await handle.writeCheckpoint(serialized);
+      rawState = JSON.parse(serialized) as unknown;
     } else {
       try {
         rawState = JSON.parse(checkpoint);

@@ -179,6 +179,47 @@ describe.sequential("actual standalone successor CLI lifecycle", { timeout: 60_0
     });
   });
 
+  it("refuses orchestration submit above the raw 16 MiB capture bound before touching the pending attempt", async () => {
+    const root = project(); await ownedSession(root, async () => {
+      const f = await predecessor(root); const p = await policy(root, "source", "policy-zero", f.publisher);
+      const s = await successor(root, "bounded-submit", p, f);
+      const first = s.started.requests[0]!.authority;
+      const refused = await invoke(root, ["submit", ...flags(root, s.handle.runId), "--request", first.requestId,
+        "--slot", first.slotId, "--attempt", "1"], " ".repeat(16_777_217));
+      expect(refused.code).not.toBe(0);
+      expect(refused.stderr).toContain("orchestration input exceeds 16777216 byte limit");
+      expect(existsSync(join(s.handle.runDirectory, first.outputSlot.path))).toBe(false);
+      expect(value(s.handle.readCaptureRejection(first))).toBeNull();
+      const reissued = await command(root, ["resume", ...flags(root, s.handle.runId)]);
+      expect(reissued.requests.map(({ authority }) => authority.requestId))
+        .toEqual(s.started.requests.map(({ authority }) => authority.requestId));
+    });
+  });
+
+  it("recovers a registered v3 successor before its initial batch receipt or checkpoint exists", async () => {
+    const root = project(); await ownedSession(root, async () => {
+      const f = await predecessor(root); const p = await policy(root, "source", "policy-zero", f.publisher);
+      const parsed = value(f.helpers.parseStandaloneStartInput(input(p)));
+      if (!("schemaVersion" in parsed)) throw Error("successor expected");
+      const prepared = await f.shell.prepareStandaloneSuccessorFacadeStart(join(root, "runs"), "registration-only", parsed);
+      if (!prepared.ok) throw Error(prepared.message);
+      const handle = value(f.handles.createRunDirectory(join(root, "runs"), "registration-only"));
+      value(await handle.registerProgram(prepared.value.registration));
+      expect(await handle.readCheckpoint()).toBeNull();
+      expect(value(handle.readIssuedRequests())).toEqual([]);
+
+      const resumed = await command(root, ["resume", ...flags(root, handle.runId)]);
+      const expected = prepared.value.authority.roster.orderedSlots.map(slot => slot.attempts[0].requestId);
+      expect(resumed.kind).toBe("spawn-batch");
+      expect(resumed.requests.map(({ authority }) => authority.requestId)).toEqual(expected);
+      expect(value(handle.readIssuedRequests()).map(request => request.requestId).sort()).toEqual([...expected].sort());
+      expect(await handle.readCheckpoint()).not.toBeNull();
+
+      const repeated = await command(root, ["resume", ...flags(root, handle.runId)]);
+      expect(repeated.requests.map(({ authority }) => authority.requestId)).toEqual(expected);
+    });
+  });
+
   it("rejects explicit predecessor cycles and the 64-Run traversal bound without creating a successor", async () => {
     const root = project(); await ownedSession(root, async () => {
       const f = await predecessor(root); const p = await policy(root, "source", "policy-zero", f.publisher);

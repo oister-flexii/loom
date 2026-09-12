@@ -302,8 +302,8 @@ function parseReviewMetadata(raw: unknown): ParseResult<StandaloneReviewMetadata
   const sourceOrTestChanged = bool("source_or_test_changed");
   const typesChanged = bool("types_changed");
   const commentsChanged = bool("comments_changed");
-  // A docs-only scope always changes comments — comment analysis is the only
-  // role that reads docs, so the producer's invariant (`metadata` in
+  // A docs-only scope always changes comments — comment-analyzer is the role
+  // selected specifically for docs, so the producer's invariant (`metadata` in
   // handlers/helpers/programs/helpers.ts: commentsChanged = docsOnly || scope
   // has .md/.mdx) must hold at the boundary too. Without it, a contradictory
   // persisted record silently drops comment-analyzer from a docs-only review.
@@ -510,8 +510,9 @@ export interface PrepareFreshStandaloneReviewInput
 
 /**
  * Construct a fresh standalone run without accepting caller-authored role,
- * model, request, slot, or destination attribution. The shell supplies only a
- * fresh run identity and the already-computed immutable context digests.
+ * model, request, slot, or destination attribution. The shell supplies scope,
+ * changed-path metadata, scope safety, optional successor authority, a fresh
+ * run identity, and already-computed immutable context digests.
  */
 export function prepareFreshStandaloneReview(
   input: PrepareFreshStandaloneReviewInput,
@@ -709,7 +710,7 @@ function canonicalRawReviewerBytes(bytes: Uint8Array): RawReviewerBytes {
     encoding: "base64" as const,
     data: Buffer.from(bytes).toString("base64"),
     byteLength: bytes.byteLength,
-    sha256: createHash("sha256").update(bytes).digest("hex"),
+    sha256: sha256Bytes(bytes),
   });
 }
 
@@ -1446,6 +1447,19 @@ function standaloneProtocol(value: Exclude<StandaloneReviewProtocol, { schemaVer
     : Object.freeze({ schemaVersion: 1 });
 }
 
+function reviewerEvidenceValue(evidence: StandaloneReviewerEvidence) {
+  return {
+    authority_kind: evidence.authorityKind,
+    agent: evidence.agent,
+    slot_id: evidence.slotId,
+    request_id: evidence.requestId,
+    attempt: evidence.attempt,
+    model_profile: evidence.modelProfile,
+    context_digest: evidence.contextDigest,
+    artifact: evidence.artifact,
+  };
+}
+
 export function serializeStandaloneAggregate(aggregate: StandaloneReviewAggregate): string {
   return JSON.stringify({
     schema_version: aggregate.schemaVersion,
@@ -1454,16 +1468,7 @@ export function serializeStandaloneAggregate(aggregate: StandaloneReviewAggregat
     run_id: aggregate.runId,
     subject_id: aggregate.subjectId,
     scope: aggregate.scope,
-    reviewer_evidence: aggregate.reviewerEvidence.map((evidence) => ({
-      authority_kind: evidence.authorityKind,
-      agent: evidence.agent,
-      slot_id: evidence.slotId,
-      request_id: evidence.requestId,
-      attempt: evidence.attempt,
-      model_profile: evidence.modelProfile,
-      context_digest: evidence.contextDigest,
-      artifact: evidence.artifact,
-    })),
+    reviewer_evidence: aggregate.reviewerEvidence.map(reviewerEvidenceValue),
     findings: aggregate.findings,
   }, null, 2);
 }
@@ -1875,16 +1880,7 @@ export function serializeAdjudicatedStandaloneReview(result: AdjudicatedStandalo
     run_id: result.runId,
     subject_id: STANDALONE_REVIEW_SUBJECT,
     scope: result.scope,
-    reviewer_evidence: result.reviewerEvidence.map((evidence) => ({
-      authority_kind: evidence.authorityKind,
-      agent: evidence.agent,
-      slot_id: evidence.slotId,
-      request_id: evidence.requestId,
-      attempt: evidence.attempt,
-      model_profile: evidence.modelProfile,
-      context_digest: evidence.contextDigest,
-      artifact: evidence.artifact,
-    })),
+    reviewer_evidence: result.reviewerEvidence.map(reviewerEvidenceValue),
     surviving_critical_findings: result.survivingCriticals,
     advisory_findings: result.advisories,
     refuted_critical_findings: result.refutedCriticals,
@@ -3975,7 +3971,7 @@ export function canonicalStandaloneResultArtifact(
   const artifact = parseArtifactRef({
     runId: result.runId,
     slot: STANDALONE_RESULT_SLOT,
-    digest: createHash("sha256").update(bytes).digest("hex"),
+    digest: sha256Bytes(bytes),
     byteLength: bytes.byteLength,
   });
   return artifact.ok

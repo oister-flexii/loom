@@ -158,8 +158,10 @@ authentication, never falls back to an older Run, retires older accepted witness
 and prunes on shutdown. Native reads do not recreate missing Run metadata.
 
 Both current attempts are frozen/recoverable from authenticated registration and
-source. Reader projection explicitly selects v3 and pages sections/source/one
-predecessor archive. Fresh predecessor references name exact original packet files,
+source. If a v3 start stops after registration but before initial-batch publication,
+resume idempotently publishes the frozen attempt-1 packets and reconstructs the
+awaiting-results checkpoint; corrupt or conflicting evidence still refuses. Reader
+projection explicitly selects v3 and pages sections/source/one predecessor archive. Fresh predecessor references name exact original packet files,
 lengths/digests and decode purpose; originals remain mandatory. Earlier issued gzip
 encodings remain bounded-readable without cross-compressor equality. Refutation
 verifiers keep Read/Glob/Grep, not Bash: packet-bound readable views are checked at
@@ -198,8 +200,8 @@ Actual Repair-Checked does not mutate the source's active Finding or history.
 
 [Operations](../operations.md#resource-and-compatibility-boundaries) pins the actual
 simultaneous limits: 512 KiB/file, 2 MiB raw source, 4096 paths/origins, 4 MiB packet
-payload before byte arrays, 2 MiB/15 predecessor sections, 16 MiB retained reads/start
-input, 64-Run/cycle/64 MiB carried traversal controls, and 64 historical decisions
+payload before byte arrays, 2 MiB/15 predecessor sections, 16 MiB retained reads and
+start/submit input, 64-Run/cycle/64 MiB carried traversal controls, and 64 historical decisions
 per origin/review generations/policy revisions. Response limits remain 1 MiB/depth
 32/128 new drafts/4096 priors. Disposition prose is capped at 65,536 UTF-8 bytes.
 Reader/native/view limits are separate; none is a whole-Run, all-reads cumulative

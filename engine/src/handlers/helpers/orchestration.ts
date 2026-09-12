@@ -32,10 +32,10 @@
  * already exist. Every other operation requires the run to exist, because an
  * absent Run Directory is the orphan case recovery adjudicates.
  *
- * Each mutating call parses authority, applies at most one event or receipt
- * reconciliation, persists it, and returns exactly one external action. The
- * parent therefore never assembles an action itself, and never has to know
- * which program produced it.
+ * Each mutating call parses authority and drives available deterministic work,
+ * including event and receipt reconciliation, until the next true external
+ * boundary; it then returns exactly one external action. The parent therefore
+ * never assembles an action itself or needs to know which program produced it.
  *
  * `submit` is idempotent: an attempt whose bytes already landed keeps the
  * stored evidence and re-emits the run's current action, which is the expected

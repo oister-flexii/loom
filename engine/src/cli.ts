@@ -26,10 +26,16 @@ import { assertAnchoredFilesystemPlatformSupported } from "./orchestration/no-fo
 const FAILURE_EXIT_CODE = failureExitCode(process.argv[2], process.argv[3]);
 const PACKAGE_ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
-// Bound this new ingress before chunk retention/concatenation; legacy routes retain their existing policy.
+// Bound orchestration inputs before chunk retention/concatenation. Submit is shared by
+// every reviewer protocol, so its raw-capture ceiling is intentionally broader than
+// the separate 1 MiB semantic-admission limit applied after durable capture.
+const ORCHESTRATION_STDIN_BYTES = 16_777_216;
 const dispositionStart = process.argv.slice(2, 6).join("/") === "helper/orchestration/start/standalone-disposition";
 const standaloneStart = process.argv.slice(2, 6).join("/") === "helper/orchestration/start/standalone-review";
-const maximumStdinBytes = dispositionStart || standaloneStart ? 16_777_216 : Number.POSITIVE_INFINITY;
+const orchestrationSubmit = process.argv.slice(2, 5).join("/") === "helper/orchestration/submit";
+const maximumStdinBytes = dispositionStart || standaloneStart || orchestrationSubmit
+  ? ORCHESTRATION_STDIN_BYTES
+  : Number.POSITIVE_INFINITY;
 // Eagerly buffer stdin before any async work (bun drains piped data during dynamic imports)
 const stdinPromise: Promise<string> = process.stdin.isTTY
   ? Promise.resolve("")
@@ -40,7 +46,7 @@ const stdinPromise: Promise<string> = process.stdin.isTTY
         total += chunk.length;
         if (total > maximumStdinBytes) {
           chunks.length = 0;
-          reject(new Error("standalone input exceeds 16777216 byte limit"));
+          reject(new Error("orchestration input exceeds 16777216 byte limit"));
         } else chunks.push(chunk);
       });
       process.stdin.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));

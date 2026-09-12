@@ -345,10 +345,12 @@ function durableStandaloneRetryRequest(
  *
  * This deliberately does not read the machine checkpoint or an existing
  * result.json. Callers use it when those completion projections are evidence
- * to verify rather than authority to trust. Scope comes from the immutable
- * request Context Packets witnessed by the Pi process, not merely from the
- * reread registration. Supported semantic attempt-2 retries are reconstructed
- * from their durable publication authority and the exact witnessed bytes.
+ * to verify rather than authority to trust. Scope comes from immutable request
+ * Context Packets, not merely from the reread registration. Generic replay
+ * reconstructs witnesses from durable capture receipts; Pi callers may also
+ * require matching current-session process witnesses. Supported semantic
+ * attempt-2 retries are reconstructed from durable publication authority and
+ * the exact witnessed bytes.
  */
 export function replayStandaloneResultFromEvidence(
   opened: RunDirHandle,
