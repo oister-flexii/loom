@@ -197,7 +197,9 @@ function parseReviewedSource(bytes: readonly number[], scope: readonly string[],
         files.push(Object.freeze({ path: file.path as string, kind: "absent", digest: null, byteLength: 0 }));
         continue;
       }
-      const contentKey = file.kind === "text" ? "content" : file.kind === "binary" ? "contentBase64" : null;
+      let contentKey: "content" | "contentBase64" | null = null;
+      if (file.kind === "text") contentKey = "content";
+      else if (file.kind === "binary") contentKey = "contentBase64";
       if (contentKey === null || typeof file.digest !== "string" || !/^[0-9a-f]{64}$/.test(file.digest) ||
           !Number.isSafeInteger(file.byteLength) || (file.byteLength as number) < 0 || typeof file[contentKey] !== "string" ||
           !exactObject(file, ["byteLength", contentKey, "digest", "kind", "path", ...(sourceVersion === 2 ? ["mode"] : [])]) ||

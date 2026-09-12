@@ -54,7 +54,8 @@ not bare Finding IDs. Every advisory—including retired history—is dispositio
 Publish immediately after autonomous parent triage under operator instructions,
 even when no remediation or successor follows. The schema-1 record has `DECLARED`
 provenance. Publication goes to `artifacts/disposition.json` plus an exact receipt;
-registration → artifact → receipt → checkpoint is an executable idempotent lifecycle.
+registration → registered checkpoint → artifact → artifact checkpoint → receipt →
+done checkpoint is an executable idempotent lifecycle.
 Missing/lagging checkpoints reconcile only to observed effects; conflicts refuse.
 There is no new await-user stage or Agent work.
 
@@ -79,7 +80,9 @@ overflow before Run creation/issuance. Scope/roster expansion is explicit.
 Relevant dependencies/configuration/contracts belong in the selected frozen scope;
 there is no mutable-live or implicit transitive context lane. Current source records
 bind byte digest, byte length and normalized Git mode `100644`/`100755`, or actual
-observed absence. Legacy known bytes retain unknown mode; genuinely unavailable old
+anchored-safe observed absence. Every extant parent component is checked without
+following symlinks, and a final whole-scope stability pass rejects torn multi-file
+observations before HEAD is read. Legacy known bytes retain unknown mode; genuinely unavailable old
 observations stay historical-unknown. Never substitute current source for missing
 history, or missing expected current source for historical absence. HEAD/ancestry
 is provenance, not source equality, repair or applicability.

@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync, writeFileSync, chmodSync, truncateSync, symlinkSync, lstatSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync, chmodSync, truncateSync, symlinkSync, lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
@@ -49,7 +49,10 @@ describe.sequential("bounded successor source observation", () => {
     const p = root(); await owned(p, async () => {
       const { observeStandaloneSuccessorSource, successorSourceSnapshot } = await import("../../../../src/handlers/helpers/programs/standalone-successor-source");
       writeFileSync(join(p, "target"), "bytes"); symlinkSync(join(p, "target"), join(p, "alias")); mkdirSync(join(p, "directory"));
-      for (const path of ["alias", "directory"]) expect(observeStandaloneSuccessorSource([path], () => "a".repeat(40)).ok).toBe(false);
+      mkdirSync(join(p, "outside")); symlinkSync(join(p, "outside"), join(p, "linked-directory"));
+      for (const path of ["alias", "directory", "linked-directory/missing.ts"]) {
+        expect(observeStandaloneSuccessorSource([path], () => "a".repeat(40)).ok).toBe(false);
+      }
       const absent = observeStandaloneSuccessorSource(["missing"], () => "a".repeat(40));
       expect(absent.ok).toBe(true); if (!absent.ok) return;
       expect(successorSourceSnapshot(absent.value, ["missing"])).toEqual({ ok: true, value: [{ kind: "absent", path: "missing" }] });
@@ -75,6 +78,23 @@ describe.sequential("bounded successor source observation", () => {
         read: () => Buffer.from("bytes"),
       });
       expect(afterRead).toEqual({ ok: false, message: `successor source unavailable: successor source ${path} changed during observation` });
+      expect(heads).toBe(0);
+    });
+  });
+  it("rejects a torn multi-file snapshot when a later read changes an earlier observed file", async () => {
+    const p = root(); await owned(p, async () => {
+      const { observeStandaloneSuccessorSource } = await import("../../../../src/handlers/helpers/programs/standalone-successor-source");
+      writeFileSync("first", "old"); writeFileSync("second", "trigger");
+      let heads = 0;
+      const observed = observeStandaloneSuccessorSource(["first", "second"], () => { heads += 1; return "a".repeat(40); }, {
+        lstat: lstatSync,
+        read: (path) => {
+          const bytes = readFileSync(path);
+          if (path === "second") writeFileSync("first", "new content");
+          return bytes;
+        },
+      });
+      expect(observed).toEqual({ ok: false, message: "successor source unavailable: successor source first changed during observation" });
       expect(heads).toBe(0);
     });
   });

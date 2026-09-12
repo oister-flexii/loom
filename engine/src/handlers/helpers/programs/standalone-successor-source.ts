@@ -41,32 +41,60 @@ const sourceObservationOperations: SourceObservationOperations = Object.freeze({
   lstat: lstatSync,
   read: readRunBytesNoFollow,
 });
+const sourceChanged = (path: string) => new Error(`successor source ${path} changed during observation`);
+function confirmAnchoredAbsence(path: string, operations: SourceObservationOperations): void {
+  try {
+    operations.read(path, 0);
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw cause;
+  }
+  throw sourceChanged(path);
+}
 export function observeStandaloneSuccessorSource(scope: readonly string[], readHeadRevision: () => string,
   operations: SourceObservationOperations = sourceObservationOperations): ProgramParse<ByteSection> {
   if (scope.length > STANDALONE_LINEAGE_LIMITS.paths) return fail("successor source exceeds path budget");
   try {
     let remaining = SUCCESSOR_SOURCE_BYTES;
+    const initialStats = new Map<string, Stats | null>();
     const files = scope.map(path => {
       let before: Stats;
       try {
         before = operations.lstat(path);
       } catch (cause) {
-        if ((cause as NodeJS.ErrnoException).code === "ENOENT") return Object.freeze({ path, kind: "absent" as const, digest: null, byteLength: 0 });
-        throw cause;
+        if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause;
+        confirmAnchoredAbsence(path, operations);
+        initialStats.set(path, null);
+        return Object.freeze({ path, kind: "absent" as const, digest: null, byteLength: 0 });
       }
       if (!before.isFile()) throw new Error(`successor source ${path} is not a regular no-follow file`);
       let bytes: Buffer;
       try {
         bytes = operations.read(path, Math.min(remaining, SUCCESSOR_SOURCE_FILE_BYTES));
-        if (!sameStat(before, operations.lstat(path))) throw new Error(`successor source ${path} changed during observation`);
+        if (!sameStat(before, operations.lstat(path))) throw sourceChanged(path);
       } catch (cause) {
-        if ((cause as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`successor source ${path} changed during observation`);
+        if ((cause as NodeJS.ErrnoException).code === "ENOENT") throw sourceChanged(path);
         throw cause;
       }
+      initialStats.set(path, before);
       remaining -= bytes.length;
       return Object.freeze({ path, kind: "binary" as const, digest: hash(bytes), byteLength: bytes.length,
         contentBase64: bytes.toString("base64"), mode: (before.mode & 0o111) === 0 ? "100644" as const : "100755" as const });
     });
+    for (const path of scope) {
+      const before = initialStats.get(path);
+      if (before === null) {
+        confirmAnchoredAbsence(path, operations);
+        continue;
+      }
+      if (before === undefined) throw new Error(`successor source ${path} lacks an initial observation`);
+      try {
+        if (!sameStat(before, operations.lstat(path))) throw sourceChanged(path);
+      } catch (cause) {
+        if ((cause as NodeJS.ErrnoException).code === "ENOENT") throw sourceChanged(path);
+        throw cause;
+      }
+    }
     const section = encodeByteSection("standalone-frozen-source", JSON.stringify({ schemaVersion: 2, headRevision: readHeadRevision(), files }));
     return section.ok ? section : fail(section.error.message);
   } catch (cause) { return fail(`successor source unavailable: ${cause instanceof Error ? cause.message : String(cause)}`); }

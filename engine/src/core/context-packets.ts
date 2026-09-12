@@ -217,19 +217,33 @@ export function buildContextPacket(input: ContextPacketInput): DomainResult<Lega
 
 const reservedLabel = (label: string): boolean => REVIEWER_FIXED_SECTIONS.some((section) => section.label === label);
 
-function reviewerPacket(base: LegacyContextPacket): DomainResult<ReviewerContextPacketV2, ContextPacketError> {
-  if (!isStandaloneReviewAgent(base.role)) return failure("role", "only reviewer roles may receive a reviewer v2 packet");
-  if (base.outputContract !== REVIEWER_OUTPUT_CONTRACT) return failure("outputContract", "reviewer output contract must match the supported contract exactly");
+type ReviewerContractProblem = Readonly<{ field: string; message: string }> | null;
+function validateReviewerContract(base: LegacyContextPacket,
+  expectedSections: readonly Readonly<{ label: string; text: string }>[], identityProblem: ReviewerContractProblem,
+  sectionKind: string): DomainResult<LegacyContextPacket, ContextPacketError> {
+  if (identityProblem !== null) return failure(identityProblem.field, identityProblem.message);
   if (base.variableContext.some((section) => reservedLabel(section.label))) {
     return failure("variableContext", "reviewer contract sections must be fixed");
   }
-  for (const expected of REVIEWER_FIXED_SECTIONS) {
+  for (const expected of expectedSections) {
     const actual = base.fixedContext.find((section) => section.label === expected.label);
     const bytes = encoder.encode(expected.text);
     if (actual === undefined || actual.bytes.length !== bytes.length || actual.bytes.some((byte, index) => byte !== bytes[index])) {
-      return failure("fixedContext", `reviewer section ${expected.label} must contain the exact supported bytes`);
+      return failure("fixedContext", `${sectionKind} ${expected.label} must contain the exact supported bytes`);
     }
   }
+  return success(base);
+}
+
+function reviewerPacket(base: LegacyContextPacket): DomainResult<ReviewerContextPacketV2, ContextPacketError> {
+  let identityProblem: ReviewerContractProblem = null;
+  if (!isStandaloneReviewAgent(base.role)) {
+    identityProblem = { field: "role", message: "only reviewer roles may receive a reviewer v2 packet" };
+  } else if (base.outputContract !== REVIEWER_OUTPUT_CONTRACT) {
+    identityProblem = { field: "outputContract", message: "reviewer output contract must match the supported contract exactly" };
+  }
+  const validated = validateReviewerContract(base, REVIEWER_FIXED_SECTIONS, identityProblem, "reviewer section");
+  if (!validated.ok) return validated;
   const identity = {
     schemaVersion: REVIEWER_CONTEXT_PACKET_SCHEMA_VERSION,
     requestId: base.requestId, role: base.role, requiredSkill: base.requiredSkill,
@@ -262,17 +276,13 @@ export function buildReviewerContextPacket(input: Omit<ContextPacketInput, "outp
 }
 
 function standaloneSuccessorPacket(base: LegacyContextPacket): DomainResult<StandaloneReviewerContextPacketV3, ContextPacketError> {
-  if (!isStandaloneReviewAgent(base.role) || base.outputContract !== REVIEWER_OUTPUT_CONTRACT) {
-    return failure("role", "standalone v3 requires a reviewer and the exact output contract");
-  }
-  if (base.variableContext.some(section => reservedLabel(section.label))) return failure("variableContext", "reviewer contract sections must be fixed");
-  for (const expected of STANDALONE_REVIEWER_FIXED_SECTIONS_V3) {
-    const actual = base.fixedContext.find(section => section.label === expected.label);
-    const bytes = encoder.encode(expected.text);
-    if (actual === undefined || actual.bytes.length !== bytes.length || actual.bytes.some((byte, index) => byte !== bytes[index])) {
-      return failure("fixedContext", `standalone v3 section ${expected.label} must contain the exact supported bytes`);
-    }
-  }
+  const identityProblem = !isStandaloneReviewAgent(base.role) || base.outputContract !== REVIEWER_OUTPUT_CONTRACT
+    ? { field: "role", message: "standalone v3 requires a reviewer and the exact output contract" }
+    : null;
+  const validated = validateReviewerContract(
+    base, STANDALONE_REVIEWER_FIXED_SECTIONS_V3, identityProblem, "standalone v3 section",
+  );
+  if (!validated.ok) return validated;
   const identity = { schemaVersion: 3 as const, requestId: base.requestId, role: base.role, requiredSkill: base.requiredSkill,
     outputContract: base.outputContract, reviewerProtocol: STANDALONE_REVIEWER_PROTOCOL_V3,
     fixedContext: base.fixedContext, variableContext: base.variableContext };

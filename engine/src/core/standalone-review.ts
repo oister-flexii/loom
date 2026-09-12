@@ -1974,14 +1974,13 @@ type StandaloneLineageError = Readonly<{
 }>;
 const rejectLineage = (code: StandaloneLineageError["code"], message: string): DomainResult<never, StandaloneLineageError> =>
   failure(canonicalRecord({ kind: "standalone-lineage-rejected", code, message }));
-const lineageDigest = (value: unknown): string => canonicalDigest(value);
 const freeze = <T>(values: readonly T[]): readonly T[] => Object.freeze([...values]);
 
 /** Content reference, not authority; current origins have no forward result-digest reference. */
-export const standaloneOriginReference = (origin: FindingOrigin): string => origin.kind === "published" ? lineageDigest(origin) : lineageDigest({ kind: "current",
+export const standaloneOriginReference = (origin: FindingOrigin): string => origin.kind === "published" ? canonicalDigest(origin) : canonicalDigest({ kind: "current",
   runId: origin.runId, requestId: origin.requestId, transcriptDigest: origin.transcriptDigest,
   role: origin.role, ordinal: origin.ordinal });
-export const standaloneDecisionReference = (decision: StandaloneLineageRow["history"][number]): string => lineageDigest(decision);
+export const standaloneDecisionReference = (decision: StandaloneLineageRow["history"][number]): string => canonicalDigest(decision);
 
 export function parseFindingOrigin(raw: unknown): DomainResult<FindingOrigin, StandaloneLineageError> {
   const inspected = readExactDataRecord(raw, ["kind", "runId", "requestId", "transcriptDigest", "role", "ordinal", "publication"], "Finding Origin");
@@ -2156,7 +2155,8 @@ export function prepareStandaloneDisposition(source: StandaloneLineageSource, in
   if (previous !== undefined && previous.history.length >= STANDALONE_LINEAGE_LIMITS.historyPerOrigin - 1) {
     return rejectLineage("limit-exceeded", "Disposition chain exceeds 64 exact revisions.");
   }
-  const prepared = canonicalRecord({ record, digest: lineageDigest(record) }) as PreparedStandaloneDisposition;
+  const dispositionDigest: string = canonicalDigest(record);
+  const prepared = canonicalRecord({ record, digest: dispositionDigest }) as PreparedStandaloneDisposition;
   dispositions.set(prepared, previous === undefined ? freeze([]) : freeze([...previous.history,
     canonicalRecord({ record: previous.record, digest: previous.digest, publication: previous.publication })]));
   return success(prepared);
@@ -2286,14 +2286,16 @@ export function prepareStandaloneSuccessor(source: StandaloneLineageSource, inpu
     return rejectLineage("invalid-disposition", "Selected policy must be the exact published revision of this source.");
   }
   const frozenPolicy = freezeDispositionSelection(disposition);
+  const snapshotDigest: string = canonicalDigest(snapshot);
   const base = canonicalRecord({ runId, source: source.publication, inventory: source.inventory, disposition: frozenPolicy,
-    snapshot, previousSnapshot: source.snapshot, reviewHistory: source.reviewHistory, snapshotDigest: lineageDigest(snapshot), reviewers });
-  const minimum = { schemaVersion: 3, kind: "standalone-successor-review", lineageDigest: lineageDigest(base), snapshotDigest: base.snapshotDigest,
+    snapshot, previousSnapshot: source.snapshot, reviewHistory: source.reviewHistory, snapshotDigest, reviewers });
+  const successorLineageDigest: string = canonicalDigest(base);
+  const minimum = { schemaVersion: 3, kind: "standalone-successor-review", lineageDigest: successorLineageDigest, snapshotDigest: base.snapshotDigest,
     priorAssessments: source.inventory.map(row => ({ origin: standaloneOriginReference(row.origin), verdict: "not-assessable", reason: "x" })), findings: [] };
   if (bytes(minimum).length > STANDALONE_LINEAGE_LIMITS.responseBytes || bytes(base).length > STANDALONE_LINEAGE_LIMITS.retainedBytes) {
     return rejectLineage("limit-exceeded", "Successor lineage or minimum exact coverage exceeds its byte budget.");
   }
-  const prepared = canonicalRecord({ ...base, lineageDigest: lineageDigest(base) }) as PreparedStandaloneSuccessor;
+  const prepared = canonicalRecord({ ...base, lineageDigest: successorLineageDigest }) as PreparedStandaloneSuccessor;
   successors.add(prepared);
   return success(prepared);
 }
@@ -2548,7 +2550,9 @@ function deriveStandaloneSuccessorLineage(prepared: PreparedStandaloneSuccessor,
     const reopening = provenance === "inherited" && reports.some(report => report.payload.priorAssessments[index]?.verdict === "reopen");
     if (findingOf(row).severity === "critical" && (provenance === "new" || reopening)) {
       const outcome = panel?.outcomes.find(value => value.findingId === `standalone-review:${row.finding.id}`);
-      state = outcome === undefined ? "pending-panel" : outcome.survives ? "active" : "refuted";
+      if (outcome === undefined) state = "pending-panel";
+      else if (outcome.survives) state = "active";
+      else state = "refuted";
     }
     return canonicalRecord({ origin, provenance, state });
   });
@@ -2616,10 +2620,6 @@ const machineFailure = (message: string): Readonly<{ ok: false; error: Standalon
     message,
   }) });
 
-function digest(value: unknown): string {
-  return canonicalDigest(value);
-}
-
 function deepFreezeJson<T>(value: T): T {
   if (Array.isArray(value)) {
     value.forEach((entry) => deepFreezeJson(entry));
@@ -2676,7 +2676,7 @@ export function freezeStandaloneRefutationPanelAuthority(input: Readonly<{
   if (input.aggregate.runId !== input.standaloneAuthority.runId) {
     return machineFailure("standalone aggregate and frozen standalone authority belong to different runs");
   }
-  const manifestDigest = parseArtifactDigest(digest(refutationManifestValue(canonical.value)));
+  const manifestDigest = parseArtifactDigest(canonicalDigest(refutationManifestValue(canonical.value)));
   if (!manifestDigest.ok) return machineFailure(manifestDigest.error.message);
   const frozen = freezeStandalonePanelAuthority({
     standaloneRunId: input.standaloneAuthority.runId,
@@ -2820,7 +2820,7 @@ export function parseStandaloneRefutationCompletion(input: Readonly<{
     if (resumed?.ok === false) return machineFailure(resumed.error.message);
     return machineFailure("refutation completion requires a completed T2 state or canonical checkpoint");
   }
-  const completedManifestDigest = digest(refutationManifestValue(completed.authority));
+  const completedManifestDigest = canonicalDigest(refutationManifestValue(completed.authority));
   const independentlyFrozen = freezeStandalonePanelAuthority({
     standaloneRunId: input.aggregate.runId,
     panelRunId: completed.authority.runId,
@@ -2861,8 +2861,8 @@ export function parseStandaloneRefutationCompletion(input: Readonly<{
     input.panelAuthority.lenses,
   );
   if (!panel.ok) return machineFailure(panel.errors.join("; "));
-  const outcomeDigest = digest(panelOutcomeValue(panel.value));
-  const completedPanelStateDigest = digest({
+  const outcomeDigest = canonicalDigest(panelOutcomeValue(panel.value));
+  const completedPanelStateDigest = canonicalDigest({
     stage: completed.stage,
     manifestDigest: completedManifestDigest,
     slots: completed.slots,
@@ -2904,7 +2904,8 @@ type PendingStandaloneSlot = Readonly<{
    * merely re-issued an already-recorded retry lost it and fell back to a
    * generic message — telling the reviewer to fix its scope when the real defect
    * was a missing Machine Summary block. Always null while `expectedAttempt` is
-   * 1; non-empty on a rejected slot unless a legacy checkpoint predates it.
+   * 1; null selects the supported generic fallback when no non-empty diagnostic
+   * survived, including but not limited to legacy checkpoints.
    */
   rejectionDiagnostic: string | null;
 }>;
@@ -3010,7 +3011,7 @@ function prepareResultPublicationIntent(
   if (result.schemaVersion === 3 && artifact.value.byteLength > STANDALONE_LINEAGE_LIMITS.retainedBytes) {
     return authoritativeResultFailure("canonical v3 result exceeds its retained lineage byte budget");
   }
-  const effectId = parseEffectId(`effect:standalone-result:${digest({
+  const effectId = parseEffectId(`effect:standalone-result:${canonicalDigest({
     runId: result.runId,
     artifact: artifact.value,
   })}`);
@@ -3052,10 +3053,10 @@ function readyToFinalize(
     panel: finalized.value.panel,
     refutationCompletion: event.kind === "refutation-completed" ? event.completion : null,
     rosterDigest: state.completion.rosterDigest,
-    reviewerEvidenceDigest: digest(finalized.value.reviewerEvidence),
-    aggregateDigest: digest(serializeStandaloneAggregate(aggregate)),
-    provenOutcomeDigest: digest(panel === null ? { kind: "clean" } : panelOutcomeValue(finalized.value.panel!)),
-    finalizationDigest: digest(serializeAdjudicatedStandaloneReview(finalized.value)),
+    reviewerEvidenceDigest: canonicalDigest(finalized.value.reviewerEvidence),
+    aggregateDigest: canonicalDigest(serializeStandaloneAggregate(aggregate)),
+    provenOutcomeDigest: canonicalDigest(panel === null ? { kind: "clean" } : panelOutcomeValue(finalized.value.panel!)),
+    finalizationDigest: canonicalDigest(serializeAdjudicatedStandaloneReview(finalized.value)),
     result: finalized.value,
     publicationIntent: publication.value,
   });
@@ -3081,15 +3082,15 @@ export function parseAuthoritativeStandaloneReviewResult(
     completion: ready.completion,
   });
   if (!reaggregated.ok ||
-      digest(serializeStandaloneAggregate(reaggregated.value.aggregate)) !== ready.aggregateDigest ||
+      canonicalDigest(serializeStandaloneAggregate(reaggregated.value.aggregate)) !== ready.aggregateDigest ||
       ready.completion.rosterDigest !== ready.rosterDigest) {
     return authoritativeResultFailure("frozen roster proof or aggregate digest changed before result publication");
   }
   const finalized = finalizeStandaloneReview(ready.aggregate, ready.panel);
   if (!finalized.ok || finalized.value.reviewerEvidence.length === 0 ||
-      digest(finalized.value.reviewerEvidence) !== ready.reviewerEvidenceDigest ||
-      digest(ready.panel === null ? { kind: "clean" } : panelOutcomeValue(finalized.value.panel!)) !== ready.provenOutcomeDigest ||
-      digest(serializeAdjudicatedStandaloneReview(finalized.value)) !== ready.finalizationDigest) {
+      canonicalDigest(finalized.value.reviewerEvidence) !== ready.reviewerEvidenceDigest ||
+      canonicalDigest(ready.panel === null ? { kind: "clean" } : panelOutcomeValue(finalized.value.panel!)) !== ready.provenOutcomeDigest ||
+      canonicalDigest(serializeAdjudicatedStandaloneReview(finalized.value)) !== ready.finalizationDigest) {
     return authoritativeResultFailure("proven panel outcome, reviewer evidence, aggregate, or finalization changed before publication");
   }
   let expectedRaw: unknown;
@@ -3428,7 +3429,7 @@ function recoverable(
     predecessor,
     diagnostic: event.diagnostic,
     expectedIntent: state.kind === "recoverable-blocked" ? state.expectedIntent : event.intent,
-    expectedIntentDigest: state.kind === "recoverable-blocked" ? state.expectedIntentDigest : digest(event.intent),
+    expectedIntentDigest: state.kind === "recoverable-blocked" ? state.expectedIntentDigest : canonicalDigest(event.intent),
   }));
 }
 
@@ -3527,7 +3528,7 @@ export function reduceStandaloneReviewMachine(
           event.completion.threshold !== state.panelAuthority.threshold ||
           event.completion.outcomeDigest !== completionProof.value.outcomeDigest ||
           event.completion.completedPanelStateDigest !== completionProof.value.completedPanelStateDigest ||
-          digest(panelOutcomeValue(event.completion.panel)) !== completionProof.value.outcomeDigest) {
+          canonicalDigest(panelOutcomeValue(event.completion.panel)) !== completionProof.value.outcomeDigest) {
         return rejectTransition(state, event, "aggregate-route-mismatch",
           "refutation completion requires the opaque parser-produced receipt for this exact frozen panel authority");
       }
@@ -3557,7 +3558,7 @@ export function reduceStandaloneReviewMachine(
       if (event.kind !== "recovery-receipt-accepted") {
         return rejectTransition(state, event, "undeclared-transition", "recoverable-blocked accepts only recovery-receipt-accepted or another recoverable failure");
       }
-      if (digest(state.expectedIntent) !== state.expectedIntentDigest) {
+      if (canonicalDigest(state.expectedIntent) !== state.expectedIntentDigest) {
         return rejectTransition(state, event, "recovery-receipt-mismatch",
           "the blocked EffectIntent changed after it was recorded");
       }
@@ -3810,7 +3811,7 @@ export function parseStandaloneReviewMachineState(
         : parsedIntentProbe.error.message);
     }
     if (typeof record.expectedIntentDigest !== "string" || !/^[0-9a-f]{64}$/.test(record.expectedIntentDigest) ||
-        digest(record.expectedIntent) !== record.expectedIntentDigest) {
+        canonicalDigest(record.expectedIntent) !== record.expectedIntentDigest) {
       return failure("recoverable checkpoint EffectIntent digest is invalid or stale");
     }
     const blocked = reduceStandaloneReviewMachine(predecessor.value, {

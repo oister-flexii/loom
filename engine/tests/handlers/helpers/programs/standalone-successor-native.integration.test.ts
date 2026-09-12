@@ -9,6 +9,7 @@ import { nativeSuccessorCapture } from "../../../fixtures/standalone-native-capt
 import { representativeNativeWorkload } from "../../../fixtures/standalone-native-workload";
 import { addRepairTest, git, hash, publishedSuccessorForRemediation, repairDeclaration, successorRemediationRepository, value } from "../../../fixtures/standalone-successor-remediation";
 import type { AgentRequestAuthority } from "../../../../src/core/orchestration-contract";
+import type { RunDirHandle } from "../../../../src/orchestration/run-directory-handle";
 
 type Requests = readonly { authority: AgentRequestAuthority; task: string }[];
 const roots: string[] = [];
@@ -35,6 +36,24 @@ function readCommand(task: string, extra = "") {
 }
 
 describe("owned native v3 → canonical replay → authentic guarded P3", { timeout: 60_000 }, () => {
+  it("retains distinct issued-request and captured-attempt roster diagnostics", async () => {
+    const { readStandaloneCaptureWitnesses } = await import("../../../../src/handlers/helpers/programs/standalone-evidence");
+    const handle = (issued: ReturnType<RunDirHandle["readIssuedRequests"]>,
+      captured: ReturnType<RunDirHandle["readCapturedAttempts"]>) => ({
+      readAuthority: () => ({ ok: true, value: {} }),
+      readIssuedRequests: () => issued,
+      readCapturedAttempts: () => captured,
+    }) as unknown as RunDirHandle;
+    const emptyIssued: ReturnType<RunDirHandle["readIssuedRequests"]> = { ok: true, value: [] };
+    const emptyCaptured: ReturnType<RunDirHandle["readCapturedAttempts"]> = { ok: true, value: new Set() };
+    expect(readStandaloneCaptureWitnesses(handle(
+      { ok: false, error: { kind: "invalid-run-directory", field: "requests", message: "issued journal corrupt" } }, emptyCaptured,
+    ))).toEqual({ ok: false, message: "issued reviewer roster is unavailable: issued journal corrupt" });
+    expect(readStandaloneCaptureWitnesses(handle(
+      emptyIssued, { ok: false, error: { kind: "invalid-run-directory", field: "captures", message: "captured index unreadable" } },
+    ))).toEqual({ ok: false, message: "captured reviewer roster is unavailable: captured index unreadable" });
+  });
+
   it("bounds current Pi transcript work before copying while conserving exact final strings", () => owned(async () => {
     const { piResultFinalPayloadCandidates } = await import("../../../../../pi/transcript-adapter");
     fc.assert(fc.property(fc.string(), text => {

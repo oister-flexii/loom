@@ -290,8 +290,9 @@ cover the entire inventory, or use `[]` only for an actually empty inventory):
 
 `decision` is `accepted`, `deferred` or `dismissed`, with a non-empty reason.
 Source, full advisory coverage and selected revision authenticate before destination
-Run creation. The program publishes `artifacts/disposition.json`, records its
-receipt, then checkpoints. `done.outcome.kind` is `standalone-disposition-published`;
+Run creation. The program checkpoints registered state, publishes `artifacts/disposition.json`,
+checkpoints artifact-published state, records its receipt, then writes the receipt-backed
+done checkpoint. `done.outcome.kind` is `standalone-disposition-published`;
 read `outcome.publication` (`locator`, `runId`, `dispositionDigest`), `record` and
 `receipt`. Exact repeat/resume is idempotent; conflicting bytes refuse. If interrupted,
 use ordinary `resume` on that Run: exact artifact/receipt facts reconstruct progress;
@@ -360,8 +361,10 @@ Role, model and request provenance remain separate; there is no live transitive
 source lane. Preflight refuses unsupported bounds/scope/roles before issuance.
 
 The engine observes exact source bytes, digest/length and normalized Git executable
-mode (`100644`/`100755`), or observed absence, before freezing both current attempts.
-Historical v1/v2 modes remain unknown (`null`); genuinely missing old source facts
+mode (`100644`/`100755`), or anchored-safe observed absence, before freezing both
+current attempts. Absence validates every extant parent without following symlinks;
+a final whole-scope stat/absence pass rejects torn multi-file observations before
+HEAD is read. Historical v1/v2 modes remain unknown (`null`); genuinely missing old source facts
 stay `historical-unknown`. Missing expected current source never becomes historical
 absence. Same HEAD is not byte equality; different HEAD is not repair. Deleted or
 renamed files keep the original Finding location and must not disappear from scope.

@@ -260,8 +260,8 @@ export async function inspectStandaloneFacade(
       standaloneReviewerProtocolResolver(handle, registration, successor), authority.value);
     if (!state.ok) return { ok: false, message: state.error.message };
     return state.value.kind === "done" ? readPublishedStandaloneResult(handle, state.value) : state;
-  } catch {
-    return { ok: false, message: "standalone review checkpoint cannot be inspected safely" };
+  } catch (cause) {
+    return { ok: false, message: `standalone review checkpoint cannot be inspected safely: ${cause instanceof Error ? cause.message : String(cause)}` };
   }
 }
 

@@ -1,4 +1,5 @@
-/** Per-program no-agent advisory publisher. Registration → artifact → receipt → checkpoint.
+/** Per-program no-agent advisory publisher.
+ * Registration → registered checkpoint → artifact → artifact checkpoint → receipt → done checkpoint.
  * Every resume reauthenticates source and exact selected revisions; no latest inference or historical fallback.
  */
 import { dirname } from "node:path";
