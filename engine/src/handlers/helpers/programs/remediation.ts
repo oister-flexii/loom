@@ -71,7 +71,6 @@ import {
 } from "./remediation-events";
 import {
   createRegisteredRemediationProgramV2,
-  parseRegisteredRemediationProgram,
   type RegisteredRemediationProgram,
   type RegisteredRemediationProgramV2,
   type RemediationStartInputV2,
@@ -707,10 +706,4 @@ export async function driveRemediationFacade(
   } finally {
     if (!installerOwnsTemporary) discardTemporaryIndex(temporary.value);
   }
-}
-
-/** Validate an already-read registration through the strict version parser. */
-export function parseRemediationRegistrationForFacade(raw: unknown): RegisteredRemediationProgram | null {
-  const parsed = parseRegisteredRemediationProgram(raw);
-  return parsed.ok ? parsed.value : null;
 }

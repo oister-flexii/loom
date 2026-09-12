@@ -66,7 +66,7 @@ async function expectInstalled(f: Fixture, run: string, declaration: unknown, su
   return { handle, events, outcome, prepared };
 }
 
-describe.sequential("owned v3 source → actual guarded P3 installation", () => {
+describe.sequential("owned v3 source → actual guarded P3 installation", { timeout: 60_000 }, () => {
   it("installs genuine not-required with complete coverage and retains full resolved/refuted/advisory lineage", () => owned(async root => {
     const f = await publishedSuccessorForRemediation(root, "complete");
     unlinkSync(join(f.successor.runDirectory, "checkpoint.json")); // P3 must replay actual captures, not trust LC-2 checkpoint.

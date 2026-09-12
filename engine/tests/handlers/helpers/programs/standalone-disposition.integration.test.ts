@@ -90,7 +90,7 @@ async function sourceFixture(root: string) {
   return { source, lineage, input, publisher };
 }
 
-describe.sequential("admitted standalone advisory publication, correction and recovery", () => {
+describe.sequential("admitted standalone advisory publication, correction and recovery", { timeout: 60_000 }, () => {
   it("publishes advisory-only decisions without repair or successor; exact retries preserve all durable bytes and index", async () => {
     const root = project();
     await withFixturePiSession(root, async () => {

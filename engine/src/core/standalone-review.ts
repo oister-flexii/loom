@@ -79,7 +79,7 @@ import {
 import { reviewFindingCounts, attributeFindings, findingsUnionError, parseStoredFindings, type Finding, type RefutedFinding } from "./findings";
 import { fail, isRecord, ok, sanitizeProse, type ParseResult } from "./panel-kernel";
 import { resolveReviewFindings, parseReviewerEvidence as parseIssuedReviewerEvidence, type ParsedFindings, type IssuedStandaloneReviewerProtocol, type ReviewerProtocolAuthorityResolver } from "./review-output";
-import { parseReviewPath, sha256Hex, sha256Bytes, type ReviewPath } from "./review-packet";
+import { parseReviewPath, sha256Bytes, type ReviewPath } from "./review-packet";
 import { compareStrings } from "./ordering";
 import { projectFindingForPanel, type BriefFinding } from "./review-panel";
 
@@ -1978,7 +1978,7 @@ type StandaloneLineageError = Readonly<{
 }>;
 const rejectLineage = (code: StandaloneLineageError["code"], message: string): DomainResult<never, StandaloneLineageError> =>
   failure(canonicalRecord({ kind: "standalone-lineage-rejected", code, message }));
-const lineageDigest = (value: unknown): string => sha256Hex(JSON.stringify(value));
+const lineageDigest = (value: unknown): string => canonicalDigest(value);
 const freeze = <T>(values: readonly T[]): readonly T[] => Object.freeze([...values]);
 
 /** Content reference, not authority; current origins have no forward result-digest reference. */
@@ -2621,7 +2621,7 @@ const machineFailure = (message: string): Readonly<{ ok: false; error: Standalon
   }) });
 
 function digest(value: unknown): string {
-  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+  return canonicalDigest(value);
 }
 
 function deepFreezeJson<T>(value: T): T {
@@ -2937,7 +2937,7 @@ export type StandaloneReadyToFinalizeState = Readonly<StandaloneStateBase & {
   completion: StandaloneRosterCompletionProof;
   aggregate: StandaloneReviewAggregate;
   panel: ParsedPanelOutcomes | null;
-  /** Null only for the canonical zero-critical route; otherwise durable T2 proof. */
+  /** Null when there is no current Refutation Panel work; inherited active criticals may remain. */
   refutationCompletion: StandaloneRefutationCompletionReceipt | null;
   rosterDigest: string;
   reviewerEvidenceDigest: string;

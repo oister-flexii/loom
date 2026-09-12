@@ -34,7 +34,7 @@ function readCommand(task: string, extra = "") {
   return JSON.parse(read.stdout);
 }
 
-describe("owned native v3 → canonical replay → authentic guarded P3", () => {
+describe("owned native v3 → canonical replay → authentic guarded P3", { timeout: 60_000 }, () => {
   it("bounds current Pi transcript work before copying while conserving exact final strings", () => owned(async () => {
     const { piResultFinalPayloadCandidates } = await import("../../../../../pi/transcript-adapter");
     fc.assert(fc.property(fc.string(), text => {

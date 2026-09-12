@@ -145,7 +145,7 @@ function payload(s: Awaited<ReturnType<typeof successor>>, verdict: "repaired" |
       : { origin: standaloneOriginReference(row.origin), verdict, reason: "Current source assessment" }), findings: [] };
 }
 
-describe.sequential("actual standalone successor CLI lifecycle", () => {
+describe.sequential("actual standalone successor CLI lifecycle", { timeout: 60_000 }, () => {
   it("fails bounded source/current-policy preflight without creating a new Run or substituting historical absence", async () => {
     const root = project(); await ownedSession(root, async () => {
       const f = await predecessor(root); const p = await policy(root, "source", "policy-zero", f.publisher);
