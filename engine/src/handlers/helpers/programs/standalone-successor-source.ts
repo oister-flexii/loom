@@ -43,12 +43,17 @@ const sourceObservationOperations: SourceObservationOperations = Object.freeze({
 });
 const sourceChanged = (path: string) => new Error(`successor source ${path} changed during observation`);
 const authorityChanged = () => new Error("successor Git/reviewer authority changed during observation");
-function confirmAnchoredAbsence(path: string, operations: SourceObservationOperations, previouslyAbsent = false): void {
+function confirmAnchoredAbsence(path: string, operations: SourceObservationOperations): void {
   try {
     operations.read(path, 0);
   } catch (cause) {
     if ((cause as NodeJS.ErrnoException).code === "ENOENT") return;
-    if (!previouslyAbsent) throw cause;
+    // A bounded 0-byte probe refuses an appeared file with a plain message, not
+    // an errno: that is appearance evidence, not a filesystem fault. Real I/O
+    // causes (EACCES, EIO, ELOOP) carry a code and are rethrown so the operator
+    // sees the actual fault instead of race diagnosis.
+    if ((cause as NodeJS.ErrnoException).code === undefined) throw sourceChanged(path);
+    throw cause;
   }
   throw sourceChanged(path);
 }
@@ -92,7 +97,7 @@ export function observeStableStandaloneSuccessorSource<T>(scope: readonly string
       for (const path of scope) {
         const before = initialStats.get(path);
         if (before === null) {
-          confirmAnchoredAbsence(path, operations, true);
+          confirmAnchoredAbsence(path, operations);
           continue;
         }
         if (before === undefined) throw new Error(`successor source ${path} lacks an initial observation`);
@@ -105,15 +110,17 @@ export function observeStableStandaloneSuccessorSource<T>(scope: readonly string
       }
     };
     // One Git command sequence can straddle a ref/index transition without
-    // changing scoped file stats. Production supplies a compact witness around
-    // that derivation; generic callers repeat their complete observation.
+    // changing scoped file stats. Production observes a compact witness at
+    // derivation and again AFTER this final whole-scope pass, so drift during
+    // either pass is detected before anything is encoded; generic callers
+    // repeat their complete observation.
     const observed = observeAuthority();
+    confirmSource();
     confirmSource();
     const stable = observed.stability === undefined
       ? canonicalStructuralEquals(observed, observeAuthority())
       : canonicalStructuralEquals(observed.stability.witness, observed.stability.observe());
     if (!stable) throw authorityChanged();
-    confirmSource();
     const section = encodeByteSection("standalone-frozen-source", JSON.stringify({
       schemaVersion: 2,
       headRevision: observed.headRevision,

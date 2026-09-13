@@ -118,6 +118,52 @@ describe("owned native v3 → canonical replay → authentic guarded P3", { time
     } finally { await native.close(); }
   }));
 
+  it.each(["claude", "pi"] as const)("%s bounds missing-registration capture before parsing without unbounded transcript work", harness => owned(async root => {
+    const native = await nativeSuccessorCapture(root, harness);
+    try {
+      const f = await publishedSuccessorForRemediation(root, "complete", async (handle, requests, payload) => {
+        const helpers = await import("../../../../src/handlers/helpers/programs/helpers");
+        const standalone = await import("../../../../src/handlers/helpers/programs/standalone");
+        const first = requests[0]!.authority;
+        const programPath = join(handle.runDirectory, "program.json");
+        const registrationBytes = readFileSync(programPath);
+        if (harness === "pi") {
+          const extension = await import("../../../../../pi/extension");
+          const toolCallId = "missing-registration";
+          value(await handle.recordHarnessCorrelator({ schemaVersion: 1, harness: "pi",
+            nativeId: extension.piSpawnRosterId(toolCallId, 0, first.role), requestId: first.requestId,
+            role: first.role, attempt: first.attempt }));
+          const binding = Object.freeze({ ...handle.identity,
+            requestIds: Object.freeze(requests.map(({ authority }) => authority.requestId)), resultDigest: null });
+          unlinkSync(programPath);
+          const refused = await extension.capturePiSubagentResult(toolCallId, 0, first.role,
+            [{ get role() { throw new Error("transcript was observed"); } }], binding);
+          expect(refused).toMatchObject({ kind: "terminal-rejection", reason: "transcript-shape",
+            message: expect.stringContaining("only own data") });
+          expect(JSON.stringify(refused)).not.toContain("transcript was observed");
+          expect(value(handle.readCaptureRejection(first))).not.toBeNull();
+          writeFileSync(programPath, registrationBytes);
+          const retry = await standalone.resumeStandaloneFacade(handle,
+            value(helpers.parseRegistration(JSON.parse(registrationBytes.toString()))));
+          if (!retry.ok) throw Error(retry.message);
+          const retried = (retry.action as { requests: Requests }).requests;
+          expect(retried).toHaveLength(7);
+          expect(retried.filter(row => row.authority.attempt === 2)).toHaveLength(1);
+          await native.capture(handle, retried, retried.map(() => [JSON.stringify(payload)]));
+          return;
+        }
+        unlinkSync(programPath);
+        const refused = await native.capture(handle, requests.slice(0, 1), [["x".repeat(16_777_217)]]);
+        expect(JSON.stringify(refused)).toContain("transcript-read");
+        expect(value(handle.readCapturedAttempts())).toEqual(new Set());
+        expect(value(handle.readCaptureRejection(first))).toBeNull();
+        writeFileSync(programPath, registrationBytes);
+        await native.capture(handle, requests, requests.map(() => [JSON.stringify(payload)]));
+      });
+      expect(JSON.parse(f.bytes.toString()).schema_version).toBe(3);
+    } finally { await native.close(); }
+  }));
+
   it.each(["claude", "pi"] as const)("%s refuses foreign capture receipts and changed current protocol/request/context/result authority", harness => owned(async root => {
     const native = await nativeSuccessorCapture(root, harness);
     try {

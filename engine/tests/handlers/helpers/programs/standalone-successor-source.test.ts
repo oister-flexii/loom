@@ -152,6 +152,44 @@ describe.sequential("bounded successor source observation", () => {
     });
   });
 
+  it("rejects witness drift observed after the final whole-scope source pass", async () => {
+    const p = root(); await owned(p, async () => {
+      const { observeStableStandaloneSuccessorSource } = await import("../../../../src/handlers/helpers/programs/standalone-successor-source");
+      writeFileSync("source.ts", "stable bytes");
+      let authority = "A";
+      let lstats = 0;
+      const drifted = observeStableStandaloneSuccessorSource(["source.ts"], () => ({
+        headRevision: "a".repeat(40),
+        value: { authorityAtDerivation: authority },
+        stability: Object.freeze({ witness: authority, observe: () => authority }),
+      }), {
+        lstat: () => { lstats += 1; if (lstats === 4) authority = "B"; return lstatSync("source.ts"); },
+        read: (path) => Buffer.from(readFileSync(path)),
+      });
+      expect(drifted).toEqual({
+        ok: false,
+        message: "successor source unavailable: successor Git/reviewer authority changed during observation",
+      });
+    });
+  });
+
+  it("rethrows non-ENOENT repeated absence causes instead of race diagnosis", async () => {
+    const p = root(); await owned(p, async () => {
+      const { observeStandaloneSuccessorSource } = await import("../../../../src/handlers/helpers/programs/standalone-successor-source");
+      const denied = Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+      let reads = 0;
+      const masked = observeStandaloneSuccessorSource(["absent.ts"], () => "a".repeat(40), {
+        lstat: () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
+        read: () => { reads += 1; if (reads === 1) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); throw denied; },
+      });
+      expect(masked).toEqual({
+        ok: false,
+        message: "successor source unavailable: EACCES: permission denied",
+      });
+      expect(reads).toBe(2);
+    });
+  });
+
   it("rejects forged frozen-source section identity and malformed source facts", async () => {
     const p = root(); await owned(p, async () => {
       const { encodeByteSection } = await import("../../../../src/core/context-packets");

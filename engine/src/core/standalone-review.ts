@@ -574,9 +574,7 @@ export function prepareFreshStandaloneReview(
     };
   });
   if (roster.some((slot) => slot === null)) {
-    return preparationFailure(authorityErrors.length > 0
-      ? authorityErrors
-      : ["cannot resolve deterministic reviewer model/context authority"]);
+    return preparationFailure(authorityErrors);
   }
   const prepared = prepareStandaloneReview({ ...input, roster });
   return prepared.ok ? resultOk(Object.freeze({
@@ -1960,7 +1958,7 @@ export function renderStandaloneReviewSummary(result: AdjudicatedStandaloneRevie
     "",
     ...rows.flatMap(({ finding }) => finding.protocolVersion !== 2 ? [] : [
       `${summaryData(finding.id)} detail: ${summaryData(finding.severity === "critical"
-        ? { basis: finding.basis } : { reason: finding.reason, ...(finding.basis === undefined ? {} : { basis: finding.basis }) })}`,
+        ? { basis: finding.basis } : { reason: finding.reason, basis: finding.basis })}`,
     ]),
   ].join("\n");
 }
@@ -3715,10 +3713,8 @@ function parsePersistedStandaloneProgress(
     }
     const record = entry as Record<string, unknown>;
     const slot = authority.roster.orderedSlots.find(({ slotId }) => slotId === record.slotId);
-    // Indexed, not branched: `attempts` is the ordered pair and the checkpoint's
-    // 1-or-2 IS its ordinal. The two-arm ternary this replaces read the same
-    // array at two literal indices, so a third attempt ordinal would have to be
-    // added in two places to be readable in either.
+    // The persisted attempt is validated as 1 or 2 before it indexes the frozen
+    // attempt tuple; broader lifecycle parsing enforces attempt cardinality.
     const attempt = record.attempt === 1 || record.attempt === 2
       ? slot?.attempts[record.attempt - 1]
       : undefined;

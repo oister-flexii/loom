@@ -545,10 +545,16 @@ export async function resumeStandaloneFacade(
         }
         machine = reduced.value;
       }
-      await handle.writeCheckpoint(serializeStandaloneReviewMachineState(machine));
+      // Append the append-only audit events BEFORE committing the attempt-2
+      // projection: a failed append leaves the checkpoint still expecting
+      // attempt 1, so the next resume rediscovers the rejection and retries
+      // it; a succeeded append followed by a failed checkpoint write is
+      // re-discovered the same way, and the journal's dedup key makes the
+      // repeat idempotent.
       for (const { slot, problems } of rejected) {
         await appendStandaloneRejection(handle, slot, slot.attempt, problems.join("; "));
       }
+      await handle.writeCheckpoint(serializeStandaloneReviewMachineState(machine));
     }
 
     // Phase B — assemble the issued-request set. Slots still expected at
@@ -593,8 +599,11 @@ export async function resumeStandaloneFacade(
           if (!terminal.ok || terminal.value.kind !== "terminal-blocked") {
             return failed(terminal.ok ? "final capture rejection did not terminal-block" : terminal.error.message);
           }
-          await handle.writeCheckpoint(serializeStandaloneReviewMachineState(terminal.value));
+          // Audit event before the terminal checkpoint commit: a failed append
+          // leaves the machine awaiting results, so the next resume re-derives
+          // and retries it; the journal dedup key makes the repeat idempotent.
           await appendStandaloneRejection(handle, request.authority, 2, rejection);
+          await handle.writeCheckpoint(serializeStandaloneReviewMachineState(terminal.value));
           return { ok: true, action: { kind: "blocked", runId: handle.runId, diagnostic: terminal.value } };
         }
         missing.push(request);
@@ -618,8 +627,11 @@ export async function resumeStandaloneFacade(
           if (!terminal.ok || terminal.value.kind !== "terminal-blocked") {
             return failed(terminal.ok ? "standalone attempt-2 rejection did not terminal-block" : terminal.error.message);
           }
-          await handle.writeCheckpoint(serializeStandaloneReviewMachineState(terminal.value));
+          // Audit event before the terminal checkpoint commit: a failed append
+          // leaves the machine awaiting results, so the next resume re-derives
+          // and retries it; the journal dedup key makes the repeat idempotent.
           await appendStandaloneRejection(handle, request.authority, 2, problems.join("; "));
+          await handle.writeCheckpoint(serializeStandaloneReviewMachineState(terminal.value));
           return { ok: true, action: { kind: "blocked", runId: handle.runId, diagnostic: terminal.value } };
         }
       }

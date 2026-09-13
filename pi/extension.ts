@@ -750,9 +750,11 @@ export async function capturePiSubagentResult(
         : "program registration does not name a registered orchestration program";
       return captureUnavailable("program-registration", `program registration is unavailable: ${problem}`);
     }
-    const purpose = raw === null || (parsedRegistration?.program.kind === "standalone-review" &&
-      parsedRegistration.program.schemaVersion === 3) ? "standalone-successor" as const : undefined;
-    const candidates = piResultFinalPayloadCandidates(messages ?? [], purpose);
+    // Every current capture applies the successor decoded-work budget before
+    // the legacy adapter allocates copied arrays; the old undefined purpose
+    // admitted the impossible foreign escape, because the correlated request
+    // carries no schema version to compare against.
+    const candidates = piResultFinalPayloadCandidates(messages ?? [], "standalone-successor");
     return candidates.ok
       ? captureCandidates(candidates.value)
       : terminalCaptureRefusal("transcript-shape", candidates.errors.join("; "));

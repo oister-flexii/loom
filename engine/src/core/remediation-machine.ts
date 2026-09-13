@@ -2318,6 +2318,30 @@ function recoveryReceiptDigest(fields: Omit<RemediationRecoveryReceipt, "kind" |
   return digestJson(fields);
 }
 
+type RecoveryReceiptMismatchField = "runId" | "recoveryAttemptId" | "effectId" | "predecessorState" | "witnessDigest";
+
+/** Sequential field guards over [field, actual, expected] pairs; the first
+ *  mismatch names its receipt field and null reconciles. The five-arm ternary
+ *  this replaces chained five independent comparisons into one data-driven
+ *  scan, so a sixth receipt field extends the pairs instead of the chain. */
+function firstRecoveryReceiptMismatch(
+  receipt: RemediationRecoveryReceipt,
+  authorityRunId: OrchestrationRunId,
+  failure: RemediationRecoveryFailure,
+): RecoveryReceiptMismatchField | null {
+  const pairs: readonly [RecoveryReceiptMismatchField, unknown, unknown][] = [
+    ["runId", receipt.runId, authorityRunId],
+    ["recoveryAttemptId", receipt.recoveryAttemptId, failure.recoveryAttemptId],
+    ["effectId", receipt.effectId, failure.effectId],
+    ["predecessorState", receipt.predecessorState, failure.predecessorState],
+    ["witnessDigest", receipt.witnessDigest, failure.witnessDigest],
+  ];
+  for (const [field, actual, expected] of pairs) {
+    if (actual !== expected) return field;
+  }
+  return null;
+}
+
 function parseRecoveryReceipt(raw: unknown): DomainResult<RemediationRecoveryReceipt, string> {
   const record = exactRecord(raw, [
     "kind", "receiptId", "recoveryAttemptId", "runId", "effectId", "predecessorState", "witnessDigest", "digest",
@@ -2496,12 +2520,7 @@ function reduceParserMintedRemediation(
     if (state.consumedRecoveryReceiptIds.includes(receipt.value.receiptId)) {
       return transitionFailure(state, event, "invalid-recovery-receipt", "receipt.receiptId", "recovery receipt is stale or already consumed");
     }
-    const mismatch = receipt.value.runId !== state.authority.runId ? "runId"
-      : receipt.value.recoveryAttemptId !== state.failure.recoveryAttemptId ? "recoveryAttemptId"
-      : receipt.value.effectId !== state.failure.effectId ? "effectId"
-      : receipt.value.predecessorState !== state.failure.predecessorState ? "predecessorState"
-      : receipt.value.witnessDigest !== state.failure.witnessDigest ? "witnessDigest"
-      : null;
+    const mismatch = firstRecoveryReceiptMismatch(receipt.value, state.authority.runId, state.failure);
     if (mismatch !== null) {
       return transitionFailure(state, event, "invalid-recovery-receipt", `receipt.${mismatch}`, `recovery receipt is stale or foreign: ${mismatch} mismatch`);
     }

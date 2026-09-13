@@ -13,7 +13,11 @@
  * drift into disagreeing about which results are admissible — the drift the
  * shared rules module was written to prevent, reintroduced one layer down.
  * Each adapter therefore contributes only what is genuinely harness-native: how
- * to observe an Agent's final payload, and what its own correlator is.
+ * to observe an Agent's final payload, what its own correlator is, and the
+ * preliminary responsibilities each capture performs before that observation —
+ * resolving the issued request against its registration, parsing the claimed
+ * registration, and resource-bounding final-payload selection before any
+ * transcript work.
  */
 
 import { match } from "ts-pattern";

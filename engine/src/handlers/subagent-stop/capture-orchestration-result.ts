@@ -240,10 +240,10 @@ export async function captureClaudeResult(
           : "program registration does not name a registered orchestration program";
         return captureUnavailable("program-registration", `program registration is unavailable: ${problem}`);
       }
-      const successor = parsedRegistration?.program.kind === "standalone-review" &&
-        parsedRegistration.program.schemaVersion === 3;
-      const bounded = successor || raw === null;
-      return captureCandidates(bounded && readPayload === claudeFinalPayloadCandidates
+      // Every current capture is bounded before decoding. The old unbounded
+      // readFileSync branch admitted the impossible foreign escape, because the
+      // correlated request carries no schema version to compare against.
+      return captureCandidates(readPayload === claudeFinalPayloadCandidates
         ? claudeFinalPayloadCandidates(transcriptPath, 16_777_216) : readPayload(transcriptPath));
     } catch (error) {
       if (error instanceof ClaudeTranscriptReadError) {

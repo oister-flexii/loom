@@ -192,8 +192,10 @@ source contents and binary/base64 fields. V1/v2 binary-file selection and any
 invalid UTF-8 fail; v3 frozen source uses a binary representation for byte fidelity,
 but explicit `--file` selection returns it when fatal UTF-8 decoding succeeds.
 The helper uses existing no-follow regular-file reads, fatal UTF-8, the packet
-parser and expected identity checks. Its 128 MiB input/48 KiB output limits are
-helper resource bounds, not changes to protocol admission. Missing tools/paths,
+parser and expected identity checks. Its 128 MiB input limit is a legacy
+v1/v2-selection ceiling (successor Context Packets are already bounded smaller
+by the protocol) and the 48 KiB output limit is a helper resource bound, not a
+change to protocol admission. Missing tools/paths,
 unsafe filesystem entries, invalid digests/identity or page bounds fail visibly.
 References remain data: no execution, network, frozen-file writes, Run/state/index
 mutation, or authority minting. Supplied expected IDs are not independent
