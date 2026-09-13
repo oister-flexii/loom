@@ -95,7 +95,76 @@ describe.sequential("bounded successor source observation", () => {
         },
       });
       expect(observed).toEqual({ ok: false, message: "successor source unavailable: successor source first changed during observation" });
-      expect(heads).toBe(0);
+      expect(heads).toBe(1);
+    });
+  });
+
+  it("keeps Git/reviewer metadata inside the final source stability window", async () => {
+    const p = root(); await owned(p, async () => {
+      const { observeStableStandaloneSuccessorSource } = await import("../../../../src/handlers/helpers/programs/standalone-successor-source");
+      writeFileSync("source.ts", "old");
+      const changedDuringMetadata = observeStableStandaloneSuccessorSource(["source.ts"], () => {
+        writeFileSync("source.ts", "new metadata-era bytes");
+        return { headRevision: "a".repeat(40), value: { additions: 1 } };
+      });
+      expect(changedDuringMetadata).toEqual({
+        ok: false,
+        message: "successor source unavailable: successor source source.ts changed during observation",
+      });
+
+      rmSync("missing.ts", { force: true });
+      const appearedDuringMetadata = observeStableStandaloneSuccessorSource(["missing.ts"], () => {
+        writeFileSync("missing.ts", "appeared");
+        return { headRevision: "a".repeat(40), value: { additions: 1 } };
+      });
+      expect(appearedDuringMetadata).toEqual({
+        ok: false,
+        message: "successor source unavailable: successor source missing.ts changed during observation",
+      });
+    });
+  });
+
+  it("rejects forged frozen-source section identity and malformed source facts", async () => {
+    const p = root(); await owned(p, async () => {
+      const { encodeByteSection } = await import("../../../../src/core/context-packets");
+      const { observeStandaloneSuccessorSource, successorSourceSnapshot, SUCCESSOR_SOURCE_BYTES } =
+        await import("../../../../src/handlers/helpers/programs/standalone-successor-source");
+      writeFileSync("source.ts", "bytes");
+      const section = observeStandaloneSuccessorSource(["source.ts"], () => "a".repeat(40));
+      if (!section.ok) throw new Error(section.message);
+      const source = JSON.parse(Buffer.from(section.value.bytes).toString()) as {
+        schemaVersion: number;
+        headRevision: string;
+        files: Record<string, unknown>[];
+      };
+      const binary = source.files[0]!;
+
+      for (const forged of [
+        { ...section.value, label: "other" },
+        { ...section.value, byteLength: section.value.byteLength + 1 },
+        { ...section.value, digest: "f".repeat(64) },
+      ]) {
+        expect(successorSourceSnapshot(forged as never, ["source.ts"]).ok).toBe(false);
+      }
+
+      const mutations: unknown[] = [
+        { ...source, extra: true },
+        { ...source, schemaVersion: 1 },
+        { ...source, headRevision: "not-a-revision" },
+        { ...source, files: [] },
+        { ...source, files: [{ ...binary, path: "other.ts" }] },
+        { ...source, files: [{ ...binary, mode: "100777" }] },
+        { ...source, files: [{ ...binary, contentBase64: "%%%" }] },
+        { ...source, files: [{ ...binary, byteLength: 99 }] },
+        { ...source, files: [{ ...binary, digest: "f".repeat(64) }] },
+        { ...source, files: [{ ...binary, byteLength: SUCCESSOR_SOURCE_BYTES + 1 }] },
+        { ...source, files: [{ path: "source.ts", kind: "absent", digest: null, byteLength: 0, extra: true }] },
+      ];
+      for (const mutation of mutations) {
+        const encoded = encodeByteSection("standalone-frozen-source", JSON.stringify(mutation));
+        if (!encoded.ok) throw new Error(encoded.error.message);
+        expect(successorSourceSnapshot(encoded.value, ["source.ts"]).ok).toBe(false);
+      }
     });
   });
 });

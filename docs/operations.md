@@ -362,9 +362,10 @@ source lane. Preflight refuses unsupported bounds/scope/roles before issuance.
 
 The engine observes exact source bytes, digest/length and normalized Git executable
 mode (`100644`/`100755`), or anchored-safe observed absence, before freezing both
-current attempts. Absence validates every extant parent without following symlinks;
-a final whole-scope stat/absence pass rejects torn multi-file observations before
-HEAD is read. Historical v1/v2 modes remain unknown (`null`); genuinely missing old source facts
+current attempts. Absence validates every extant parent without following symlinks. HEAD,
+changed-path facts, additions, and reviewer-selection metadata are derived inside
+the source observation window; a final whole-scope stat/absence pass rejects drift
+before authority is encoded. Historical v1/v2 modes remain unknown (`null`); genuinely missing old source facts
 stay `historical-unknown`. Missing expected current source never becomes historical
 absence. Same HEAD is not byte equality; different HEAD is not repair. Deleted or
 renamed files keep the original Finding location and must not disappear from scope.
@@ -413,8 +414,9 @@ duplicates remain refused. Resume/replay alone cannot synthesize this recovery, 
 no additional Agent roster or semantic attempt is authorized. Retain the failure
 evidence; never hand-write an observation or receipt. Missing expected Run metadata
 is not recreated by native reads. Pi adds current-session process witnesses:
-only the current Run for the root can verify, rejection never falls back, acceptance
-is idempotent and retires older witnesses, and shutdown prunes the session.
+the first exact standalone spawn binding selects the current Run for the root before
+capture, rejection never falls back, acceptance is idempotent and retires older
+witnesses, and shutdown prunes the session.
 
 Issued `LOOM_CONTEXT_READ_COMMAND` selects v3 with `--purpose standalone-successor`.
 Use bounded `--section`, `--file`, `--offset`/`--limit` pages, and explicit
@@ -457,6 +459,7 @@ source resolution status.
 |---|---:|
 | Source regular file / aggregate raw bytes / paths | 512 KiB / 2 MiB / 4096 |
 | Prepared lineage + current source + predecessor-section payload | 4 MiB before packet byte arrays |
+| Canonical serialized successor packet | 16 MiB exact pre-issuance ceiling |
 | Retained predecessor-section payload | 2 MiB, at most 15 sections |
 | Exact predecessor packet observations | 64 MiB, charged to carried traversal allowance |
 | Individual retained context/registration/result/source read; start/submit stdin | 16 MiB |
@@ -469,7 +472,7 @@ source resolution status.
 | Reader page / index / encoded output | 4096 UTF-16 units / 32 entries / 48 KiB |
 | Current Claude transcript before decoding | 16 MiB |
 | Current Pi decoded transcript before adapter copying | 16 MiB text/key bytes, 65,536 values, depth 32 |
-| Current panel readable view | 16 MiB; 4096-unit display lines |
+| Current panel readable view | 16 MiB; 4096 UTF-16-unit display lines, never split inside a Unicode surrogate pair |
 
 Request reads also cap at 16 KiB/128 entries; captured slots at 128 with bounded
 per-slot enumeration. Native write-ahead observations cap at 16 KiB and are inert

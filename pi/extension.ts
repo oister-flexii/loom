@@ -239,6 +239,29 @@ const trustedReviewRuns = new Map<string, Map<string, TrustedReviewRoot>>();
 const trustedRunIdentity = ({ runsRoot, runDirectory }: Pick<SessionRunBinding, "runsRoot" | "runDirectory">): string =>
   `${runsRoot}\0${runDirectory}`;
 
+/** First exact standalone spawn selects the current run; retries never reorder runs. */
+function touchTrustedReviewRun(sessionId: string, binding: SessionRunBinding): void {
+  const sessionRoots = trustedReviewRuns.get(sessionId) ?? new Map<string, TrustedReviewRoot>();
+  trustedReviewRuns.set(sessionId, sessionRoots);
+  const rootIdentity = resolve(binding.runsRoot);
+  const root = sessionRoots.get(rootIdentity) ?? Object.freeze({
+    nextTouch: 1,
+    runs: new Map<string, TrustedReviewRun>(),
+  });
+  const identity = trustedRunIdentity(binding);
+  const previous = root.runs.get(identity);
+  const runs = new Map(root.runs);
+  runs.set(identity, Object.freeze({
+    binding,
+    captures: previous?.captures ?? new Map<CaptureKey, TrustedReviewCapture>(),
+    touchedAt: previous?.touchedAt ?? root.nextTouch,
+  }));
+  sessionRoots.set(rootIdentity, Object.freeze({
+    nextTouch: previous === undefined ? root.nextTouch + 1 : root.nextTouch,
+    runs,
+  }));
+}
+
 /**
  * Fail-closed path existence check. Returns `true` (assume active) for any
  * access error other than ENOENT — prevents EACCES, ELOOP, and other
@@ -466,8 +489,15 @@ function rememberTrustedReviewCapture(
     }),
   );
   const runs = new Map(root.runs);
-  runs.set(identity, Object.freeze({ binding, captures, touchedAt: root.nextTouch }));
-  sessionRoots.set(rootIdentity, Object.freeze({ nextTouch: root.nextTouch + 1, runs }));
+  runs.set(identity, Object.freeze({
+    binding,
+    captures,
+    touchedAt: previousRun?.touchedAt ?? root.nextTouch,
+  }));
+  sessionRoots.set(rootIdentity, Object.freeze({
+    nextTouch: previousRun === undefined ? root.nextTouch + 1 : root.nextTouch,
+    runs,
+  }));
 }
 
 function environmentRunBinding(): SessionRunBinding | null {
@@ -599,6 +629,9 @@ export async function recordPiSpawnCorrelators(
     consumed.add(request.requestId);
   }
   for (const [index, task] of canonicalTasks.entries()) replacePiSpawnTask(rawInput, index, task);
+  if (items.some(({ task }) => hasStandaloneReviewContext(task))) {
+    touchTrustedReviewRun(rawSessionId, runBinding);
+  }
   return runBinding;
 }
 

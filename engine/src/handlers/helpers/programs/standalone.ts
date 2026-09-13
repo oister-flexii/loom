@@ -7,7 +7,7 @@
 import { createHash } from 'node:crypto';
 import { STANDALONE_REVIEWER_PROTOCOL_V3 } from '../../../core/standalone-lineage-contract';
 import { prepareStandaloneSuccessorSource, readStandaloneSuccessorAuthority } from './standalone-source';
-import { boundedStandaloneReadHandle, observeStandaloneSuccessorSource } from './standalone-successor-source';
+import { boundedStandaloneReadHandle, observeStableStandaloneSuccessorSource } from './standalone-successor-source';
 import type { StandaloneSuccessorStartInput, RegisteredStandaloneSuccessorProgram } from './standalone-successor-registration';
 import { admitCapturedStandaloneTranscript, readStandaloneCaptureWitnesses, replayStandaloneCliCaptures, standaloneRefutationPreparation, type StandaloneCaptureWitness, type StandaloneEvidenceReplayResult } from './standalone-evidence';
 // Retain existing caller entry points, not the union of the evidence volume's internal exports.
@@ -23,7 +23,7 @@ import { completePersistentRefutationPanel, panelRequestIdentity, refutationPane
 import { readRunBytesNoFollow, writeRunBytesExclusiveNoFollow } from '../../../orchestration/no-follow-fs';
 import { captureKey } from '../../../core/harness-capture';
 import { type RunDirHandle } from '../../../orchestration/run-directory-handle';
-import { standaloneReviewerProtocolResolver, readPublishedStandaloneResult, gitText, deriveChangedPaths, durableCaptureRejection, durablePublicationDigest, durableRefutationRequests, durableRequests, executableRefutationRequests, failed, metadata, readRegisteredStandaloneAuthority, publicationFile, publicationResolver, publishInitialBatch, recoverOrPublishRefutationRetry, recoverOrPublishStandaloneRetry, refutationRejectionDiagnostic, renderSpawnTask, safeScope, standalonePackets, standalonePublicationEffectId, standaloneRetryTask, type FacadeDriveResult, type ProgramParse, type RegisteredStandaloneProgram } from './helpers';
+import { standaloneReviewerProtocolResolver, readPublishedStandaloneResult, deriveChangedPaths, durableCaptureRejection, durablePublicationDigest, durableRefutationRequests, durableRequests, executableRefutationRequests, failed, metadata, readRegisteredStandaloneAuthority, publicationFile, publicationResolver, publishInitialBatch, recoverOrPublishRefutationRetry, recoverOrPublishStandaloneRetry, refutationRejectionDiagnostic, renderSpawnTask, safeScope, standalonePackets, standalonePublicationEffectId, standaloneRetryTask, type FacadeDriveResult, type ProgramParse, type RegisteredStandaloneProgram } from './helpers';
 
 const preparedSuccessorStarts = new WeakSet<object>();
 
@@ -58,11 +58,16 @@ export async function prepareStandaloneSuccessorFacadeStart(runsRoot: string, ru
   try {
     const destination = parseRunDirectoryReference(runsRoot, run);
     if (!destination.ok) return { ok: false as const, message: destination.error.message };
-    const source = observeStandaloneSuccessorSource(input.files, () => gitText(["rev-parse", "HEAD"]));
+    const source = observeStableStandaloneSuccessorSource(input.files, () => {
+      const changed = deriveChangedPaths();
+      return {
+        headRevision: changed.authority.head_revision,
+        value: Object.freeze({ changed, reviewMetadata: metadata(input.kind, input.files, changed) }),
+      };
+    });
     if (!source.ok) return source;
-    const changed = deriveChangedPaths();
-    const reviewMetadata = metadata(input.kind, input.files, changed);
-    const lineage = await prepareStandaloneSuccessorSource(input, destination.value.runId, source.value, reviewMetadata,
+    const { changed, reviewMetadata } = source.value.observation;
+    const lineage = await prepareStandaloneSuccessorSource(input, destination.value.runId, source.value.source, reviewMetadata,
       { visited: [destination.value.runDirectory], remaining: 64 * 1024 * 1024 });
     if (!lineage.ok) return lineage;
     const prepared = prepareFreshStandaloneReview({ runId: destination.value.runId, explicitScope: input.files,
@@ -71,7 +76,7 @@ export async function prepareStandaloneSuccessorFacadeStart(runsRoot: string, ru
       reviewMetadata: preparationMetadata(reviewMetadata) });
     if (!prepared.ok) return { ok: false as const, message: prepared.error.errors.join("; ") };
     const registration: RegisteredStandaloneSuccessorProgram = Object.freeze({ schemaVersion: 3, kind: "standalone-review",
-      reviewerProtocol: STANDALONE_REVIEWER_PROTOCOL_V3, input, currentSource: source.value,
+      reviewerProtocol: STANDALONE_REVIEWER_PROTOCOL_V3, input, currentSource: source.value.source,
       previousContexts: Object.freeze(lineage.value.packets[0]!.variableContext.slice(1)),
       authority: JSON.parse(serializeStandaloneReviewAuthority(prepared.value.authority), (_key: string, value: unknown) =>
         typeof value === "object" && value !== null ? Object.freeze(value) : value) });

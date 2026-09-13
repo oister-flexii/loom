@@ -81,8 +81,9 @@ Relevant dependencies/configuration/contracts belong in the selected frozen scop
 there is no mutable-live or implicit transitive context lane. Current source records
 bind byte digest, byte length and normalized Git mode `100644`/`100755`, or actual
 anchored-safe observed absence. Every extant parent component is checked without
-following symlinks, and a final whole-scope stability pass rejects torn multi-file
-observations before HEAD is read. Legacy known bytes retain unknown mode; genuinely unavailable old
+following symlinks. HEAD, changed-path facts, additions, and reviewer-selection
+metadata are derived inside the same observation window, then a final whole-scope
+stability pass rejects drift before authority is encoded. Legacy known bytes retain unknown mode; genuinely unavailable old
 observations stay historical-unknown. Never substitute current source for missing
 history, or missing expected current source for historical absence. HEAD/ancestry
 is provenance, not source equality, repair or applicability.
@@ -156,9 +157,10 @@ receipt. Missing/changed evidence or any existing contradictory receipt refuses;
 already-receipted duplicates remain refused. No new semantic attempt or reviewer
 roster is granted. Current resume/inspection/source replay still require real receipts
 and original publication.
-Pi additionally requires its current-session witnesses, rechecks after asynchronous
-authentication, never falls back to an older Run, retires older accepted witnesses
-and prunes on shutdown. Native reads do not recreate missing Run metadata.
+Pi additionally requires its current-session witnesses, records the current Run when
+its first exact standalone spawn is bound (before child dispatch or capture), rechecks
+after asynchronous authentication, never falls back to an older Run, retires older
+accepted witnesses and prunes on shutdown. Native reads do not recreate missing Run metadata.
 
 Both current attempts are frozen/recoverable from authenticated registration and
 source. If a v3 start stops after registration but before initial-batch publication,
@@ -203,7 +205,8 @@ Actual Repair-Checked does not mutate the source's active Finding or history.
 
 [Operations](../operations.md#resource-and-compatibility-boundaries) pins the actual
 simultaneous limits: 512 KiB/file, 2 MiB raw source, 4096 paths/origins, 4 MiB packet
-payload before byte arrays, 2 MiB/15 predecessor sections, 16 MiB retained reads and
+payload before byte arrays plus an exact 16 MiB canonical serialized-packet ceiling,
+2 MiB/15 predecessor sections, 16 MiB retained reads and
 start/submit input, 64-Run/cycle/64 MiB carried traversal controls, and 64 historical decisions
 per origin/review generations/policy revisions. Response limits remain 1 MiB/depth
 32/128 new drafts/4096 priors. Disposition prose is capped at 65,536 UTF-8 bytes.

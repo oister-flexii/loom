@@ -74,8 +74,9 @@ function inspectPublication(handle: RunDirHandle, registration: RegisteredStanda
   }
   let published: PublishedStandaloneDisposition | null = null;
   if (receipt !== null) {
+    if (artifact === null) throw new Error("receipt has no exact artifact");
     const next = reduceStandaloneDisposition(registration, state, { kind: "receipt-recorded", receipt });
-    if (!next.ok || artifact === null) throw new Error(next.ok ? "receipt has no exact artifact" : next.error.message);
+    if (!next.ok) throw new Error(next.error.message);
     const reference = { locator: handle.runDirectory, runId: handle.runId, dispositionDigest: prepared.digest };
     const confirmed = readPublishedStandaloneDisposition(prepared, reference, lookup =>
       canonicalStructuralEquals(lookup, reference)

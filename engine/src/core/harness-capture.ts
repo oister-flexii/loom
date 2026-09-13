@@ -41,13 +41,10 @@ export const CAPTURE_SCHEMA_VERSION = 1;
 /**
  * Why a result could not be accepted BY THESE RULES.
  *
- * This is the core vocabulary only. Harness adapters mint observation reasons:
- * Claude owns `transcript-json` and `transcript-locator`; Pi owns
- * `transcript-shape`, `agent-failed`, and `capture-crashed`. The shared
- * run-directory runtime owns `run-authority`, `run-directory`, `correlator`,
- * `requests`, `context`, `context-binding`, `transcript`, `wrong-agent-role`,
- * and `rejection-persistence`. `CaptureOutcome.reason` is therefore a wider
- * string, and an adapter/runtime reason is not a violation of this union.
+ * This union is only the pure request/payload rejection vocabulary.
+ * Harness observation and run-directory failures belong to `CaptureOutcome`
+ * and its boundary constructors in `harness-capture-runtime`; those diagnostics
+ * intentionally remain wider than this domain union.
  */
 export type CaptureRejectionReason =
   | "no-final-payload"

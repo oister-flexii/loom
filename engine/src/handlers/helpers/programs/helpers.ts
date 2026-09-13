@@ -142,10 +142,10 @@ export type DerivedChangedPaths = Readonly<{
 }>;
 
 /**
- * Fail CLOSED on a path this repository's own parser cannot canonicalize: a
- * path we cannot name is a path we cannot prove is not run evidence, and
- * admitting it would put a Run Directory's own transcripts into the frozen
- * review scope. Exclusion is the safe answer; the reviewed set only shrinks.
+ * Changed-path discovery omits paths this repository cannot canonicalize and
+ * excludes orchestration evidence from the derived review scope. Callers that
+ * require explicit complete coverage must supply and parse that scope instead
+ * of treating this filter as rejection authority.
  */
 export function reviewablePath(path: string): boolean {
   const parsed = parseCanonicalRepositoryRelativePath(path, "standalone review scope path");

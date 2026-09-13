@@ -2,7 +2,7 @@
 import { lstatSync, type Stats } from "node:fs";
 import { createHash } from "node:crypto";
 import { readRunBytesNoFollow } from "../../../orchestration/no-follow-fs";
-import { encodeByteSection, type ByteSection, type StandaloneReviewerContextPacketV3 } from "../../../core/context-packets";
+import { encodeByteSection, serializeStandaloneReviewerContextPacketV3, type ByteSection, type StandaloneReviewerContextPacketV3 } from "../../../core/context-packets";
 import { parseBoundedReviewerJson } from "../../../core/reviewer-protocol";
 import { canonicalStructuralEquals, parseRequestId, parseOrchestrationRunId, AGENT_REQUIRED_SKILLS } from "../../../core/orchestration-contract";
 import { STANDALONE_LINEAGE_LIMITS, standaloneSuccessorSelectionSchema, type StandaloneSnapshot } from "../../../core/standalone-lineage-contract";
@@ -42,17 +42,22 @@ const sourceObservationOperations: SourceObservationOperations = Object.freeze({
   read: readRunBytesNoFollow,
 });
 const sourceChanged = (path: string) => new Error(`successor source ${path} changed during observation`);
-function confirmAnchoredAbsence(path: string, operations: SourceObservationOperations): void {
+function confirmAnchoredAbsence(path: string, operations: SourceObservationOperations, previouslyAbsent = false): void {
   try {
     operations.read(path, 0);
   } catch (cause) {
     if ((cause as NodeJS.ErrnoException).code === "ENOENT") return;
-    throw cause;
+    if (!previouslyAbsent) throw cause;
   }
   throw sourceChanged(path);
 }
-export function observeStandaloneSuccessorSource(scope: readonly string[], readHeadRevision: () => string,
-  operations: SourceObservationOperations = sourceObservationOperations): ProgramParse<ByteSection> {
+export function observeStableStandaloneSuccessorSource<T>(scope: readonly string[], observeAuthority: () => Readonly<{
+  headRevision: string;
+  value: T;
+}>, operations: SourceObservationOperations = sourceObservationOperations): ProgramParse<Readonly<{
+  source: ByteSection;
+  observation: T;
+}>> {
   if (scope.length > STANDALONE_LINEAGE_LIMITS.paths) return fail("successor source exceeds path budget");
   try {
     let remaining = SUCCESSOR_SOURCE_BYTES;
@@ -81,10 +86,14 @@ export function observeStandaloneSuccessorSource(scope: readonly string[], readH
       return Object.freeze({ path, kind: "binary" as const, digest: hash(bytes), byteLength: bytes.length,
         contentBase64: bytes.toString("base64"), mode: (before.mode & 0o111) === 0 ? "100644" as const : "100755" as const });
     });
+    // Git changed-path and reviewer-selection metadata belong inside the same
+    // stability window as the bytes they describe. A mutation during these
+    // subprocesses is detected by the final whole-scope pass below.
+    const observed = observeAuthority();
     for (const path of scope) {
       const before = initialStats.get(path);
       if (before === null) {
-        confirmAnchoredAbsence(path, operations);
+        confirmAnchoredAbsence(path, operations, true);
         continue;
       }
       if (before === undefined) throw new Error(`successor source ${path} lacks an initial observation`);
@@ -95,12 +104,30 @@ export function observeStandaloneSuccessorSource(scope: readonly string[], readH
         throw cause;
       }
     }
-    const section = encodeByteSection("standalone-frozen-source", JSON.stringify({ schemaVersion: 2, headRevision: readHeadRevision(), files }));
-    return section.ok ? section : fail(section.error.message);
+    const section = encodeByteSection("standalone-frozen-source", JSON.stringify({
+      schemaVersion: 2,
+      headRevision: observed.headRevision,
+      files,
+    }));
+    return section.ok
+      ? { ok: true, value: Object.freeze({ source: section.value, observation: observed.value }) }
+      : fail(section.error.message);
   } catch (cause) { return fail(`successor source unavailable: ${cause instanceof Error ? cause.message : String(cause)}`); }
 }
 
+export function observeStandaloneSuccessorSource(scope: readonly string[], readHeadRevision: () => string,
+  operations: SourceObservationOperations = sourceObservationOperations): ProgramParse<ByteSection> {
+  const observed = observeStableStandaloneSuccessorSource(scope, () => ({
+    headRevision: readHeadRevision(),
+    value: null,
+  }), operations);
+  return observed.ok ? { ok: true, value: observed.value.source } : observed;
+}
+
 export function successorSourceSnapshot(section: ByteSection, scope: readonly string[]): ProgramParse<StandaloneSnapshot> {
+  if (section.label !== "standalone-frozen-source" || section.byteLength !== section.bytes.length || hash(Uint8Array.from(section.bytes)) !== section.digest) {
+    return fail("frozen successor source section identity differs from its exact bytes");
+  }
   const decoded = parseBoundedReviewerJson(Uint8Array.from(section.bytes), SUCCESSOR_CONTEXT_PAYLOAD_BYTES);
   if (!decoded.ok) return fail(decoded.error.message);
   const raw = decoded.value;
@@ -127,6 +154,14 @@ export function successorSourceSnapshot(section: ByteSection, scope: readonly st
   return parsed.success ? { ok: true, value: parsed.data.snapshot } : fail("frozen successor source has invalid paths");
 }
 
+export function admitStandaloneSuccessorPacketSize(packet: StandaloneReviewerContextPacketV3): ProgramParse<StandaloneReviewerContextPacketV3> {
+  const serialized = serializeStandaloneReviewerContextPacketV3(packet);
+  if (!serialized.ok) return fail(serialized.error.message);
+  return Buffer.byteLength(serialized.value, "utf8") <= STANDALONE_LINEAGE_LIMITS.retainedBytes
+    ? { ok: true, value: packet }
+    : fail(`successor packet exceeds ${STANDALONE_LINEAGE_LIMITS.retainedBytes} serialized byte budget`);
+}
+
 export function standaloneSuccessorPackets(prepared: PreparedStandaloneSuccessor, currentSource: ByteSection,
   previousContexts: readonly ByteSection[]): ProgramParse<Readonly<{
     packets: readonly StandaloneReviewerContextPacketV3[]; contexts: readonly Readonly<{ attempts: readonly [string, string] }>[];
@@ -149,7 +184,9 @@ export function standaloneSuccessorPackets(prepared: PreparedStandaloneSuccessor
       const packet = buildStandaloneSuccessorReviewerContext(prepared, { runId: run.value, requestId: id.value, role, attempt,
         requiredSkill: AGENT_REQUIRED_SKILLS[role] ?? null }, [currentSource, ...previousContexts]);
       if (!packet.ok) return fail(packet.error.message);
-      packets.push(packet.value); attempts.push(packet.value.digest);
+      const bounded = admitStandaloneSuccessorPacketSize(packet.value);
+      if (!bounded.ok) return bounded;
+      packets.push(bounded.value); attempts.push(bounded.value.digest);
     }
     contexts.push(Object.freeze({ attempts: Object.freeze([attempts[0]!, attempts[1]!]) as readonly [string, string] }));
   }

@@ -161,7 +161,7 @@ The exact parsed immutable generation record beside one session's `.task_graph` 
 _Avoid_: Pointer owner flag, shared pointer, best-effort rollback
 
 **Trusted Review Witness Aggregate**:
-The process-local Pi authority grouped by session, Standalone Review root, and Review Run, with explicit touch recency. Verification considers only the current run for that root; rejection never falls back, exact acceptance is idempotent and retires older root witnesses, and session shutdown prunes the session aggregate.
+The process-local Pi authority grouped by session, Standalone Review root, and Review Run. A run becomes current when its first exact standalone spawn is bound before dispatch; retries and later captures enrich that run without reordering it. Verification considers only the current run for that root; rejection or missing capture never falls back, exact acceptance is idempotent and retires older root witnesses, and session shutdown prunes the session aggregate.
 _Avoid_: Review cache, accepted result fallback, global witness map
 
 **Plan**:
@@ -385,7 +385,7 @@ _Avoid_: Constraint (too generic), rule (alone), enforced guideline (advisory ru
 - A Task-scoped **Completion Suite Result** binds to one **Implementation Attempt**; a Wave-scoped result binds to a quiescent Wave workspace
 - Review Agents consume one immutable **Review Packet** per Task
 - A **Session TaskGraph Pointer Lease Registry** restores its previous target only after the generation's final exact lease is released
-- A **Trusted Review Witness Aggregate** verifies only the most recently touched Standalone Review Run for one session/root and is pruned at session shutdown
+- A **Trusted Review Witness Aggregate** verifies only the latest first-bound Standalone Review Run for one session/root; retries/captures never reorder runs, and session shutdown prunes the aggregate
 - A **Review Run** binds that Review Packet to one **Review Generation**, the expected review Agents, and all prior active Finding IDs
 - A **Resolved Finding** leaves the active set only when every Agent in its Review Run explicitly verifies remediation; any `still_present` assessment keeps it active
 - A **Panel Program** emits the exact Agent batches and engine operations for each panel
