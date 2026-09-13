@@ -42,6 +42,7 @@ const sourceObservationOperations: SourceObservationOperations = Object.freeze({
   read: readRunBytesNoFollow,
 });
 const sourceChanged = (path: string) => new Error(`successor source ${path} changed during observation`);
+const authorityChanged = () => new Error("successor Git/reviewer authority changed during observation");
 function confirmAnchoredAbsence(path: string, operations: SourceObservationOperations, previouslyAbsent = false): void {
   try {
     operations.read(path, 0);
@@ -54,6 +55,7 @@ function confirmAnchoredAbsence(path: string, operations: SourceObservationOpera
 export function observeStableStandaloneSuccessorSource<T>(scope: readonly string[], observeAuthority: () => Readonly<{
   headRevision: string;
   value: T;
+  stability?: Readonly<{ witness: unknown; observe: () => unknown }>;
 }>, operations: SourceObservationOperations = sourceObservationOperations): ProgramParse<Readonly<{
   source: ByteSection;
   observation: T;
@@ -86,24 +88,32 @@ export function observeStableStandaloneSuccessorSource<T>(scope: readonly string
       return Object.freeze({ path, kind: "binary" as const, digest: hash(bytes), byteLength: bytes.length,
         contentBase64: bytes.toString("base64"), mode: (before.mode & 0o111) === 0 ? "100644" as const : "100755" as const });
     });
-    // Git changed-path and reviewer-selection metadata belong inside the same
-    // stability window as the bytes they describe. A mutation during these
-    // subprocesses is detected by the final whole-scope pass below.
+    const confirmSource = () => {
+      for (const path of scope) {
+        const before = initialStats.get(path);
+        if (before === null) {
+          confirmAnchoredAbsence(path, operations, true);
+          continue;
+        }
+        if (before === undefined) throw new Error(`successor source ${path} lacks an initial observation`);
+        try {
+          if (!sameStat(before, operations.lstat(path))) throw sourceChanged(path);
+        } catch (cause) {
+          if ((cause as NodeJS.ErrnoException).code === "ENOENT") throw sourceChanged(path);
+          throw cause;
+        }
+      }
+    };
+    // One Git command sequence can straddle a ref/index transition without
+    // changing scoped file stats. Production supplies a compact witness around
+    // that derivation; generic callers repeat their complete observation.
     const observed = observeAuthority();
-    for (const path of scope) {
-      const before = initialStats.get(path);
-      if (before === null) {
-        confirmAnchoredAbsence(path, operations, true);
-        continue;
-      }
-      if (before === undefined) throw new Error(`successor source ${path} lacks an initial observation`);
-      try {
-        if (!sameStat(before, operations.lstat(path))) throw sourceChanged(path);
-      } catch (cause) {
-        if ((cause as NodeJS.ErrnoException).code === "ENOENT") throw sourceChanged(path);
-        throw cause;
-      }
-    }
+    confirmSource();
+    const stable = observed.stability === undefined
+      ? canonicalStructuralEquals(observed, observeAuthority())
+      : canonicalStructuralEquals(observed.stability.witness, observed.stability.observe());
+    if (!stable) throw authorityChanged();
+    confirmSource();
     const section = encodeByteSection("standalone-frozen-source", JSON.stringify({
       schemaVersion: 2,
       headRevision: observed.headRevision,

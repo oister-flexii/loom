@@ -174,6 +174,31 @@ describe.sequential("actual standalone successor CLI lifecycle", { timeout: 60_0
       const original = readFileSync(sourceProgram); writeFileSync(sourceProgram, "{}");
       const validInput = value(f.helpers.parseStandaloneStartInput(base));
       if (!("schemaVersion" in validInput)) throw Error("successor expected");
+
+      const originalHead = spawnSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).stdout.trim();
+      const committed = spawnSync("git", ["commit", "--allow-empty", "-qm", "concurrent head"], { cwd: root, encoding: "utf8" });
+      expect(committed.status, committed.stderr).toBe(0);
+      const concurrentHead = spawnSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).stdout.trim();
+      expect(spawnSync("git", ["update-ref", "HEAD", originalHead], { cwd: root }).status).toBe(0);
+      const shim = join(root, "git-shim"); mkdirSync(shim);
+      const realGit = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim();
+      const marker = join(shim, "advanced");
+      writeFileSync(join(shim, "git"), `#!/bin/sh\nif [ "$1" = rev-parse ] && [ "$2" = HEAD ] && [ ! -e "$LOOM_GIT_MARKER" ]; then\n  "$LOOM_REAL_GIT" "$@"\n  status=$?\n  : > "$LOOM_GIT_MARKER"\n  "$LOOM_REAL_GIT" update-ref HEAD "$LOOM_CONCURRENT_HEAD"\n  exit $status\nfi\nexec "$LOOM_REAL_GIT" "$@"\n`);
+      chmodSync(join(shim, "git"), 0o755);
+      const previousPath = process.env.PATH;
+      Object.assign(process.env, { PATH: `${shim}:${previousPath ?? ""}`, LOOM_REAL_GIT: realGit,
+        LOOM_GIT_MARKER: marker, LOOM_CONCURRENT_HEAD: concurrentHead });
+      try {
+        const drifting = await f.shell.prepareStandaloneSuccessorFacadeStart(join(root, "runs"), "head-drift", validInput);
+        expect(drifting).toEqual({ ok: false,
+          message: "successor source unavailable: successor Git/reviewer authority changed during observation" });
+        expect(existsSync(join(root, "runs/head-drift"))).toBe(false);
+      } finally {
+        if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
+        delete process.env.LOOM_REAL_GIT; delete process.env.LOOM_GIT_MARKER; delete process.env.LOOM_CONCURRENT_HEAD;
+        expect(spawnSync("git", ["update-ref", "HEAD", originalHead], { cwd: root }).status).toBe(0);
+      }
+
       expect((await f.shell.prepareStandaloneSuccessorFacadeStart(join(root, "runs"), "corrupt", validInput)).ok).toBe(false);
       expect(existsSync(join(root, "runs/corrupt"))).toBe(false); writeFileSync(sourceProgram, original);
     });

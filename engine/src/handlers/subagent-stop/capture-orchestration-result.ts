@@ -229,10 +229,21 @@ export async function captureClaudeResult(
     try {
       const correlated = resolveCorrelatedRequest({ harness: "claude", runsRoot, runDirectory, nativeId: input.agent_id ?? "" });
       const registration = correlated.ok ? correlated.value.handle.readProgramRegistration(16_777_216) : null;
-      const raw = registration?.ok ? registration.value : null;
-      const successor = typeof raw === "object" && raw !== null && Object.getOwnPropertyDescriptor(raw, "schemaVersion")?.value === 3 &&
-        Object.getOwnPropertyDescriptor(raw, "kind")?.value === "standalone-review";
-      return captureCandidates(successor && readPayload === claudeFinalPayloadCandidates
+      if (registration !== null && !registration.ok) {
+        return captureUnavailable("program-registration", `program registration is unavailable: ${registration.error.message}`);
+      }
+      const raw = registration?.value ?? null;
+      const parsedRegistration = raw === null ? null : parseRegisteredFacadeProgram(raw);
+      if (parsedRegistration !== null && parsedRegistration.kind !== "registered") {
+        const problem = parsedRegistration.kind === "invalid"
+          ? parsedRegistration.message
+          : "program registration does not name a registered orchestration program";
+        return captureUnavailable("program-registration", `program registration is unavailable: ${problem}`);
+      }
+      const successor = parsedRegistration?.program.kind === "standalone-review" &&
+        parsedRegistration.program.schemaVersion === 3;
+      const bounded = successor || raw === null;
+      return captureCandidates(bounded && readPayload === claudeFinalPayloadCandidates
         ? claudeFinalPayloadCandidates(transcriptPath, 16_777_216) : readPayload(transcriptPath));
     } catch (error) {
       if (error instanceof ClaudeTranscriptReadError) {

@@ -42,7 +42,7 @@ describe.sequential("bounded successor source observation", () => {
       writeFileSync(join(p, "extra"), "x");
       expect(observeStandaloneSuccessorSource([...paths, "extra"], head).ok).toBe(false); expect(heads).toBe(0);
       expect(observeStandaloneSuccessorSource(Array.from({ length: 4097 }, (_, i) => String(i)), head).ok).toBe(false); expect(heads).toBe(0);
-      expect(observeStandaloneSuccessorSource(paths, head).ok).toBe(true); expect(heads).toBe(1);
+      expect(observeStandaloneSuccessorSource(paths, head).ok).toBe(true); expect(heads).toBe(2);
     });
   });
   it("refuses symlink/nonregular source rather than widening scope; genuine absence remains absence", async () => {
@@ -121,6 +121,34 @@ describe.sequential("bounded successor source observation", () => {
         ok: false,
         message: "successor source unavailable: successor source missing.ts changed during observation",
       });
+    });
+  });
+
+  it("rejects Git/reviewer authority drift even when source bytes and stats stay unchanged", async () => {
+    const p = root(); await owned(p, async () => {
+      const { observeStableStandaloneSuccessorSource } = await import("../../../../src/handlers/helpers/programs/standalone-successor-source");
+      writeFileSync("source.ts", "stable bytes");
+      let observations = 0;
+      const changedHead = observeStableStandaloneSuccessorSource(["source.ts"], () => ({
+        headRevision: (++observations === 1 ? "a" : "b").repeat(40),
+        value: { additions: 1 },
+      }));
+      expect(changedHead).toEqual({
+        ok: false,
+        message: "successor source unavailable: successor Git/reviewer authority changed during observation",
+      });
+      expect(observations).toBe(2);
+
+      observations = 0;
+      const changedMetadata = observeStableStandaloneSuccessorSource(["source.ts"], () => ({
+        headRevision: "a".repeat(40),
+        value: { additions: ++observations },
+      }));
+      expect(changedMetadata).toEqual({
+        ok: false,
+        message: "successor source unavailable: successor Git/reviewer authority changed during observation",
+      });
+      expect(observations).toBe(2);
     });
   });
 

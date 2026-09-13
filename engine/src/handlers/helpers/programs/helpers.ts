@@ -156,7 +156,7 @@ export function deriveChangedPaths(): DerivedChangedPaths {
   const head = gitText(["rev-parse", "HEAD"]);
   let base: string | null = null;
   for (const candidate of ["origin/main", "origin/master", "main", "master"]) {
-    const probe = spawnSync("git", ["merge-base", candidate, "HEAD"], { encoding: "utf8" });
+    const probe = spawnSync("git", ["merge-base", candidate, head], { encoding: "utf8" });
     if (probe.status === 0 && probe.stdout.trim() !== "") { base = probe.stdout.trim(); break; }
   }
   const untracked = gitPaths(["ls-files", "--others", "--exclude-standard", "-z", "--"]).filter(reviewablePath);
@@ -164,12 +164,12 @@ export function deriveChangedPaths(): DerivedChangedPaths {
   const stagedAdded = gitPaths(["diff", "--cached", "--name-only", "--diff-filter=A", "-z", "--"]).filter(reviewablePath);
   const committedAdded = base === null
     ? []
-    : gitPaths(["diff", "--name-only", "--diff-filter=A", "-z", `${base}...HEAD`, "--"]).filter(reviewablePath);
+    : gitPaths(["diff", "--name-only", "--diff-filter=A", "-z", `${base}...${head}`, "--"]).filter(reviewablePath);
   return Object.freeze({
     authority: Object.freeze({
       unstaged: Object.freeze([...new Set([...trackedUnstaged, ...untracked])].sort()),
       staged: gitPaths(["diff", "--cached", "--name-only", "-z", "--"]).filter(reviewablePath),
-      committed: base === null ? Object.freeze([]) : gitPaths(["diff", "--name-only", "-z", `${base}...HEAD`, "--"]).filter(reviewablePath),
+      committed: base === null ? Object.freeze([]) : gitPaths(["diff", "--name-only", "-z", `${base}...${head}`, "--"]).filter(reviewablePath),
       base_revision: base,
       head_revision: head,
     }),
@@ -226,12 +226,7 @@ export function classifyScope(
   const languages = [...new Set(extensions.filter(Boolean).map((extension) => extension.slice(1)))].sort();
   const sourceOrTestChanged = scope.some((path, index) =>
     SOURCE_EXTENSIONS.has(extensions[index]!) || /(^|\/)(test|tests|__tests__)(\/|$)/.test(path));
-  // `docs_only` MEANS "no source or test file changed", and the load boundary
-  // (core/standalone-review) refuses any record where both are true. Matching
-  // the documentation shape alone did not carry that meaning: `docs/tests/x.md`
-  // satisfies the docs pattern AND the test-path pattern, so this producer
-  // could emit a record its own validator would reject. The exclusion is part
-  // of the definition, not a check layered on top of it.
+  // Canonically, docsOnly implies commentsChanged and excludes sourceOrTestChanged.
   const docsOnly = !sourceOrTestChanged
     && scope.every((path) => /(^|\/)(docs?|README)(\/|\.|$)|\.(md|mdx|txt)$/.test(path));
   return Object.freeze({

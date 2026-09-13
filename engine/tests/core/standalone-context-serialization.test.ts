@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import fc from "fast-check";
 import { buildStandaloneReviewerContextPacketV3, encodeByteSection, serializeStandaloneReviewerContextPacketV3 } from "../../src/core/context-packets";
 import { parseRequestId } from "../../src/core/orchestration-contract";
-import { admitStandaloneSuccessorPacketSize } from "../../src/handlers/helpers/programs/standalone-successor-source";
+import { admitStandaloneSuccessorPacketSize, standaloneSuccessorPackets } from "../../src/handlers/helpers/programs/standalone-successor-source";
+import { prepareStandaloneLineageSource, prepareStandaloneSuccessor } from "../../src/core/standalone-lineage";
+import { standaloneFixture } from "../fixtures/standalone-remediation-authority";
 import { wrapStandalonePanelLine } from "../../src/orchestration/standalone-panel-context";
 const value = <T>(result: { ok: true; value: T } | { ok: false }): T => {
   if (!result.ok) throw Error("fixture parser refused");
@@ -43,6 +45,32 @@ describe("immutable successor section serialization", () => {
       ok: false,
       message: "successor packet exceeds 16777216 serialized byte budget",
     });
+  });
+
+  it("refuses amplified serialization through the production successor packet constructor", () => {
+    const prior = value(prepareStandaloneLineageSource(
+      standaloneFixture(undefined, true).input.standaloneResult,
+      "/owned/predecessor",
+    ));
+    const prepared = value(prepareStandaloneSuccessor(prior, new TextEncoder().encode(JSON.stringify({
+      runId: "run.serialized-production-budget",
+      snapshot: prior.scope.map(path => ({ kind: "absent", path })),
+      reviewers: prior.reviewers,
+    })), { kind: "historical-decision-unavailable" }));
+    const current = value(encodeByteSection("standalone-frozen-source", JSON.stringify({
+      schemaVersion: 2,
+      headRevision: "a".repeat(40),
+      files: prepared.snapshot.map(({ path }) => ({ path, kind: "absent", digest: null, byteLength: 0 })),
+    })));
+    const amplified = Array.from({ length: 24 }, (_, index) =>
+      value(encodeByteSection(`amplified-${index}`, "😀".repeat(43_510))));
+
+    const packets = standaloneSuccessorPackets(prepared, current, amplified);
+    if (packets.ok) {
+      const serialized = value(serializeStandaloneReviewerContextPacketV3(packets.value.packets[0]!));
+      throw new Error(`production constructor admitted ${Buffer.byteLength(serialized, "utf8")} serialized bytes`);
+    }
+    expect(packets.message).toBe("successor packet exceeds 16777216 serialized byte budget");
   });
 
   it("wraps display lines without splitting astral Unicode characters", () => {

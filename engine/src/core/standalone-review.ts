@@ -2512,6 +2512,33 @@ type StandaloneSuccessorLineage = Readonly<{
     refutedCritical: number; resolved: number; advisory: number; currentCriticalCoverageLimited: number }>;
 }>;
 
+function successorDispositionState(
+  prepared: PreparedStandaloneSuccessor,
+  reports: readonly AdmittedStandaloneSuccessorEvidence[],
+  row: StandaloneLineageRow,
+  index: number,
+  provenance: "new" | "inherited",
+  panel: ParsedPanelOutcomes | null,
+): StandaloneSuccessorLineage["dispositions"][number]["state"] {
+  const finding = findingOf(row);
+  const reopening = provenance === "inherited" &&
+    reports.some(report => report.payload.priorAssessments[index]?.verdict === "reopen");
+  if (finding.severity === "critical" && (provenance === "new" || reopening)) {
+    const outcome = panel?.outcomes.find(value => value.findingId === `standalone-review:${finding.id}`);
+    if (outcome === undefined) return "pending-panel";
+    return outcome.survives ? "active" : "refuted";
+  }
+  if (finding.severity === "advisory" && prepared.disposition.kind === "selected-record" &&
+      prepared.disposition.disposition.record.entries.some(entry =>
+        entry.origin === standaloneOriginReference(row.origin) && entry.decision === "dismissed")) {
+    return "policy-retired";
+  }
+  const latest = row.history.at(-1);
+  if (latest?.kind === "adjudication" && !latest.survives) return "refuted";
+  if (latest?.kind === "resolution" || latest?.kind === "successor-resolution") return "resolved";
+  return "active";
+}
+
 /** Current panel work and history are derived from the exact full-roster admission, not from caller partitions. */
 function deriveStandaloneSuccessorLineage(prepared: PreparedStandaloneSuccessor,
   requests: readonly AgentRequestAuthority[], reports: readonly AdmittedStandaloneSuccessorEvidence[],
@@ -2539,22 +2566,12 @@ function deriveStandaloneSuccessorLineage(prepared: PreparedStandaloneSuccessor,
   });
   const all = [...inherited, ...reports.flatMap(report => report.newFindings)];
   const dispositions = all.map((row, index): StandaloneSuccessorLineage["dispositions"][number] => {
-    const origin = standaloneOriginReference(row.origin);
     const provenance = index < inherited.length ? "inherited" : "new";
-    const latest = row.history.at(-1);
-    let state: StandaloneSuccessorLineage["dispositions"][number]["state"] = "active";
-    if (latest?.kind === "resolution" || latest?.kind === "successor-resolution") state = "resolved";
-    if (latest?.kind === "adjudication" && !latest.survives) state = "refuted";
-    if (findingOf(row).severity === "advisory" && prepared.disposition.kind === "selected-record" &&
-        prepared.disposition.disposition.record.entries.some(entry => entry.origin === origin && entry.decision === "dismissed")) state = "policy-retired";
-    const reopening = provenance === "inherited" && reports.some(report => report.payload.priorAssessments[index]?.verdict === "reopen");
-    if (findingOf(row).severity === "critical" && (provenance === "new" || reopening)) {
-      const outcome = panel?.outcomes.find(value => value.findingId === `standalone-review:${row.finding.id}`);
-      if (outcome === undefined) state = "pending-panel";
-      else if (outcome.survives) state = "active";
-      else state = "refuted";
-    }
-    return canonicalRecord({ origin, provenance, state });
+    return canonicalRecord({
+      origin: standaloneOriginReference(row.origin),
+      provenance,
+      state: successorDispositionState(prepared, reports, row, index, provenance, panel),
+    });
   });
   const inventory = all.map((row, index): StandaloneLineageRow => {
     if (panel === null || !(dispositions[index]!.provenance === "new" ||
@@ -3599,10 +3616,8 @@ export function serializeStandaloneReviewMachineState(state: StandaloneReviewMac
     schema_version: state.authority.schemaVersion,
     authority: JSON.parse(serializeStandaloneReviewAuthority(state.authority)),
   };
-  // `in` narrows the real union; the ad-hoc intersection cast this replaces
-  // re-declared both field types by hand, so a change to either declaration
-  // would have been silently ignored here — in a durable checkpoint writer,
-  // where a silently wrong projection is a checkpoint that will not load back.
+  // Discriminant-preserving narrowing keeps durable fields aligned with the
+  // exact union members that own them, so checkpoint serialization stays exhaustive.
   if ("refutationAuthority" in state) {
     record.refutationAuthority = serializableRefutationAuthority(state.refutationAuthority);
   }

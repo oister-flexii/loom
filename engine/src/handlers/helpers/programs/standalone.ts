@@ -23,7 +23,7 @@ import { completePersistentRefutationPanel, panelRequestIdentity, refutationPane
 import { readRunBytesNoFollow, writeRunBytesExclusiveNoFollow } from '../../../orchestration/no-follow-fs';
 import { captureKey } from '../../../core/harness-capture';
 import { type RunDirHandle } from '../../../orchestration/run-directory-handle';
-import { standaloneReviewerProtocolResolver, readPublishedStandaloneResult, deriveChangedPaths, durableCaptureRejection, durablePublicationDigest, durableRefutationRequests, durableRequests, executableRefutationRequests, failed, metadata, readRegisteredStandaloneAuthority, publicationFile, publicationResolver, publishInitialBatch, recoverOrPublishRefutationRetry, recoverOrPublishStandaloneRetry, refutationRejectionDiagnostic, renderSpawnTask, safeScope, standalonePackets, standalonePublicationEffectId, standaloneRetryTask, type FacadeDriveResult, type ProgramParse, type RegisteredStandaloneProgram } from './helpers';
+import { standaloneReviewerProtocolResolver, readPublishedStandaloneResult, deriveChangedPaths, gitText, durableCaptureRejection, durablePublicationDigest, durableRefutationRequests, durableRequests, executableRefutationRequests, failed, metadata, readRegisteredStandaloneAuthority, publicationFile, publicationResolver, publishInitialBatch, recoverOrPublishRefutationRetry, recoverOrPublishStandaloneRetry, refutationRejectionDiagnostic, renderSpawnTask, safeScope, standalonePackets, standalonePublicationEffectId, standaloneRetryTask, type FacadeDriveResult, type ProgramParse, type RegisteredStandaloneProgram } from './helpers';
 
 const preparedSuccessorStarts = new WeakSet<object>();
 
@@ -54,15 +54,24 @@ function initialStandaloneRequests(authority: FrozenStandaloneReviewAuthority) {
   });
 }
 
+const successorGitAuthorityWitness = (): string => gitText([
+  "status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all",
+]);
+
 export async function prepareStandaloneSuccessorFacadeStart(runsRoot: string, run: string, input: StandaloneSuccessorStartInput) {
   try {
     const destination = parseRunDirectoryReference(runsRoot, run);
     if (!destination.ok) return { ok: false as const, message: destination.error.message };
     const source = observeStableStandaloneSuccessorSource(input.files, () => {
+      const before = successorGitAuthorityWitness();
       const changed = deriveChangedPaths();
+      const reviewMetadata = metadata(input.kind, input.files, changed);
+      const witness = successorGitAuthorityWitness();
+      if (before !== witness) throw new Error("successor Git/reviewer authority changed during observation");
       return {
         headRevision: changed.authority.head_revision,
-        value: Object.freeze({ changed, reviewMetadata: metadata(input.kind, input.files, changed) }),
+        value: Object.freeze({ changed, reviewMetadata }),
+        stability: Object.freeze({ witness, observe: successorGitAuthorityWitness }),
       };
     });
     if (!source.ok) return source;

@@ -68,6 +68,56 @@ describe("owned native v3 → canonical replay → authentic guarded P3", { time
     expect(touched).toBe(false);
   }));
 
+  it.each(["claude", "pi"] as const)("%s refuses transcript observation until current registration is readable", harness => owned(async root => {
+    const native = await nativeSuccessorCapture(root, harness);
+    try {
+      await publishedSuccessorForRemediation(root, "complete", async (handle, requests, payload) => {
+        const programPath = join(handle.runDirectory, "program.json");
+        const registration = readFileSync(programPath);
+        const first = requests[0]!.authority;
+        if (harness === "pi") {
+          const extension = await import("../../../../../pi/extension");
+          const toolCallId = "registration-unavailable";
+          value(await handle.recordHarnessCorrelator({ schemaVersion: 1, harness,
+            nativeId: extension.piSpawnRosterId(toolCallId, 0, first.role), requestId: first.requestId,
+            role: first.role, attempt: first.attempt }));
+          const binding = Object.freeze({ ...handle.identity,
+            requestIds: Object.freeze(requests.map(({ authority }) => authority.requestId)), resultDigest: null });
+          try {
+            for (const corrupt of ["{", "{}"] as const) {
+              writeFileSync(programPath, corrupt);
+              const refused = await extension.capturePiSubagentResult(toolCallId, 0, first.role,
+                [{ get role() { throw new Error("transcript was observed"); } }], binding);
+              expect(refused).toMatchObject({ kind: "retriable-failure", reason: "program-registration",
+                message: expect.stringContaining("program registration is unavailable") });
+              expect(value(handle.readCapturedAttempts())).toEqual(new Set());
+              expect(value(handle.readCaptureRejection(first))).toBeNull();
+            }
+          } finally {
+            writeFileSync(programPath, registration);
+          }
+          expect(await extension.capturePiSubagentResult(toolCallId, 0, first.role,
+            [{ role: "assistant", content: [{ type: "text", text: JSON.stringify(payload) }] }], binding))
+            .toMatchObject({ kind: "captured" });
+          await native.capture(handle, requests.slice(1), requests.slice(1).map(() => [JSON.stringify(payload)]));
+          return;
+        }
+        try {
+          for (const corrupt of ["{", "{}"] as const) {
+            writeFileSync(programPath, corrupt);
+            const refused = await native.capture(handle, requests.slice(0, 1), [["must not be observed"]]);
+            expect(JSON.stringify(refused)).toContain("program registration is unavailable");
+            expect(value(handle.readCapturedAttempts())).toEqual(new Set());
+            expect(value(handle.readCaptureRejection(first))).toBeNull();
+          }
+        } finally {
+          writeFileSync(programPath, registration);
+        }
+        await native.capture(handle, requests, requests.map(() => [JSON.stringify(payload)]));
+      });
+    } finally { await native.close(); }
+  }));
+
   it.each(["claude", "pi"] as const)("%s refuses foreign capture receipts and changed current protocol/request/context/result authority", harness => owned(async root => {
     const native = await nativeSuccessorCapture(root, harness);
     try {

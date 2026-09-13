@@ -113,6 +113,7 @@ import {
   captureAuditLine,
   captureCandidates,
   captureHarnessResult,
+  captureUnavailable,
   RUN_DIR_ENV,
   describeCaptureFailure,
   resolveCorrelatedRequest,
@@ -239,8 +240,11 @@ const trustedReviewRuns = new Map<string, Map<string, TrustedReviewRoot>>();
 const trustedRunIdentity = ({ runsRoot, runDirectory }: Pick<SessionRunBinding, "runsRoot" | "runDirectory">): string =>
   `${runsRoot}\0${runDirectory}`;
 
-/** First exact standalone spawn selects the current run; retries never reorder runs. */
-function touchTrustedReviewRun(sessionId: string, binding: SessionRunBinding): void {
+function updateTrustedReviewRun(
+  sessionId: string,
+  binding: SessionRunBinding,
+  updateCaptures: (captures: ReadonlyMap<CaptureKey, TrustedReviewCapture>) => ReadonlyMap<CaptureKey, TrustedReviewCapture>,
+): void {
   const sessionRoots = trustedReviewRuns.get(sessionId) ?? new Map<string, TrustedReviewRoot>();
   trustedReviewRuns.set(sessionId, sessionRoots);
   const rootIdentity = resolve(binding.runsRoot);
@@ -253,13 +257,18 @@ function touchTrustedReviewRun(sessionId: string, binding: SessionRunBinding): v
   const runs = new Map(root.runs);
   runs.set(identity, Object.freeze({
     binding,
-    captures: previous?.captures ?? new Map<CaptureKey, TrustedReviewCapture>(),
+    captures: updateCaptures(previous?.captures ?? new Map<CaptureKey, TrustedReviewCapture>()),
     touchedAt: previous?.touchedAt ?? root.nextTouch,
   }));
   sessionRoots.set(rootIdentity, Object.freeze({
     nextTouch: previous === undefined ? root.nextTouch + 1 : root.nextTouch,
     runs,
   }));
+}
+
+/** First exact standalone spawn selects the current run; retries never reorder runs. */
+function touchTrustedReviewRun(sessionId: string, binding: SessionRunBinding): void {
+  updateTrustedReviewRun(sessionId, binding, captures => captures);
 }
 
 /**
@@ -466,38 +475,22 @@ function rememberTrustedReviewCapture(
   if (!digest.ok) {
     throw new Error(`captured request ${outcome.receipt.requestId} carries an invalid receipt digest: ${digest.error.message}`);
   }
-  const sessionRoots = trustedReviewRuns.get(sessionId) ?? new Map<string, TrustedReviewRoot>();
-  trustedReviewRuns.set(sessionId, sessionRoots);
-  const rootIdentity = resolve(binding.runsRoot);
-  const root = sessionRoots.get(rootIdentity) ?? Object.freeze({
-    nextTouch: 1,
-    runs: new Map<string, TrustedReviewRun>(),
+  updateTrustedReviewRun(sessionId, binding, previous => {
+    const captures = new Map(previous);
+    captures.set(
+      captureKey(outcome.receipt.slotId, outcome.receipt.attempt),
+      Object.freeze({
+        requestId: outcome.receipt.requestId,
+        slotId: outcome.receipt.slotId,
+        attempt: outcome.receipt.attempt,
+        role,
+        contextDigest: contextDigest.value,
+        digest: digest.value,
+        byteLength: outcome.receipt.byteLength,
+      }),
+    );
+    return captures;
   });
-  const identity = trustedRunIdentity(binding);
-  const previousRun = root.runs.get(identity);
-  const captures = new Map(previousRun?.captures ?? []);
-  captures.set(
-    captureKey(outcome.receipt.slotId, outcome.receipt.attempt),
-    Object.freeze({
-      requestId: outcome.receipt.requestId,
-      slotId: outcome.receipt.slotId,
-      attempt: outcome.receipt.attempt,
-      role,
-      contextDigest: contextDigest.value,
-      digest: digest.value,
-      byteLength: outcome.receipt.byteLength,
-    }),
-  );
-  const runs = new Map(root.runs);
-  runs.set(identity, Object.freeze({
-    binding,
-    captures,
-    touchedAt: previousRun?.touchedAt ?? root.nextTouch,
-  }));
-  sessionRoots.set(rootIdentity, Object.freeze({
-    nextTouch: previousRun === undefined ? root.nextTouch + 1 : root.nextTouch,
-    runs,
-  }));
 }
 
 function environmentRunBinding(): SessionRunBinding | null {
@@ -746,9 +739,19 @@ export async function capturePiSubagentResult(
     const correlation = resolveCorrelatedRequest({ harness: "pi", runsRoot, runDirectory,
       nativeId: piSpawnRosterId(toolCallId, resultIndex, agentType) });
     const registration = correlation.ok ? correlation.value.handle.readProgramRegistration(16_777_216) : null;
-    const raw = registration?.ok ? registration.value : null;
-    const purpose = typeof raw === "object" && raw !== null && Object.getOwnPropertyDescriptor(raw, "schemaVersion")?.value === 3 &&
-      Object.getOwnPropertyDescriptor(raw, "kind")?.value === "standalone-review" ? "standalone-successor" as const : undefined;
+    if (registration !== null && !registration.ok) {
+      return captureUnavailable("program-registration", `program registration is unavailable: ${registration.error.message}`);
+    }
+    const raw = registration?.value ?? null;
+    const parsedRegistration = raw === null ? null : parseRegisteredFacadeProgram(raw);
+    if (parsedRegistration !== null && parsedRegistration.kind !== "registered") {
+      const problem = parsedRegistration.kind === "invalid"
+        ? parsedRegistration.message
+        : "program registration does not name a registered orchestration program";
+      return captureUnavailable("program-registration", `program registration is unavailable: ${problem}`);
+    }
+    const purpose = raw === null || (parsedRegistration?.program.kind === "standalone-review" &&
+      parsedRegistration.program.schemaVersion === 3) ? "standalone-successor" as const : undefined;
     const candidates = piResultFinalPayloadCandidates(messages ?? [], purpose);
     return candidates.ok
       ? captureCandidates(candidates.value)

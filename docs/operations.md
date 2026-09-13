@@ -188,7 +188,9 @@ The command first returns a bounded section index. Append `--section LABEL` to
 browse decoded sections or `--file EXACT_SOURCE_PATH` for frozen standalone source
 text, then `--offset N --limit 4096` to continue. Text offsets count UTF-16 units;
 index offsets count section entries (at most 32 per page). Section browsing omits
-source contents and binary/base64 fields; explicit binary-file selection fails.
+source contents and binary/base64 fields. V1/v2 binary-file selection and any
+invalid UTF-8 fail; v3 frozen source uses a binary representation for byte fidelity,
+but explicit `--file` selection returns it when fatal UTF-8 decoding succeeds.
 The helper uses existing no-follow regular-file reads, fatal UTF-8, the packet
 parser and expected identity checks. Its 128 MiB input/48 KiB output limits are
 helper resource bounds, not changes to protocol admission. Missing tools/paths,
@@ -234,14 +236,13 @@ and is not substituted for independently admitted native evidence.
 
 ## Standalone lineage (P5)
 
-**Availability and bootstrap:** the selected design is implemented on the P5 feature
-worktree; final validation, one registered review and publication are pending.
-P4 is already merged/reloaded. For P5's own source review/remediation, keep using
-the admitted main CLI and Skill 5.0.0, with ordinary Plan advisory triage. That
-runtime does **not** implement `standalone-disposition` or successor issuance.
-The commands below describe P5 after matching-runtime publication/reload (or
-explicitly owned disposable fixtures), not an instruction to switch a live session
-to the feature CLI. Never unset admission or retrofit the source review.
+**Availability and bootstrap:** use these commands only when the loaded package's
+admitted Runtime Revision implements schema-v3 standalone lineage. Every mutating
+CLI must match that loaded revision; after installing or updating Loom, reload Pi
+(or restart the host) before mutation. A revision mismatch fails closed and is never
+permission to unset admission, switch a live session to unrelated checkout bytes,
+or retrofit an issued source review. Dated rollout evidence belongs in ADR-0010 and
+the remediation plans, not this operating contract.
 
 ### Immediate advisory publication
 
@@ -362,10 +363,12 @@ source lane. Preflight refuses unsupported bounds/scope/roles before issuance.
 
 The engine observes exact source bytes, digest/length and normalized Git executable
 mode (`100644`/`100755`), or anchored-safe observed absence, before freezing both
-current attempts. Absence validates every extant parent without following symlinks. HEAD,
-changed-path facts, additions, and reviewer-selection metadata are derived inside
-the source observation window; a final whole-scope stat/absence pass rejects drift
-before authority is encoded. Historical v1/v2 modes remain unknown (`null`); genuinely missing old source facts
+current attempts. Absence validates every extant parent without following symlinks.
+HEAD-derived commands are pinned to their captured revision. Identical porcelain-v2
+HEAD/index/worktree status witnesses bracket changed-path, additions, and reviewer
+selection derivation and remain stable across the final whole-scope stat/absence pass;
+any disagreement rejects before authority is encoded.
+Historical v1/v2 modes remain unknown (`null`); genuinely missing old source facts
 stay `historical-unknown`. Missing expected current source never becomes historical
 absence. Same HEAD is not byte equality; different HEAD is not repair. Deleted or
 renamed files keep the original Finding location and must not disappear from scope.
@@ -670,7 +673,7 @@ Completed schema-v1 remediation runs remain read-only and inspect as `done — h
 
 Completed-v2 replay parses both checkpoint audit-path arrays before assessing retained observations. Missing or malformed arrays produce `remediation checkpoint audit paths are missing or malformed`, not invented empty-path evidence. If installation succeeds but checkpoint recording fails, preserve the explicit installed-index diagnostic and actual receipt: that failure does not mean rollback or “nothing was installed.” Do not hand-repair the checkpoint or reinstall from its prose; use read-only inspection and retain the interrupted evidence.
 
-**Runtime publication:** P4 merged as `96153ed` and reload was verified. P5 final validation, registered review and publication remain pending. Its own final review/remediation must use the admitted main CLI and Skill 5.0.0 frozen contract, including existing Plan advisory triage—not the new P5 publisher. The loaded main runtime is `sha256:086c472e4e913376c07d69f5116c9ad9655546e22c91e40d28cba9fdd795bc79`; feature CLI mutations belong only in explicitly owned matching-runtime fixtures until publication/reload. Do not retrofit P5 records into the source review. After merge/package publication and reload, new triage may honestly publish new records. Never unset admission variables. Reviewer source version does not select remediation version: P3 schema-2 command/report/install policy is unchanged. Skill 3.1 bootstrap remains historical P3 context. Development checks are not registered installation receipts.
+**Runtime selection:** every mutating CLI must present the exact Runtime Revision admitted by the loaded extension. After a package update, reload Pi or restart the host before retrying; revision skew fails closed and must never be bypassed by unsetting admission variables. Use matching-runtime disposable fixtures for feature-checkout mutation experiments. Do not retrofit newly available records into an already-issued source review. Reviewer source version does not select remediation version: P3 schema-2 command/report/install policy remains separate. Dated publication and bootstrap evidence lives in the relevant ADR and remediation plans; development checks are not registered installation receipts.
 
 ### Enrolling a critical-repair check
 

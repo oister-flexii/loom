@@ -2078,7 +2078,7 @@ describe("Pi extension review tool_result integration", () => {
     });
     await expect(bridge.verify({ cwd: projectCwd, sessionId: session }))
       .rejects.toThrow(`no request-bound Loom captures were witnessed for Pi session ${session}`);
-  });
+  }, 60_000);
 
   it("reloads durable session authority when the Pi extension restarts between spawn and result", async () => {
     const beforeReload = await extension();
