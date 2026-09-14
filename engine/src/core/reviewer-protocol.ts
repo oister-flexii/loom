@@ -37,6 +37,60 @@ function excessiveDepthOffset(text: string): number | null {
   return null;
 }
 
+/**
+ * Deterministic extraction for prose-wrapped payloads: the outermost balanced
+ * JSON object when exactly one candidate parses as strict JSON. A reviewer's
+ * final message that wraps its payload in prose or a code fence still carries
+ * the reviewer's own work; the engine extracts it without the orchestrator
+ * hand-editing bytes, and the original transcript stays immutable audit
+ * evidence. Zero candidates (no JSON) and ambiguity (two or more balanced,
+ * parseable objects) fail closed to the bounded retry — only genuinely
+ * ambiguous output burns a retry.
+ *
+ * The scan records spans only from a depth-0 `{` to its matching `}`, so
+ * nested payload objects never create additional candidates, and braces
+ * inside JSON string values or quoted prose never affect candidate
+ * selection. Each candidate must itself JSON.parse — a prose brace pair that
+ * forms no valid object is excluded. Local state never escapes: the scan
+ * reads its argument and returns the extracted payload bytes.
+ */
+function extractStrictObject(text: string): { value: unknown; text: string } | null {
+  const spans: Array<[number, number]> = [];
+  let depth = 0;
+  let quoted = false;
+  let escaped = false;
+  let objectStart = -1;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') quoted = false;
+      continue;
+    }
+    if (char === '"') { quoted = true; continue; }
+    if (char === "{") {
+      if (objectStart === -1) objectStart = index;
+      depth += 1;
+      continue;
+    }
+    if (char === "}" && depth > 0) {
+      depth -= 1;
+      if (depth === 0 && objectStart !== -1) {
+        spans.push([objectStart, index + 1]);
+        objectStart = -1;
+      }
+    }
+  }
+  // Parse each candidate exactly once: a candidate that survives is the
+  // reviewer's own payload bytes, already decoded.
+  const candidates = spans.flatMap(([start, end]): Array<{ value: unknown; text: string }> => {
+    try { return [{ value: JSON.parse(text.slice(start, end)), text: text.slice(start, end) }]; }
+    catch { return []; }
+  });
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
 function uniqueMembers(text: string): DomainResult<true, ReviewerProtocolFailure> {
   const objects: Set<string>[] = [];
   let problem: DomainResult<never, ReviewerProtocolFailure> | undefined;
@@ -78,16 +132,26 @@ export function parseReviewerPayloadV2(rawBytes: Uint8Array): DomainResult<Revie
   if (depthOffset !== null) {
     return rejected("depth-exceeded", "Reviewer payload exceeds 32 nested containers.", "", encoder.encode(text.slice(0, depthOffset)).byteLength);
   }
-  let raw: unknown;
+  let payloadText = text;
+  let parsedValue: unknown;
   try {
-    raw = JSON.parse(text);
+    parsedValue = JSON.parse(text);
   } catch {
-    return rejected("invalid-json", "Reviewer payload must be exactly one strict JSON object.");
+    // A prose-wrapped payload still carries the reviewer's own final message;
+    // deterministic extraction admits it without hand-editing the original
+    // transcript bytes, which stay immutable audit evidence. Zero candidates
+    // and ambiguity fail closed to the bounded retry.
+    const extracted = extractStrictObject(text);
+    if (extracted === null) {
+      return rejected("invalid-json", "Reviewer payload must be exactly one strict JSON object.");
+    }
+    parsedValue = extracted.value;
+    payloadText = extracted.text;
   }
   try {
-    const unique = uniqueMembers(text);
+    const unique = uniqueMembers(payloadText);
     if (!unique.ok) return unique;
-    const parsed = reviewerPayloadV2Schema.safeParse(raw);
+    const parsed = reviewerPayloadV2Schema.safeParse(parsedValue);
     if (!parsed.success) {
       return rejected("invalid-payload", "Reviewer payload does not conform to the issued v2 schema.", pointer(parsed.error.issues[0]?.path ?? []));
     }
