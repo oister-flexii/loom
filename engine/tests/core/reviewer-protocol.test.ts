@@ -81,8 +81,51 @@ describe("current reviewer codec", () => {
     }), { seed: 4002 });
   });
 
-  it.each(["", " ", "{}{}", "```json\n{}\n```", "before {}", "{} after", "// comment\n{}", "{/*x*/}", '{"x":1,}', "[1,]", '{"x":01}', '{"x":+1}', '{"x":.1}', '{"x":1.}', '{"x":NaN}', '{"x":Infinity}', "\u00a0{}", '{"x":"\n"}', '{"x":"\\x20"}'])
+  it.each(["", " ", "{}{}", "before {\"x\":1,}", "{/*x*/}", '{"x":1,}', "[1,]", '{"x":01}', '{"x":+1}', '{"x":.1}', '{"x":1.}', '{"x":NaN}', '{"x":Infinity}', '{"x":"\n"}', '{"x":"\\x20"}'])
     ("requires strict native grammar, never JSONC repair: %j", (raw) => refused(bytes(raw), "invalid-json"));
+  it.each(["```json\n{}\n```", "before {}", "{} after", "// comment\n{}", "\u00a0{}"])
+    ("extracts a prose-wrapped candidate and still gates the issued schema: %j", (raw) => refused(bytes(raw), "invalid-payload"));
+
+  it("extracts exactly one strict JSON object wrapped in prose or a code fence", () => {
+    const payload = JSON.stringify(standalone([advisory]));
+    for (const wrapped of [
+      `Summary text.\n\n${payload}`,
+      "```json\n" + payload + "\n```",
+      `Summary.\n\n\`\`\`json\n${payload}\n\`\`\`\n`,
+    ]) {
+      expect(parseReviewerPayloadV2(bytes(wrapped))).toEqual({ ok: true, value: standalone([advisory]) });
+    }
+  });
+  it("admits prose-wrapped payloads without mutating the original bytes", () => {
+    const payload = JSON.stringify(standalone([advisory]));
+    const wrapped = `Summary text.\n\n${payload}`;
+    const original = bytes(wrapped).slice();
+    expect(parseReviewerPayloadV2(bytes(wrapped))).toEqual({ ok: true, value: standalone([advisory]) });
+    expect(bytes(wrapped)).toEqual(original);
+  });
+  it("fails closed on ambiguous output: two or more balanced, parseable objects", () => {
+    const payload = JSON.stringify(standalone([advisory]));
+    refused(bytes(payload + payload), "invalid-json");
+    refused(bytes(`Summary.\n\n${payload}\n\nAlso.\n\n${payload}`), "invalid-json");
+  });
+  it("fails closed when prose braces steal the object start rather than guessing", () => {
+    const payload = JSON.stringify(standalone([advisory]));
+    refused(bytes("Your message begins with '{' as the very first character.\n\n" + payload), "invalid-json");
+  });
+  it("admits prose-wrapped payloads for arbitrary brace-free quote-free prose", () => {
+    fc.assert(fc.property(
+      fc.array(fc.constantFrom("a", "é", "🧵", "\n", "\t", " ", "\\", "|", "<", "\u202e"), { maxLength: 35 }),
+      fc.array(draft, { maxLength: 4 }),
+      (prose, findings) => {
+        const payload = JSON.stringify(standalone(findings));
+        const wrapped = prose.join("") + "\n" + payload;
+        const original = bytes(wrapped).slice();
+        const result = parseReviewerPayloadV2(bytes(wrapped));
+        expect(result).toEqual({ ok: true, value: standalone(findings) });
+        expect(bytes(wrapped)).toEqual(original);
+      },
+    ), { seed: 4010, numRuns: 100 });
+  });
 
   it.each([null, [], 2, "x", {}, { schemaVersion: 2, kind: "standalone-review" }, { schemaVersion: 1, kind: "standalone-review", findings: [] }, { ...standalone(), kind: "unknown" }, { ...standalone(), criticalCount: 0 }, { ...standalone(), packetId: "a".repeat(64) }, { ...standalone(), protocolVersion: 2 }, { ...wave(), extra: 1 }])
     ("refuses wrong root, version, missing fields or authored extras: %j", (value) => refuseValue(value));
