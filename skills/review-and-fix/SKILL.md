@@ -1,13 +1,32 @@
 ---
 name: review-and-fix
-version: "5.0.0"
+version: "6.0.0"
 description: "Review a PR, adjudicate critical findings, remediate, validate, and install an exact verified Git index."
 ---
 
 # Review and Fix
 
 Canonical workflow: registered standalone review → engine-owned refutation →
-plan → remediation → validation → verified index installation → commit/push.
+Plan and immediate immutable advisory publication → remediation → validation →
+verified index installation → commit/push. Explicit successor review is optional,
+never an automatic extra roster after remediation.
+
+## Availability and P5 bootstrap
+
+Skill 6 adds P5 advisory publication and explicit successor handling. The selected
+design is implemented on the feature worktree; **final validation, registered review
+and publication remain pending**. P4 merged as `96153ed` and reload was verified.
+
+**P5's own final registered source review/remediation MUST use the admitted main
+CLI and frozen Skill 5.0.0 contract, including its existing Plan advisory triage.**
+Loaded main runtime:
+`sha256:086c472e4e913376c07d69f5116c9ad9655546e22c91e40d28cba9fdd795bc79`.
+It does not implement the P5 publisher. Do not call the new mutator through it,
+switch a live parent to the feature CLI, unset admission, or retrofit P5 records
+into that source review. Feature mutations belong only in owned matching-runtime
+fixtures until publication/reload. After merge/package publication/reload, **new**
+triage may publish new P5 records honestly. The P5 instructions below apply only
+to that matching runtime; this bootstrap restriction takes precedence.
 
 ## Arguments
 
@@ -32,8 +51,11 @@ plan → remediation → validation → verified index installation → commit/p
   a separately named Declared Repair Group, but that group ID never replaces
   the source Finding ID. Unresolved/out-of-scope dispositions are valid and
   block installation.
-- Advisory dispositions remain the existing parent policy: accepted, deferred,
-  or dismissed. Advisories are never inserted into critical repair groups.
+- Advisory dispositions remain parent policy: accepted, deferred or dismissed.
+  Publish the complete ordered inventory immediately through the no-agent P5
+  publisher on a matching runtime, even if no fix/successor follows. Corrections
+  publish a new exact revision; never edit history. Advisories are never inserted
+  into critical repair groups.
 - Grouping, root cause, invariant, sibling accounting, and Historical RED are
   `DECLARED`. Repaired checks alone become `ENGINE_OBSERVED`. Call the bounded
   result `repair-checked`, never proven closure or `ResolvedFinding`. An
@@ -84,9 +106,11 @@ critical sets through its registered Refutation Panel and publishes canonical
 - `advisory_findings` — autonomous parent triage by default
 - `refuted_critical_findings` — report, never fix
 
-### Reviewer Protocol v2 and canonical presentation
+### Issued reviewer protocol and canonical presentation
 
-Fresh reviews issue exactly one JSON final payload under the frozen
+Fresh independent reviews remain v2. Only explicit schema-3 successor start input
+selects v3; it does not change fresh Wave review. Independent reviews issue exactly
+one JSON final payload under the frozen
 `reviewer-payload-schema` and `reviewer-impact-rubric`. No Machine Summary,
 markers, numeric tallies, or reviewer-chosen new Finding IDs. Criticals require
 six fields: claim plus basis evidence, violatedContract, consequence,
@@ -123,13 +147,44 @@ published root `result.json`. JSON output retains the existing inspection shape.
 summary artifact is authority. P3 retains every original source ID and full basis
 immutably, including refuted/advisory partitions and original result digest.
 Its selected operator checks, fresh required reports and verified-index policy
-are unchanged by this reviewer-wire major version.
+are unchanged. For v3, human inspection reports new/inherited/current counts and
+coverage instead; full source JSON retains every origin/history.
 
-Completed and unfinished issued reviewer v1 runs keep their original protocol,
-including retries and replay. Read the issued packet first and follow archived
-role/shared-wire delivery under `references/reviewer-protocol-v1/`; do not apply
-current schema/rubric to v1. This is distinct from unfinished remediation v1,
-which ADR-0008 still refuses. See [protocol operations](../../docs/operations.md#reviewer-protocol-v2).
+Completed and unfinished issued reviewer v1/v2 runs keep their original protocol,
+initial/resume/both-attempt retry behavior and exact context/result/receipt bytes.
+Read the issued packet first; v1 follows its archived role/shared wire under
+`references/reviewer-protocol-v1/`, while v2 keeps its exact P4 schema/rubric.
+Do not apply successor grammar to either. Development-only pre-B4 v3 panel context
+changes are not historical v1/v2 migrations. Unfinished remediation v1 is separately
+refused by ADR-0008. See [protocol operations](../../docs/operations.md#reviewer-protocol-v2).
+
+### Optional explicit successor
+
+Do not automatically select `previousRun`, repeat the reviewer roster, reuse old
+review as current completion, merge forks or infer identity from similarity.
+For an explicitly requested successor, use the exact schema-3 start JSON in
+[successor operations](../../docs/operations.md#explicit-successor-review): ordered
+explicit files, `dryRun:false`, exact predecessor locator/Run/result digest, and
+exact published policy revision (or honest explicit historical unavailability).
+There is no new slash-command successor flag. Preserve all predecessor paths and
+roles; include relevant dependency/configuration/contract paths explicitly.
+
+The full current roster assesses every inherited origin in issued order. Resolution
+requires unanimous `repaired` judgments with relevant implementation changes against
+one frozen byte/mode snapshot; disagreement/not-assessable prevents it. Missing or
+malformed coverage refuses the whole response under the existing single retry.
+Critical reopening requires new evidence bound to the exact old decision and goes
+through a fresh full Refutation Panel; only new criticals and explicit reopening
+need current panel work. Already-upheld unchanged criticals remain blocking.
+Preserve original IDs/assertions/severity/evidence, per-role high-water and all
+history. Advisory policy reconsideration needs a later disposition publication,
+never severity promotion. Digests, formal statements and Repair-Checked are not
+semantic proof. Historical unknown source facts never become inferred absence.
+
+V3 human inspection supplies new/inherited/current counts and coverage. P3 consumes
+actual active `surviving_critical_findings`, not fresh panel counts; limited current
+critical coverage blocks even a zero-active-critical install. Full source JSON and
+lineage remain exact through unchanged schema-2 checks/index installation.
 
 ## Phase 2 — Plan
 
@@ -154,17 +209,76 @@ in-scope fix is practical. Defer or dismiss only with a concrete evidence-based
 reason. An explicit user instruction about a specific advisory overrides this
 default. Never add an advisory or refuted critical to `defectFamily`.
 
-If no code or documentation fix remains after advisory disposition, report the
-clean review or dispositions and stop. Zero surviving criticals require no
-check, manifest, or subprocess, but every remediation start still requires the
-explicit `defectFamily: {"kind":"not-required"}` input.
+### Publish advisory decisions now (matching P5 runtime only)
+
+Before stopping or implementing, obtain the engine's exact source and complete
+ordered advisory inventory:
+
+```bash
+bun ${LOOM_DIR}/engine/src/cli.ts helper orchestration inspect \
+  --runs-root ".claude/reviews/review-and-fix-runs" \
+  --run "<same-review-run-id>" --lineage
+```
+
+Copy `source` unchanged into both input source fields. Copy **every**
+`advisoryInventory[].origin` in order, including retired/resolved advisories, into
+`record.entries` with the parent decision/reason. Do not use bare Finding IDs,
+compute origin hashes or infer a missing entry from prose. Prepare ordinary JSON:
+
+```json
+{
+  "source": {"locator":"/absolute/review-root/run.review","runId":"run.review","resultDigest":"<exact-result-sha256>"},
+  "record": {
+    "schemaVersion": 1,
+    "source": {"locator":"/absolute/review-root/run.review","runId":"run.review","resultDigest":"<exact-result-sha256>"},
+    "provenance": "DECLARED",
+    "revision": {"kind":"initial"},
+    "entries": [{"origin":"<exact-inspection-origin>","decision":"accepted","reason":"Concrete evidence-based reason."}]
+  },
+  "previous": null
+}
+```
+
+Expand entries to exact coverage; `[]` is legal only for an empty advisory inventory.
+This input declares policy; it is not a hand-built Run artifact or receipt.
+
+```bash
+bun ${LOOM_DIR}/engine/src/cli.ts helper orchestration start standalone-disposition \
+  --runs-root ".claude/reviews/review-and-fix-runs" \
+  --run "<fresh-policy-run-id>" < /path/to/declared-policy.json
+```
+
+Read `done.outcome.kind: standalone-disposition-published`, `publication`, `record`
+and `receipt`. The engine publishes `artifacts/disposition.json`; never write it
+manually. No Agents or await-user stage. Exact repeat/resume is idempotent; conflicting
+bytes refuse. If interrupted, ordinary `resume` reconciles exact artifact/receipt
+facts without re-triage. Do not treat an unreceipted record as published authority.
+
+For a correction, publish a fresh policy Run with the same source, complete entries,
+`revision:{"kind":"correction","previousDigest":"<prior-digest>"}` and
+`previous:{"locator":"<absolute-prior-policy-run>","runId":"<prior-policy-id>","dispositionDigest":"<same-prior-digest>"}`.
+The prior revision must already be published; no automatic latest choice. An explicit
+present-day import uses `revision:{"kind":"historical-import","proseReference":"<retained-reference>","prose":"<exact-retained-prose>"}` and `previous:null`.
+It remains DECLARED now, never backdated. Missing historical policy is explicit
+`historical-decision-unavailable`, not an empty native record. Missing/corrupt
+expected current publication fails, never falls back to historical absence.
+See [complete publication/inspection operations](../../docs/operations.md#immediate-advisory-publication).
+
+If no code or documentation fix remains, report the published decisions and stop;
+do not require a successor merely to retain them. Zero surviving criticals require
+no remediation check, manifest or check subprocess, but every remediation start
+still requires `defectFamily: {"kind":"not-required"}` and, for v3, complete current
+critical coverage. Under the P5-bootstrap restriction above, use the old Plan-only
+triage instead; never pretend this publication occurred.
 
 Write `.claude/plans/YYYY-MM-DD-pr-remediation.md` containing branch, exact
 scope, review Run Directory, every surviving-critical disposition, every
 Declared Repair Group, sibling disposition, selected check ID and Historical
 RED declaration, every advisory disposition/reason, accepted advisory fixes,
-refuted-finding audit, and validation commands. Keep `DECLARED` facts distinct
-from checks the engine will later observe. `--dry-run` stops here.
+refuted-finding audit, exact policy publication/revision reference (or explicit
+bootstrap/historical unavailability), and validation commands. Keep `DECLARED`
+facts distinct from checks the engine will later observe. `--dry-run` stops here:
+review/adjudication and policy custody occur, but no implementation/install/commit.
 
 ## Phase 3 — Implement and validate
 
@@ -212,7 +326,7 @@ do not reuse these placeholders literally:
     "provenance": "DECLARED",
     "dispositions": [
       {
-        "findingId": "code-reviewer:1",
+        "findingId": "code-reviewer-1",
         "status": "repaired",
         "repairGroupId": "group.repair-predicate"
       }
@@ -222,7 +336,7 @@ do not reuse these placeholders literally:
         "kind": "declared-repair-group",
         "provenance": "DECLARED",
         "repairGroupId": "group.repair-predicate",
-        "findingIds": ["code-reviewer:1"],
+        "findingIds": ["code-reviewer-1"],
         "rootCause": {
           "provenance": "DECLARED",
           "statement": "The predicate returned the vulnerable constant."
@@ -291,7 +405,7 @@ All-unresolved accounting is represented without fake groups or checks:
   "provenance": "DECLARED",
   "dispositions": [
     {
-      "findingId": "code-reviewer:1",
+      "findingId": "code-reviewer-1",
       "status": "unresolved",
       "reason": "The repair has not been implemented."
     }
@@ -363,14 +477,13 @@ adapter receipt) and `outcome.defectFamilyAssessment` (`repair-checked` or
 `not-required`). Commit the installed index and push unless `--no-push`. A push
 failure leaves the valid local commit intact and is reported with its SHA.
 
-**P4 source status:** Reviewer Protocol v2 is implemented in this feature checkout,
-not yet independently reviewed, merged, published, or cut over into the loaded
-runtime. The parent must use its actually admitted CLI/Skill for later registered
-review and installation. Reviewer v1 source history does not imply remediation
-v1: the existing P3 v2 installation/report policy remains unchanged. The earlier
-Skill 3.1 bootstrap belongs to P3 history (ADR-0008), not this wire migration.
-Documentation and development validation neither advance a Run nor mint an
-installation receipt.
+**Publication status:** P4 merged/reloaded; P5 final validation, registered review
+and publication remain pending. Follow the bootstrap restriction at the start of
+this Skill: admitted main CLI/Skill 5.0.0 and existing Plan advisory triage for
+P5's own review/remediation. Source reviewer version never selects remediation
+version; schema-2 installation/report policy remains unchanged. The earlier
+Skill 3.1 bootstrap belongs to P3 history (ADR-0008). Documentation and development
+validation do not advance a Run or mint an installation receipt.
 
 A newly installed/updated Pi package requires `/reload` or a full Pi restart
 before this schema-v2 live workflow can mutate anything. Never unset runtime
@@ -378,10 +491,14 @@ admission variables to force a fresh CLI through an older loaded extension.
 
 ## Phase 5 — Report
 
-Relay the inspection renderer's emitted/admitted and after-refutation counts;
-report repaired dispositions from actual P3 accounting, every original critical
+Relay the inspection renderer's emitted/admitted and after-refutation counts for
+v1/v2, or new/inherited/current disposition and coverage counts for v3. Never count
+inherited history as newly emitted. Report exact policy publication/revision and
+DECLARED reasons (or honest bootstrap/historical unavailability), repaired
+dispositions from actual P3 accounting, every original critical
 Finding ID and disposition, Declared Repair Groups, blockers, every advisory
-disposition/reason, both Run Directories, plan, changed files, validation
+disposition/reason, review/policy/remediation Run Directories as applicable, Plan,
+changed files, validation
 evidence, Defect-Family Assessment with provenance, actual installation receipt,
 commit SHA, branch, and push status. Include every refuted finding with panel
 reasoning. Say `repair-checked`, not closed/proven/resolved.

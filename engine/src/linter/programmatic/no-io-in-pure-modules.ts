@@ -17,11 +17,11 @@ import { makeViolation } from "../types";
  *
  * These are the shipped DEFAULTS: running loom's own linter with them must
  * not flag loom's own code, so only genuinely-pure modules belong here.
- * `engine/src/core/` and `engine/src/parsers/` are NOT listed — despite the
- * "core"/"parser" naming, most of those files are harness-agnostic decision
- * functions that legitimately peek at the filesystem (existsSync) or write
- * to stderr, so they are not pure and would self-flag. The machine and
- * Defect-Family Accounting closures below are verified by machine-purity.test.ts.
+ * `engine/src/core/` and `engine/src/parsers/` are NOT listed wholesale: those
+ * directories are mixed and include a small number of filesystem/stderr users,
+ * so directory-wide classification would incorrectly self-flag them. Pure files
+ * are enumerated explicitly. The machine and Defect-Family Accounting closures
+ * below are verified by machine-purity.test.ts.
  */
 export const DEFAULT_PURE_MODULES: readonly string[] = [
   "engine/src/linter/types.ts",
@@ -62,6 +62,10 @@ export const DEFAULT_PURE_MODULES: readonly string[] = [
   "engine/src/core/review-output.ts",
   "engine/src/core/reviewer-contract.ts",
   "engine/src/core/reviewer-protocol.ts",
+  "engine/src/core/standalone-lineage-contract.ts",
+  "engine/src/core/standalone-lineage.ts",
+  "engine/src/core/standalone-disposition-machine.ts",
+  "engine/src/core/standalone-successor-reviewer.ts",
   "engine/src/core/context-packets.ts",
   "engine/src/core/context-packet-projection.ts",
   "engine/src/core/safe-io-cause.ts",

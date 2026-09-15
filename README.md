@@ -168,7 +168,7 @@ Critical Findings are adjudicated by a Refutation Panel. **Default panel size is
 
 A clean rerun cannot erase an old blocker by omission.
 
-Fresh reviewer registrations in this checkout use Reviewer Protocol v2: one JSON
+Fresh independent standalone/Wave registrations use Reviewer Protocol v2: one JSON
 payload, engine-derived counts/IDs, and full critical Finding Basis under the
 issued schema and impact rubric. Filled fields prove neither truth nor impact.
 Malformed output is failed evidence, not a synthetic Finding. The same panel and
@@ -176,7 +176,9 @@ majority remain; a true assertion is not refuted because fixing it seems unimpor
 and surviving criticals block without a new severity override. Completed and
 unfinished issued reviewer v1 runs keep their original protocol and packet-first
 archived instructions. See [ADR-0009](docs/adr/ADR-0009-versioned-reviewer-protocol.md).
-**P4 source review, merge, publication and loaded-runtime cutover remain pending.**
+**P4 merged as `96153ed` on 2026-09-10; publication/reload were verified.**
+P5 lineage is implemented on the feature worktree; final validation, registered
+review and publication remain pending.
 
 ## Standalone quality workflows
 
@@ -201,13 +203,40 @@ For critical checks, the engine first removes the exact old ignored/untracked re
 The engine binds those observations to unchanged candidate bytes and modes, audits dirty paths, stages literal paths in a temporary Git index, proves the staged set, and installs only versioned opaque authority under the real index lock. The external `done` outcome contains the actual installation receipt and Defect-Family Assessment; callers do not supply staging outcomes, receipts, manifests, report bytes, or Run JSON. Push is optional; force-push is forbidden. Completed v1 remediation is read-only `historical-unknown`, never authority to reinstall; unfinished v1 blocks and missing v2 fields never downgrade. Completed-v2 replay refuses malformed checkpoint audit paths explicitly.
 
 P3's selected operator checks, fresh required reports and installation policy are
-unchanged by the reviewer-wire major version. Both published source-review versions
-retain original IDs/full basis and result authority. Use canonical
+unchanged by the reviewer-wire major version. Published v1/v2 sources retain
+original IDs/full basis and result authority; P5's deliberate v3 arm additionally
+retains the complete exact lineage-bearing source JSON. Use canonical
 `helper orchestration inspect` for engine-rendered emitted/admitted and
 post-refutation counts from root `result.json`; do not author replacement tallies.
 Subsequent review/install uses the actually admitted runtime, with reload/restart
 after package installation. The earlier Skill 3.1 bootstrap is P3 history, not a
 P4 recipe; see [runtime publication](docs/operations.md#remediation-and-git-safety).
+
+### Explicit standalone lineage (P5)
+
+On a matching P5 runtime, parent advisory triage publishes complete ordered
+accepted/deferred/dismissed decisions immediately through the no-agent
+`standalone-disposition` program, even without a fix or successor. Policy remains
+DECLARED; corrections name exact earlier publications, imports are present-day
+attestations, and unavailable history is explicit—not corrupt-current fallback.
+
+An explicitly selected schema-3 successor retains predecessor scope/roles, original
+Finding IDs/assertions/severity/evidence and full history. Every current reviewer
+assesses every origin; resolution needs whole-roster repair judgments against frozen
+bytes/modes. Only new criticals and evidence-bound reopening need a fresh panel.
+New/inherited/current counts are engine-derived. P3 preserves exact full source
+bytes and uses actual active criticals, with a full-current-critical-coverage guard;
+its schema-2 checks/index policy is unchanged. Digests and formally phrased claims
+are not semantic proof. No automatic predecessor, extra rerun roster, review reuse,
+branch join, similarity merge, severity override or formal planning feature.
+
+**Bootstrap restriction:** P5's own final registered review/remediation still uses
+admitted main runtime `sha256:086c472e4e913376c07d69f5116c9ad9655546e22c91e40d28cba9fdd795bc79`
+and Skill 5.0.0's ordinary Plan triage. It does not implement the P5 publisher.
+Do not use a feature CLI against that loaded runtime, unset admission or retrofit
+source review. New records can publish after merge/package publication/reload.
+See [operations/input/bounds](docs/operations.md#standalone-lineage-p5) and
+[ADR-0010](docs/adr/ADR-0010-standalone-finding-lineage.md).
 
 ### Requirements and drift
 

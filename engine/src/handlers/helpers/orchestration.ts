@@ -6,7 +6,7 @@
  *   helper orchestration inspect --run <run-directory> --runs-root <root> [--json]
  *   helper orchestration abandon --run <run-directory> --runs-root <root>
  *                                --reason <text> [--superseded-by <run-directory>]
- *   helper orchestration start <architecture|refutation|standalone-review|wave-gate|remediation> --run <run-directory>
+ *   helper orchestration start <architecture|refutation|standalone-review|standalone-disposition|wave-gate|remediation> --run <run-directory>
  *                              --runs-root <root> < program.json
  *   helper orchestration restart --run <exhausted-wave-run> --new-run <fresh-run-directory>
  *                                --runs-root <root>
@@ -32,10 +32,10 @@
  * already exist. Every other operation requires the run to exist, because an
  * absent Run Directory is the orphan case recovery adjudicates.
  *
- * Each mutating call parses authority, applies at most one event or receipt
- * reconciliation, persists it, and returns exactly one external action. The
- * parent therefore never assembles an action itself, and never has to know
- * which program produced it.
+ * Each mutating call parses authority and drives available deterministic work,
+ * including event and receipt reconciliation, until the next true external
+ * boundary; it then returns exactly one external action. The parent therefore
+ * never assembles an action itself or needs to know which program produced it.
  *
  * `submit` is idempotent: an attempt whose bytes already landed keeps the
  * stored evidence and re-emits the run's current action, which is the expected
@@ -94,7 +94,7 @@ import {
   observeCurrentWaveCompletionResult,
   observeCurrentWaveWorkspace,
 } from "./wave-completion-suite";
-import { createRunDirectory, inspectRunDirectoryEntry, openRunDirectory, type RunDirHandle } from "../../orchestration/run-directory-handle";
+import { createRunDirectory, inspectRunDirectoryEntry, openRegisteredRunDirectory, openRunDirectory, type RunDirHandle } from "../../orchestration/run-directory-handle";
 import {
   deriveRunInspection,
   observed,
@@ -155,6 +155,9 @@ import {
   restartWaveGateFacade,
   startRemediationFacade,
   startStandaloneFacade,
+  prepareStandaloneSuccessorFacadeStart,
+  startPreparedStandaloneSuccessor,
+  replayStandaloneCapturedEvidence,
   startWaveGateFacade,
   waveAdvisoryDecisionRequestId,
   waveGateDecisionMismatch,
@@ -164,10 +167,18 @@ import {
   type RegisteredStandaloneProgram,
   type RegisteredWaveGateProgram,
 } from "./programs";
+import { parseBoundedReviewerJson } from '../../core/reviewer-protocol';
 import { renderStandaloneReviewSummary } from "../../core/standalone-review";
 import { serializeStandaloneReviewMachineState } from "../../core/standalone-review-machine";
 import { argumentValue, hasFlag } from "./cli-args";
 import { REMEDIATION_EVENT_RESOURCE_POLICY } from "./programs/remediation-events";
+import { parseStandaloneDispositionStartBytes } from "../../core/standalone-disposition-machine";
+import { STANDALONE_LINEAGE_LIMITS, standalonePublicationReferenceSchema } from "../../core/standalone-lineage-contract";
+import { projectStandaloneLineageSource, type StandaloneDispositionSelection } from "../../core/standalone-lineage";
+import { readAuthenticatedStandaloneLineageSource } from "./programs/standalone-source";
+import { prepareStandaloneDispositionFacadeStart, startStandaloneDispositionFacade,
+  resumeStandaloneDispositionFacade, inspectStandaloneDispositionFacade, readSelectedStandaloneDisposition,
+  STANDALONE_DISPOSITION_EVENT_RESOURCE_POLICY } from "./programs/standalone-disposition";
 
 const OPERATIONS = ["status", "inspect", "start", "restart", "recover-orphan", "resume", "submit", "correlate", "complete", "decide", "abandon"] as const;
 type Operation = (typeof OPERATIONS)[number];
@@ -185,11 +196,15 @@ function usage(): HookResult {
       "  --runs-root. start/restart/recover-orphan create it; the runs-root must exist.",
       "",
       "  status  [--json] [--wave N] [--runs-root <wave-gate-runs-root>]",
+      "          --runs-root <root> --run <run-directory> selects read-only Run inspection",
       "  inspect --runs-root <root> --run <run-directory> [--json]",
       "          (pure read: program, state, per-slot capture and rejection diagnostics, event tail)",
+      "          --lineage returns authenticated source identity, complete Finding Origins, counts and advisory inventory",
+      "          --replay derives exact standalone result JSON/digest from registered CLI capture receipts, without current result/checkpoint",
+      "          optional exact policy: --disposition <absolute Run directory> --disposition-run <id> --disposition-digest <sha256>",
       "  abandon --runs-root <root> --run <run-directory> --reason <text> [--superseded-by <run-directory>]",
       "          (terminal marker; deletes nothing and refuses every operation that would advance the run)",
-      "  start   <architecture|refutation|standalone-review|wave-gate|remediation> --runs-root <root> --run <run-directory> < program.json",
+      "  start   <architecture|refutation|standalone-review|standalone-disposition|wave-gate|remediation> --runs-root <root> --run <run-directory> < program.json",
       "  restart --runs-root <root> --run <exhausted-wave-run> --new-run <fresh-run-directory>",
       "  recover-orphan --runs-root <root> --run-id <missing-run-id> --wave <N> --digest <sha256> --new-run <fresh-run-directory>",
       "  resume  --runs-root <root> --run <run-directory>",
@@ -646,20 +661,24 @@ async function observeStandaloneReview(
  */
 async function observeRun(handle: RunDirHandle): Promise<RunInspectionObservation & Readonly<{ reviewSummary: string | null }>> {
   const authority = handle.readAuthority();
-  const programRegistration = handle.readProgramRegistration();
-  const requests = handle.readIssuedRequests();
+  const programRegistration = handle.readProgramRegistration(STANDALONE_LINEAGE_LIMITS.retainedBytes);
+  const disposition = programRegistration.ok && typeof programRegistration.value === "object" && programRegistration.value !== null &&
+    (programRegistration.value as Record<string, unknown>).kind === "standalone-disposition";
+  const requests = handle.readIssuedRequests(disposition ? STANDALONE_LINEAGE_LIMITS.retainedBytes : undefined, disposition ? 128 : undefined);
   let remediationOutcome: ObservedFact<RemediationInspectionLabel | null> = observed(null);
-  let checkpoint = await observing(() => handle.readCheckpoint(), "checkpoint");
+  let checkpoint = await observing(() => handle.readCheckpoint(disposition ? STANDALONE_LINEAGE_LIMITS.retainedBytes : undefined), "checkpoint");
   let reviewSummary: string | null = null;
-  let eventPolicy: Parameters<RunDirHandle["readEvents"]>[0];
+  let eventPolicy: Parameters<RunDirHandle["readEvents"]>[0] = disposition ? STANDALONE_DISPOSITION_EVENT_RESOURCE_POLICY : undefined;
   if (programRegistration.ok && programRegistration.value !== null) {
     const parsed = parseRegisteredFacadeProgram(programRegistration.value);
-    if (parsed.kind === "registered" && parsed.program.kind === "standalone-review") {
-      ({ checkpoint, reviewSummary } = await observeStandaloneReview(handle, parsed.program));
-    } else if (parsed.kind === "invalid" &&
-        typeof programRegistration.value === "object" && programRegistration.value !== null &&
-        (programRegistration.value as Record<string, unknown>)["kind"] === "standalone-review") {
+    if (parsed.kind === "registered" && parsed.program.kind === "standalone-disposition") {
+      const inspected = await inspectStandaloneDispositionFacade(handle, parsed.program);
+      checkpoint = inspected.ok ? observed(JSON.stringify(inspected.value)) : unavailable(inspected.message);
+    } else if (parsed.kind === "invalid" && typeof programRegistration.value === "object" &&
+        programRegistration.value !== null && ["standalone-disposition", "standalone-review"].includes(String((programRegistration.value as Record<string, unknown>).kind))) {
       checkpoint = unavailable(parsed.message);
+    } else if (parsed.kind === "registered" && parsed.program.kind === "standalone-review") {
+      ({ checkpoint, reviewSummary } = await observeStandaloneReview(handle, parsed.program));
     } else if (parsed.kind === "invalid" &&
         typeof programRegistration.value === "object" && programRegistration.value !== null &&
         (programRegistration.value as Record<string, unknown>)["kind"] === "remediation") {
@@ -692,7 +711,48 @@ async function observeRun(handle: RunDirHandle): Promise<RunInspectionObservatio
   });
 }
 
+async function inspectLineageOperation(args: readonly string[]): Promise<HookResult> {
+  const root = argumentValue(args, "--runs-root");
+  const run = argumentValue(args, "--run");
+  if (root === null || run === null) return { kind: "error", message: "source inspection requires --runs-root and --run" };
+  const locator = argumentValue(args, "--disposition");
+  const runId = argumentValue(args, "--disposition-run");
+  const dispositionDigest = argumentValue(args, "--disposition-digest");
+  const selected = locator === null && runId === null && dispositionDigest === null ? null
+    : standalonePublicationReferenceSchema.safeParse({ locator, runId, resultDigest: dispositionDigest });
+  if (selected !== null && !selected.success) return { kind: "error", message: "policy inspection requires exact --disposition, --disposition-run and --disposition-digest" };
+  const source = await readAuthenticatedStandaloneLineageSource(root, run);
+  if (!source.ok) return { kind: "error", message: source.message };
+  let selection: StandaloneDispositionSelection = { kind: "historical-decision-unavailable" };
+  if (selected !== null && selected.success) {
+    const publication = readSelectedStandaloneDisposition(source.value, { locator: selected.data.locator,
+      runId: selected.data.runId, dispositionDigest: selected.data.resultDigest });
+    if (!publication.ok) return { kind: "error", message: publication.message };
+    selection = { kind: "selected-record", disposition: publication.value };
+  }
+  const projection = projectStandaloneLineageSource(source.value, selection);
+  if (!projection.ok) return { kind: "error", message: projection.error.message };
+  process.stdout.write(`${JSON.stringify(projection.value, null, 2)}\n`);
+  return { kind: "allow" };
+}
+
 async function inspectOperation(args: readonly string[]): Promise<HookResult> {
+  if (hasFlag(args, "--replay")) {
+    const bound = bindRun(args, openRegisteredRunDirectory);
+    if (!isBound(bound)) return bound;
+    const stored = bound.value.handle.readProgramRegistration(STANDALONE_LINEAGE_LIMITS.retainedBytes);
+    if (!stored.ok) return { kind: "error", message: stored.error.message };
+    const registration = parseRegisteredFacadeProgram(stored.value);
+    if (registration.kind !== "registered" || registration.program.kind !== "standalone-review") return { kind: "error", message: "evidence replay requires registered standalone authority" };
+    const replay = await replayStandaloneCapturedEvidence(bound.value.handle, registration.program);
+    if (!replay.ok) return { kind: "error", message: replay.message };
+    process.stdout.write(`${JSON.stringify({ kind: "standalone-evidence-replay", digest: replay.digest, json: replay.json })}\n`);
+    return { kind: "allow" };
+  }
+  if (hasFlag(args, "--lineage")) return inspectLineageOperation(args);
+  if (["--disposition", "--disposition-run", "--disposition-digest"].some(flag => argumentValue(args, flag) !== null)) {
+    return { kind: "error", message: "disposition selection requires --lineage inspection" };
+  }
   const bound = bindRun(args);
   if (!isBound(bound)) return bound;
   const observation = await observeRun(bound.value.handle);
@@ -1124,7 +1184,7 @@ async function emitRunAction(handle: RunDirHandle, action: unknown): Promise<Hoo
   return { kind: "allow" };
 }
 
-const START_PROGRAMS = ["architecture", "refutation", "standalone-review", "wave-gate", "remediation"] as const;
+const START_PROGRAMS = ["architecture", "refutation", "standalone-review", "wave-gate", "remediation", "standalone-disposition"] as const;
 type StartProgram = (typeof START_PROGRAMS)[number];
 
 const isStartProgram = (value: string | undefined): value is StartProgram =>
@@ -1148,10 +1208,14 @@ type StartRequest =
   | Readonly<{ kind: "wave-gate"; input: RegisteredWaveGateProgram["input"] }>
   | Readonly<{ kind: "panel"; registration: RegisteredPanelProgram }>;
 
-function parseStartRequest(program: StartProgram, stdin: string): ProgramParse<StartRequest> {
+function parseStartRequest(program: Exclude<StartProgram, "standalone-disposition">, stdin: string): ProgramParse<StartRequest> {
   let raw: unknown;
   try {
-    raw = JSON.parse(stdin) as unknown;
+    if (program === "standalone-review") {
+      const decoded = parseBoundedReviewerJson(Buffer.from(stdin), STANDALONE_LINEAGE_LIMITS.retainedBytes);
+      if (!decoded.ok) return { ok: false, message: decoded.error.message };
+      raw = decoded.value;
+    } else raw = JSON.parse(stdin) as unknown;
   } catch (error) {
     return { ok: false, message: `program input is invalid JSON: ${error instanceof Error ? error.message : String(error)}` };
   }
@@ -1200,8 +1264,20 @@ async function startOperation(stdin: string, args: readonly string[]): Promise<H
   if (!isStartProgram(program)) {
     return { kind: "error", message: `start requires ${START_PROGRAMS.join(", ")}` };
   }
+  if (program === "standalone-disposition") return startDispositionOperation(stdin, args.slice(1));
   const request = parseStartRequest(program, stdin);
   if (!request.ok) return { kind: "error", message: request.message };
+  if (request.value.kind === "standalone-review" && "schemaVersion" in request.value.input) {
+    const root = argumentValue(args.slice(1), "--runs-root");
+    const run = argumentValue(args.slice(1), "--run");
+    if (root === null || run === null) return { kind: "error", message: "successor start requires --runs-root and --run" };
+    const prepared = await prepareStandaloneSuccessorFacadeStart(root, run, request.value.input);
+    if (!prepared.ok) return { kind: "error", message: prepared.message };
+    const bound = bindLiveRun(args.slice(1), createRunDirectory);
+    if (!isBound(bound)) return bound;
+    const driven = await startPreparedStandaloneSuccessor(bound.value.handle, prepared.value);
+    return driven.ok ? emitRunAction(bound.value.handle, driven.action) : { kind: "error", message: driven.message };
+  }
   if (request.value.kind === "remediation") {
     const runRoot = argumentValue(args.slice(1), "--runs-root");
     const run = argumentValue(args.slice(1), "--run");
@@ -1226,6 +1302,21 @@ async function startOperation(stdin: string, args: readonly string[]): Promise<H
   const driven = await driveStart(bound.value.handle, request.value);
   if (!driven.ok) return { kind: "error", message: driven.message };
   return emitRunAction(bound.value.handle, driven.action);
+}
+
+async function startDispositionOperation(stdin: string, args: readonly string[]): Promise<HookResult> {
+  if (Buffer.byteLength(stdin) > STANDALONE_LINEAGE_LIMITS.retainedBytes) return { kind: "error", message: "disposition input exceeds byte budget" };
+  const input = parseStandaloneDispositionStartBytes(Buffer.from(stdin));
+  if (!input.ok) return { kind: "error", message: input.error.message };
+  const root = argumentValue(args, "--runs-root");
+  const run = argumentValue(args, "--run");
+  if (root === null || run === null) return { kind: "error", message: "disposition start requires --runs-root and --run" };
+  const prepared = await prepareStandaloneDispositionFacadeStart(input.value, root, run);
+  if (!prepared.ok) return { kind: "error", message: prepared.message };
+  const bound = bindLiveRun(args, createRunDirectory);
+  if (!isBound(bound)) return bound;
+  const driven = await startStandaloneDispositionFacade(bound.value.handle, prepared.value);
+  return driven.ok ? emitRunAction(bound.value.handle, driven.action) : { kind: "error", message: driven.message };
 }
 
 async function recoverOrphanOperation(args: readonly string[]): Promise<HookResult> {
@@ -1345,7 +1436,7 @@ async function resumeOperation(args: readonly string[]): Promise<HookResult> {
 
   const authority = bound.value.handle.readAuthority();
   if (!authority.ok) return { kind: "error", message: authority.error.message };
-  const stored = bound.value.handle.readProgramRegistration();
+  const stored = bound.value.handle.readProgramRegistration(STANDALONE_LINEAGE_LIMITS.retainedBytes);
   if (!stored.ok) return { kind: "error", message: stored.error.message };
   if (stored.value !== null) {
     const facadeParse = parseRegisteredFacadeProgram(stored.value);
@@ -1359,6 +1450,8 @@ async function resumeOperation(args: readonly string[]): Promise<HookResult> {
           resumeStandaloneFacade(bound.value.handle, registration))
         .with({ kind: "remediation" }, (registration) =>
           resumeRemediationFacade(bound.value.handle, registration))
+        .with({ kind: "standalone-disposition" }, (registration) =>
+          resumeStandaloneDispositionFacade(bound.value.handle, registration))
         .with({ kind: "wave-gate" }, (registration) =>
           resumeWaveGateFacade(bound.value.handle, registration))
         .exhaustive();
@@ -1497,6 +1590,9 @@ function bindSubmission(args: readonly string[]): SubmissionBindingResult {
     return { ok: false, result: { kind: "error", message: `registered orchestration program is invalid: ${facade.message}` } };
   }
   const facadeRegistration = facade?.kind === "registered" ? facade.program : null;
+  if (facadeRegistration?.kind === "standalone-disposition") {
+    return { ok: false, result: { kind: "error", message: "no-agent standalone disposition publication does not accept submissions" } };
+  }
   const panelRegistration = stored.value === null ? null : parseRegisteredPanelProgram(stored.value);
   if (stored.value !== null && panelRegistration === null && facadeRegistration === null) {
     return { ok: false, result: { kind: "error", message: "registered orchestration program is malformed" } };
@@ -1876,7 +1972,7 @@ const handler: HookHandler = async (stdin, args) => {
 
   switch (operation) {
     case "status":
-      return statusOperation(rest);
+      return argumentValue(rest, "--run") === null ? statusOperation(rest) : inspectOperation(rest);
     case "inspect":
       return inspectOperation(rest);
     case "abandon":

@@ -24,7 +24,12 @@ describe("current reviewer runbooks preserve protocol and decision boundaries", 
 
   it("versions reviewer wire without changing P3 report/install obligations", () => {
     const text = prose("skills/review-and-fix/SKILL.md");
-    expect(text).toContain('version: "5.0.0"');
+    expect(text).toContain('version: "6.0.0"');
+    expect(text).toContain("admitted main CLI and frozen Skill 5.0.0 contract, including its existing Plan advisory triage");
+    expect(text).toContain("Feature mutations belong only in owned matching-runtime fixtures until publication/reload");
+    expect(text).toContain("Fresh independent reviews remain v2");
+    expect(text).toContain("Only explicit schema-3 successor start input selects v3");
+    expect(text).toContain("limited current critical coverage blocks even a zero-active-critical install");
     expect(text).toContain("unfinished schema-v1 remediation run");
     expect(text).toContain("operator checks, fresh required reports and verified-index policy are unchanged");
     expect(text).toContain("every original source ID and full basis immutably");
@@ -65,6 +70,10 @@ describe("current reviewer runbooks preserve protocol and decision boundaries", 
     expect(text).toContain('`jsonc-parser: "3.3.1"`');
     expect(text).toContain("no blanket package/core allowlist");
     expect(text).toContain("not invented original provenance");
-    expect(text).toContain("Source review, merge, publication and loaded-runtime cutover remain pending");
+    expect(text).toContain("P4 merged as `96153edc3dd755b4ac648ed48920b6670753c5a6` on 2026-09-10");
+    expect(text).toContain("publication/loaded-runtime reload were verified");
+    expect(text).toContain("P5's separate successor implementation is tracked in [ADR-0010]");
+    expect(text).toContain("its final validation, registered review and publication remain pending");
+    expect(text).not.toContain("Source review, merge, publication and loaded-runtime cutover remain pending");
   });
 });

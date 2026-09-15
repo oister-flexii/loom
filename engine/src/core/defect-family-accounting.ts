@@ -16,6 +16,7 @@ import {
   type NonEmpty,
   type OrchestrationRunId,
 } from "./orchestration-contract";
+import { readDenseDataArray, type DataBoundaryError } from "./orchestration-contract/bytes";
 import {
   COMPLETION_REPORT_ROOT,
   isProtectedVerificationPath,
@@ -24,12 +25,14 @@ import {
   type CompletionTimeoutMs,
   type RepositoryRelativePath,
 } from "./completion-suite";
-import { canonicalStandaloneResultArtifact } from "./standalone-review";
+import { canonicalStandaloneResultArtifact, serializeAdjudicatedStandaloneReview } from "./standalone-review";
 import {
   isAuthoritativeStandaloneReviewResult,
+  readStandaloneReviewPublication,
   type AuthoritativeStandaloneReviewResult,
 } from "./standalone-review-machine";
-import { parseStoredFindings, type Finding, type RefutedFinding } from "./findings";
+import { parseFindingId as parseCanonicalFindingId, parseStoredFindings, type Finding, type RefutedFinding } from "./findings";
+import { STANDALONE_LINEAGE_LIMITS } from "./standalone-lineage-contract";
 import { parseReviewPath, sha256Hex, type ReviewPath } from "./review-packet";
 import {
   parseFrozenVerificationManifest,
@@ -37,7 +40,6 @@ import {
 } from "./verification-manifest";
 import { MAX_STRUCTURED_REPORT_BYTES, parseReportSummary, type TestReportSummary } from "./structured-test-report";
 
-const MAX_COLLECTION_LENGTH = 1_048_576;
 const REPAIR_GROUP_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/;
 
 const success = <T, E = never>(value: T): DomainResult<T, E> => canonicalRecord({ ok: true, value });
@@ -46,6 +48,7 @@ const immutableArray = <T>(values: readonly T[]): readonly T[] => Object.freeze(
 
 type DefectFamilyFailureCode =
   | "invalid-source-authority"
+  | "critical-coverage-limited"
   | "invalid-declaration"
   | "source-declaration-mismatch"
   | "missing-critical-disposition"
@@ -182,40 +185,36 @@ function exactRecord(raw: unknown, fields: readonly string[], path: string): Int
   }
 }
 
+/** Dense own-data array boundary delegated to the shared kernel parser
+ *  (orchestration-contract/bytes.ts). The kernel's enumerable/configurable
+ *  own-data length rule is the canonical acceptance corner — one parser can no
+ *  longer disagree with the kernel about which arrays it accepts. */
 function denseArray(raw: unknown, path: string, nonEmpty = false): InternalParse<readonly unknown[]> {
-  try {
-    if (!Array.isArray(raw) || Object.getPrototypeOf(raw) !== Array.prototype) {
-      return rejected(problem("invalid-declaration", path, `${path} must be a plain array`));
-    }
-    const descriptor = Object.getOwnPropertyDescriptor(raw, "length");
-    if (descriptor === undefined || !("value" in descriptor) ||
-        typeof descriptor.value !== "number" || !Number.isSafeInteger(descriptor.value) ||
-        descriptor.value < 0 || descriptor.value > MAX_COLLECTION_LENGTH) {
-      return rejected(problem("invalid-declaration", path, `${path} has an invalid or excessive length`));
-    }
-    const length = descriptor.value;
-    if (nonEmpty && length === 0) {
-      return rejected(problem("invalid-declaration", path, `${path} must be non-empty`));
-    }
-    const keys = Reflect.ownKeys(raw);
-    if (keys.length !== length + 1 || keys[length] !== "length") {
-      return rejected(problem("invalid-declaration", path, `${path} must be dense and contain no extra fields`));
-    }
-    const values: unknown[] = [];
-    for (let index = 0; index < length; index += 1) {
-      if (keys[index] !== String(index)) {
-        return rejected(problem("invalid-declaration", `${path}[${index}]`, `${path} has a hole at index ${index}`));
-      }
-      const entry = Object.getOwnPropertyDescriptor(raw, String(index));
-      if (entry === undefined || !("value" in entry) || !entry.enumerable) {
-        return rejected(problem("invalid-declaration", `${path}[${index}]`, `${path}[${index}] must be own data`));
-      }
-      values.push(entry.value);
-    }
-    return parsed(Object.freeze(values));
-  } catch {
-    return rejected(problem("invalid-declaration", path, `${path} could not be safely inspected`));
+  const result = readDenseDataArray(raw, path);
+  if (!result.ok) return rejected(denseArrayProblem(path, result.error));
+  if (nonEmpty && result.value.length === 0) {
+    return rejected(problem("invalid-declaration", path, `${path} must be non-empty`));
   }
+  return parsed(result.value);
+}
+
+/** Translate the kernel's typed boundary failure into this module's exact
+ *  InternalParse vocabulary; callers here discriminate on these failures, not
+ *  on DataBoundaryError. */
+function denseArrayProblem(path: string, error: DataBoundaryError): DefectFamilyFailure {
+  if (error.reason === "sparse-array" && error.index !== null) {
+    return problem("invalid-declaration", `${path}[${error.index}]`, `${path} has a hole at index ${error.index}`);
+  }
+  if (error.reason === "accessor-field" || error.reason === "non-enumerable-field") {
+    const at = `${path}[${error.index ?? 0}]`;
+    return problem("invalid-declaration", at, `${at} must be own data`);
+  }
+  const message = error.reason === "not-array" ? `${path} must be a plain array`
+    : error.reason === "invalid-array-length" ? `${path} has an invalid or excessive length`
+    : error.reason === "symbol-field" || error.reason === "sparse-array"
+      ? `${path} must be dense and contain no extra fields`
+    : `${path} could not be safely inspected`;
+  return problem("invalid-declaration", path, message);
 }
 
 function declaredText(raw: unknown, path: string): InternalParse<DeclaredText> {
@@ -284,7 +283,14 @@ export type SourceFindingInventory = Readonly<{
   survivingCriticals: readonly Finding[];
   refutedCriticals: readonly RefutedFinding[];
   advisories: readonly Finding[];
-}>;
+}> & (
+  | Readonly<{ sourceVersion?: never; sourceResultJson?: never }>
+  | Readonly<{
+      sourceVersion: 3;
+      /** Exact canonical publication, including every origin, decision, assessment and prior generation. */
+      sourceResultJson: string;
+    }>
+);
 
 const sourceInventoryCache = new WeakSet<object>();
 
@@ -300,7 +306,13 @@ function createSourceFindingInventory(
         "source inventory requires the opaque authoritative Standalone Review result",
       )]);
     }
-    const artifact = canonicalStandaloneResultArtifact(source);
+    if (source.schemaVersion === 3 && source.lineage.currentCriticalCoverage.kind === "limited") {
+      return accountingFailure([problem("critical-coverage-limited", "source.lineage.currentCriticalCoverage",
+        `current critical coverage is limited for origin(s): ${source.lineage.currentCriticalCoverage.origins.join(", ")}; remediation cannot authorize checks or installation`)]);
+    }
+    const artifact = source.schemaVersion === 3
+      ? readStandaloneReviewPublication(source, STANDALONE_LINEAGE_LIMITS.retainedBytes)
+      : canonicalStandaloneResultArtifact(source);
     if (!artifact.ok) {
       return accountingFailure([problem("invalid-source-authority", "source", artifact.error.message)]);
     }
@@ -323,14 +335,17 @@ function createSourceFindingInventory(
         "authoritative Standalone Review finding classifications are inconsistent or overlap",
       )]);
     }
-    const inventory = canonicalRecord({
+    const partitions = {
       sourceRunId: artifact.value.runId,
       sourceResultDigest: artifact.value.digest,
       sourceResultByteLength: artifact.value.byteLength,
       survivingCriticals: immutableArray(survivingCriticals),
       refutedCriticals: immutableArray(refutedCriticals),
       advisories: immutableArray(advisories),
-    });
+    };
+    const inventory: SourceFindingInventory = source.schemaVersion === 3
+      ? canonicalRecord({ ...partitions, sourceVersion: 3, sourceResultJson: serializeAdjudicatedStandaloneReview(source) })
+      : canonicalRecord(partitions);
     sourceInventoryCache.add(inventory);
     return success(inventory);
   } catch {
@@ -344,8 +359,22 @@ function createSourceFindingInventory(
 
 declare const DECLARED_TEXT: unique symbol;
 declare const REPAIR_GROUP_ID: unique symbol;
+declare const FINDING_ID: unique symbol;
 type DeclaredText = string & { readonly [DECLARED_TEXT]: true };
 type RepairGroupId = string & { readonly [REPAIR_GROUP_ID]: true };
+type FindingId = string & { readonly [FINDING_ID]: true };
+
+/** Every disposition and repair-group join keys on the Finding id; branding it
+ *  through the canonical parseFindingId shape extends the kernel's identity-branded
+ *  pattern (OrchestrationRunId, RequestId, SlotId, RepairGroupId) to that id, so a
+ *  RepairGroupId-shaped string is no longer silently assignable where a finding
+ *  id is expected. */
+function parseFindingId(raw: unknown, path: string): InternalParse<FindingId> {
+  const canonical = parseCanonicalFindingId(raw);
+  return canonical !== null
+    ? parsed(canonical as FindingId)
+    : rejected(problem("invalid-declaration", path, `${path} must be a non-empty exact source Finding id`));
+}
 
 type DeclaredSemanticClaim = Readonly<{
   provenance: "DECLARED";
@@ -353,9 +382,9 @@ type DeclaredSemanticClaim = Readonly<{
 }>;
 
 type CriticalFindingDisposition =
-  | Readonly<{ findingId: string; status: "repaired"; repairGroupId: RepairGroupId }>
-  | Readonly<{ findingId: string; status: "unresolved"; reason: DeclaredText }>
-  | Readonly<{ findingId: string; status: "out-of-scope"; reason: DeclaredText }>;
+  | Readonly<{ findingId: FindingId; status: "repaired"; repairGroupId: RepairGroupId }>
+  | Readonly<{ findingId: FindingId; status: "unresolved"; reason: DeclaredText }>
+  | Readonly<{ findingId: FindingId; status: "out-of-scope"; reason: DeclaredText }>;
 
 type SiblingDisposition =
   | Readonly<{ path: ReviewPath; status: "repaired"; reason: DeclaredText }>
@@ -387,7 +416,7 @@ type DeclaredRepairGroup = Readonly<{
   kind: "declared-repair-group";
   provenance: "DECLARED";
   repairGroupId: RepairGroupId;
-  findingIds: NonEmpty<string>;
+  findingIds: NonEmpty<FindingId>;
   rootCause: DeclaredSemanticClaim;
   invariant: DeclaredSemanticClaim;
   siblings: DeclaredSiblingAccounting;
@@ -554,15 +583,14 @@ function parseDisposition(raw: unknown, path: string): InternalParse<CriticalFin
   const record = exactRecord(raw, fields, path);
   if (!record.ok) return record;
   const failures: DefectFamilyFailure[] = [];
-  if (typeof record.value.findingId !== "string" || record.value.findingId.trim() !== record.value.findingId || record.value.findingId === "") {
-    failures.push(problem("invalid-declaration", `${path}.findingId`, `${path}.findingId must be a non-empty exact source Finding id`));
-  }
+  const findingId = parseFindingId(record.value.findingId, `${path}.findingId`);
+  if (!findingId.ok) failures.push(...findingId.error);
   if (record.value.status === "repaired") {
     const groupId = parseRepairGroupId(record.value.repairGroupId, `${path}.repairGroupId`);
     if (!groupId.ok) failures.push(...groupId.error);
-    return failures.length === 0 && groupId.ok
+    return failures.length === 0 && groupId.ok && findingId.ok
       ? parsed(canonicalRecord({
-          findingId: record.value.findingId as string,
+          findingId: findingId.value,
           status: "repaired" as const,
           repairGroupId: groupId.value,
         }))
@@ -573,23 +601,24 @@ function parseDisposition(raw: unknown, path: string): InternalParse<CriticalFin
   }
   const reason = declaredText(record.value.reason, `${path}.reason`);
   if (!reason.ok) failures.push(...reason.error);
-  return failures.length === 0 && reason.ok &&
+  return failures.length === 0 && reason.ok && findingId.ok &&
       (record.value.status === "unresolved" || record.value.status === "out-of-scope")
     ? parsed(canonicalRecord({
-        findingId: record.value.findingId as string,
+        findingId: findingId.value,
         status: record.value.status,
         reason: reason.value,
       }))
     : failure(immutableArray(failures));
 }
 
-function parseStringIds(raw: unknown, path: string): InternalParse<NonEmpty<string>> {
+function parseStringIds(raw: unknown, path: string): InternalParse<NonEmpty<FindingId>> {
   const entries = denseArray(raw, path, true);
   if (!entries.ok) return entries;
   const failures: DefectFamilyFailure[] = [];
   const ids = entries.value.flatMap((entry, index) => {
-    if (typeof entry === "string" && entry.trim() === entry && entry.length > 0) return [entry];
-    failures.push(problem("invalid-repair-group", `${path}[${index}]`, `${path}[${index}] must be a non-empty exact Finding id`));
+    const findingId = parseFindingId(entry, `${path}[${index}]`);
+    if (findingId.ok) return [findingId.value];
+    failures.push(...findingId.error);
     return [];
   });
   const duplicates = ids.filter((id, index) => ids.indexOf(id) !== index);
@@ -600,7 +629,7 @@ function parseStringIds(raw: unknown, path: string): InternalParse<NonEmpty<stri
   ));
   const [head, ...tail] = [...ids].sort(compareStrings);
   return failures.length === 0 && head !== undefined
-    ? parsed(Object.freeze([head, ...tail]) as NonEmpty<string>)
+    ? parsed(Object.freeze([head, ...tail]) as NonEmpty<FindingId>)
     : failure(immutableArray(failures));
 }
 
@@ -677,7 +706,10 @@ function validateAccounting(
   groups: readonly DeclaredRepairGroup[],
 ): readonly DefectFamilyFailure[] {
   const failures: DefectFamilyFailure[] = [];
-  const dispositionIds = dispositions.map(({ findingId }) => findingId);
+  // The inventory's surviving-critical ids are plain strings; comparisons
+  // against them are string comparisons. The FindingId brand earns its keep at
+  // the parse boundary and the repair-group join, not here.
+  const dispositionIds: readonly string[] = dispositions.map(({ findingId }) => findingId);
   for (const id of dispositionIds) {
     const foreign = classifyForeignFinding(inventory, id, "defectFamily.dispositions");
     if (foreign !== null) failures.push(foreign);

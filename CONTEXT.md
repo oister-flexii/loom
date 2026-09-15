@@ -49,7 +49,7 @@ The Pi-only parent-relayed RPC child transport for one interactive phase Agent. 
 _Avoid_: Question-file fallback, parent interview, interactive subagent (that is the tool surface, not the transport contract)
 
 **Wire Contract**:
-The exact machine-readable output shape a review Agent must emit. Fresh reviewer issuance in this checkout uses Reviewer Protocol v2: one JSON payload with engine-derived counts and IDs. The executable schema/rubric generate the shared fragment and seven stamped shims; never hand-edit those copies. Completed and unfinished issued v1 contracts retain their original markers/block/lifecycle parsing. [ADR-0009](docs/adr/ADR-0009-versioned-reviewer-protocol.md) records the boundary; P4 source review, merge, publication and runtime cutover remain pending.
+The exact machine-readable output shape a review Agent must emit. Fresh independent standalone/Wave issuance uses Reviewer Protocol v2: one JSON payload with engine-derived counts and IDs. Only explicit standalone successor schema-3 input selects the separate v3 envelope; its new Finding drafts retain v2 evidence. The executable schema/rubric generate the shared fragment and seven stamped shims; never hand-edit those copies. Completed and unfinished issued v1 contracts retain their original markers/block/lifecycle parsing. [ADR-0009](docs/adr/ADR-0009-versioned-reviewer-protocol.md) records the boundary. P4 merged as `96153ed` on 2026-09-10; publication and loaded-runtime cutover were verified. P5 successor contracts are implemented and the registered review and remediation are complete ([ADR-0010](docs/adr/ADR-0010-standalone-finding-lineage.md)); they do not rewrite issued v1/v2 evidence. Publication and the /reload cutover happen after merge.
 _Avoid_: Output format, response template, Machine Summary (that is one historical v1 section, not the current contract)
 
 **Wave Gate**:
@@ -112,6 +112,34 @@ _Avoid_: Workspace, scratch dir, output dir
 An immutable review-and-adjudication record outside the wave lifecycle. It binds an exact file scope to the complete expected reviewer transcript set, identified Findings, optional Refutation Panel outcomes, and one finalized remediation input. It never reads or writes the State File.
 _Avoid_: Synthetic Task, fake Wave, ad-hoc review output
 
+**Finding Origin**:
+The immutable identity of one originally attributed Finding, qualified by its originating Standalone Review Run, issued request and accepted transcript, and joined to its original result publication. A bare Finding ID is only local identity; a successor preserves the original assertion, severity, location and evidence rather than reminting it. Current locally originated Findings obtain their result identity from enclosing publication, never a self-referential digest.
+_Avoid_: Similar claim, deduplicated Finding, global ordinal
+
+**Standalone Disposition Record**:
+An immutable independently published parent-policy record bound to one exact completed Standalone Review result and its complete ordered advisory-origin inventory, including retired history. A no-agent program publishes it immediately after autonomous parent triage, even without later remediation/successor work. Accepted/deferred/dismissed decisions and reasons remain DECLARED; corrections name an exact earlier published revision without editing it, and forks remain explicit. Historical absence and present-day imports retaining exact prose/reference are distinct; missing/corrupt expected current publication never becomes historical absence. This is neither Refutation Panel authority nor repair evidence.
+_Avoid_: Resolved Finding, policy proof, mutable triage ledger
+
+**Standalone Successor Binding**:
+One explicit authenticated predecessor result, exact published disposition revision or honest historical absence, conserved Finding Origin inventory, and the successor's frozen source bytes/modes and complete issued reviewer roster. Explicit schema-3 start selects this binding; independent standalone/Wave issuance remains v2. Successors retain prior scope and roles; dependencies/contracts must be explicitly scoped, and unknown historical observations stay unknown. Every current reviewer assesses every inherited origin once in order, including retired history. Forks are never automatically merged. Independent reviews and same-Run infrastructure recovery are not successor bindings.
+_Avoid_: Latest review, same-name Run, review reuse, recoverable predecessor state
+
+**Standalone Resolution Assessment**:
+A source-bound semantic assessment resolving one prior Finding only when every current expected review Agent explicitly verifies its repair and identifies a relevant implementation change. Every reason and current request is retained; any disagreement, not-assessable or absent assessment prevents resolution. It is reviewer judgment, never engine proof, a Task Review Generation, or an automatic consequence of Repair-Checked.
+_Avoid_: Refutation, declared repair, passing-check proof
+
+**Standalone Reopening Proposal**:
+An issued successor reviewer's explicit challenge to one exact prior disposition/refutation/resolution, naming its Finding Origin, current applicability, changed conditions or contradictory new evidence, and evidence limits. A critical proposal reaches a fresh fully bound Refutation Panel under the existing majority rule before re-adjudication. It never rewrites the origin, promotes advisory severity or erases historical votes.
+_Avoid_: Parent override, duplicate Finding, severity promotion
+
+**Current Critical Coverage**:
+A standalone successor's engine-derived complete-or-limited assessment coverage over inherited critical origins, including refuted/resolved history. A not-assessable critical origin yields explicit limitation even when no critical is currently active; P3 refuses before checks/candidate/installable authority. This is separate from fresh panel work and surviving-critical counts.
+_Avoid_: Zero-critical pass, new-finding count, test coverage
+
+**Attempt-One Admission**:
+The pure decision that classifies every expected attempt-1 slot of a resumed standalone review as captured, reissue, or tombstoned, given the captured-attempt set and every gathered capture-rejection receipt. Two refusal classes both reject the slot where the machine can advance it to attempt 2 instead of dead-locking the roster on every resume: a semantically refused transcript, and a capture terminally rejected by the harness runtime (no bytes landed at all). A tombstoned slot is dead for capture and is not re-issued; the machine advances it to attempt 2 through the rejection path. The shell gathers the I/O first and applies the returned trichotomy — the policy is never interleaved with I/O.
+_Avoid_: Admission sweep, Phase A (a reviewer's phase label, not the decision), retry decision
+
 **Defect-Family Accounting**:
 Exact accounting of one Standalone Review Run's surviving critical Finding IDs into Declared Repair Groups or explicit blocking dispositions. Grouping, root cause, invariant, sibling-path completeness, and Historical RED remain semantic declarations; accounting never changes the source Findings or creates a Resolved Finding.
 _Avoid_: Proven closure, automatic root-cause discovery, cross-run finding lineage
@@ -137,7 +165,7 @@ The exact parsed immutable generation record beside one session's `.task_graph` 
 _Avoid_: Pointer owner flag, shared pointer, best-effort rollback
 
 **Trusted Review Witness Aggregate**:
-The process-local Pi authority grouped by session, Standalone Review root, and Review Run, with explicit touch recency. Verification considers only the current run for that root; rejection never falls back, exact acceptance is idempotent and retires older root witnesses, and session shutdown prunes the session aggregate.
+The process-local Pi authority grouped by session, Standalone Review root, and Review Run. A run becomes current when its first exact standalone spawn is bound before dispatch; retries and later captures enrich that run without reordering it. Verification considers only the current run for that root; rejection or missing capture never falls back, exact acceptance is idempotent and retires older root witnesses, and session shutdown prunes the session aggregate.
 _Avoid_: Review cache, accepted result fallback, global witness map
 
 **Plan**:
@@ -361,13 +389,20 @@ _Avoid_: Constraint (too generic), rule (alone), enforced guideline (advisory ru
 - A Task-scoped **Completion Suite Result** binds to one **Implementation Attempt**; a Wave-scoped result binds to a quiescent Wave workspace
 - Review Agents consume one immutable **Review Packet** per Task
 - A **Session TaskGraph Pointer Lease Registry** restores its previous target only after the generation's final exact lease is released
-- A **Trusted Review Witness Aggregate** verifies only the most recently touched Standalone Review Run for one session/root and is pruned at session shutdown
+- A **Trusted Review Witness Aggregate** verifies only the latest first-bound Standalone Review Run for one session/root; retries/captures never reorder runs, and session shutdown prunes the aggregate
 - A **Review Run** binds that Review Packet to one **Review Generation**, the expected review Agents, and all prior active Finding IDs
 - A **Resolved Finding** leaves the active set only when every Agent in its Review Run explicitly verifies remediation; any `still_present` assessment keeps it active
 - A **Panel Program** emits the exact Agent batches and engine operations for each panel
 - The **Orchestration Façade** materializes each batch as **Agent Request Authority** plus a **Context Packet**
 - An **Effect Receipt** makes an authorized side effect reconcilable and idempotent across resume
 - A **Standalone Review Run** feeds identified critical Findings through the same **Refutation Panel** without creating a Task or mutating the State File
+- P5's feature-worktree implementation (final validation/review/publication pending in `.claude/plans/2026-09-10-standalone-lineage.md`): a **Standalone Disposition Record** captures advisory policy immediately and independently of later remediation or successor review
+- A **Standalone Successor Binding** conserves every **Finding Origin**, its original publication and prior disposition history; fresh reviewer evidence never reuses predecessor votes as current review completion
+- A **Standalone Resolution Assessment** requires the full current roster against one frozen source; **Repair-Checked** alone creates none
+- Limited **Current Critical Coverage** cannot authorize P3 installation even when there are zero active criticals; full v3 canonical source bytes and original IDs remain in schema-2 remediation authority
+- Only new criticals and evidence-bound critical reopening require current **Refutation Panel** work; unchanged upheld inherited criticals remain active without a new panel or extra automatic reviewer roster
+- A **Standalone Reopening Proposal** preserves old adjudication and supplies explicit new evidence to current adjudication; only engine attribution creates new Finding IDs
+- **Attempt-One Admission** is one pure decision applied by every standalone resume orchestrator; the shell gathers capture-rejection receipts first and the policy is never interleaved with I/O
 - An **Issued Reviewer Protocol** binds the same parser/rubric through capture admission, retry, replay, panel projection, and publication; completed and unfinished issued v1 reviews retain their original contract
 - A **Finding Basis** distinguishes truth confidence from consequence; structural admission proves neither, and an admitted surviving critical stays blocking without a new severity-dispute authority
 - A **Reviewer Protocol Failure** blocks evidence completion, not product-defect accounting; the existing explicit Wave operator override remains separate from reviewer settlement

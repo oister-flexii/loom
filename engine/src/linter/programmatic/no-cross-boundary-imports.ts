@@ -111,6 +111,7 @@ export const DEFAULT_BOUNDARIES: readonly BoundaryRule[] = [
     // every import statement; it is now off the list.
     perFileExactAllow: {
       "engine/src/core/reviewer-contract.ts": ["zod/v4"],
+      "engine/src/core/standalone-lineage-contract.ts": ["zod/v4"],
       "engine/src/core/reviewer-protocol.ts": ["jsonc-parser"],
     },
     perFileAllow: {
@@ -135,8 +136,7 @@ export const DEFAULT_BOUNDARIES: readonly BoundaryRule[] = [
       "engine/src/core/repository-path.ts": ["node:path"],
       "engine/src/core/review-packet.ts": ["node:crypto"],
       "engine/src/core/review-panel.ts": ["node:path"],
-      "engine/src/core/standalone-review.ts": ["node:crypto"],
-      "engine/src/core/standalone-review-machine.ts": ["node:crypto", "node:util"],
+      "engine/src/core/standalone-review.ts": ["node:crypto", "node:util"],
       // Exact runtime entry and transitive implementation bytes are gated by machine-purity.
       "engine/src/core/structured-test-report.ts": ["saxes"],
       "engine/src/core/wave-gate-machine.ts": ["node:crypto"],

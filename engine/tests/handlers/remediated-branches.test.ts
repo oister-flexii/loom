@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolvesWithin } from "../../src/handlers/subagent-stop/advance-phase";
@@ -323,8 +323,10 @@ describe("remediation façade refusals", () => {
     return { runsRoot, source, handle: openedRemediation.value };
   }
 
-  it("refuses when the source review has written no checkpoint at all", async () => {
-    const { runsRoot, source, handle } = sourceRun(() => { /* no checkpoint */ });
+  it("refuses missing source registration before checkpoint lookup without creating source authority", async () => {
+    const { runsRoot, source, handle } = sourceRun(() => { /* neither registration nor checkpoint */ });
+    const authority = readFileSync(join(source, "authority.json"));
+    const entries = readdirSync(source).sort();
 
     const driven = await driveRemediationFacade(handle, {
       kind: "remediation",
@@ -335,7 +337,16 @@ describe("remediation façade refusals", () => {
     if (!driven.ok) return;
     const action = driven.action as { kind: string; diagnostic: { message: string } };
     expect(action.kind).toBe("blocked");
-    expect(action.diagnostic.message).toContain("source standalone review checkpoint is missing");
+    expect(action.diagnostic.message).toBe("source standalone review registration is missing");
+    expect(readFileSync(join(source, "authority.json"))).toEqual(authority);
+    expect(readdirSync(source).sort()).toEqual(entries);
+    for (const directory of [source, handle.runDirectory]) {
+      expect(existsSync(join(directory, "program.json"))).toBe(false);
+      expect(existsSync(join(directory, "checkpoint.json"))).toBe(false);
+      expect(existsSync(join(directory, "result.json"))).toBe(false);
+      expect(readdirSync(join(directory, "events"))).toEqual([]);
+      expect(readdirSync(join(directory, "receipts"))).toEqual([]);
+    }
   });
 
   it("refuses when the source review's checkpoint is unreadable", async () => {

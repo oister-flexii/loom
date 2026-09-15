@@ -2028,13 +2028,57 @@ describe("Pi extension review tool_result integration", () => {
     expect(currentReceipt).toMatchObject({ runId: "run.cli-session-binding-second" });
     expect(await bridge.verify({ cwd: projectCwd, sessionId: session })).toEqual(currentReceipt);
 
+    const rejectedRunId = "run.cli-session-binding-rejected";
+    const rejectedRunDir = join(runsRoot, rejectedRunId);
+    const rejectedAction = JSON.parse(execFileSync("bun", [
+      join(ROOT, "engine", "src", "cli.ts"),
+      "helper", "orchestration", "start", "standalone-review",
+      "--runs-root", runsRoot, "--run", rejectedRunDir,
+    ], {
+      cwd: projectCwd,
+      encoding: "utf-8",
+      input: JSON.stringify({ kind: "comments", files: ["src/types.ts"], dryRun: false }),
+      env: {
+        ...process.env,
+        PI_CODING_AGENT: "true",
+        PI_SESSION_ID: session,
+        LOOM_SUBAGENT_DIR: subagentDir,
+      },
+    })) as {
+      kind: string;
+      requests: readonly { authority: AgentRequestAuthority; task: string }[];
+    };
+    const rejectedRequest = rejectedAction.requests[0]!;
+    const rejectedToolCallId = "call-session-run-binding-rejected";
+    expect(await pi.emit("tool_call", {
+      toolName: "subagent",
+      toolCallId: rejectedToolCallId,
+      input: { agent: rejectedRequest.authority.role, task: rejectedRequest.task, agentScope: "user" },
+    }, { sessionManager: { getSessionId: () => session } })).toEqual([undefined]);
+    const rejectedResponses = await pi.emit("tool_result", {
+      toolName: "subagent",
+      toolCallId: rejectedToolCallId,
+      isError: false,
+      input: {},
+      content: [],
+      details: { results: [{
+        agent: rejectedRequest.authority.role,
+        task: rejectedRequest.task,
+        exitCode: 0,
+        messages: [null],
+      }] },
+    }, { sessionManager: { getSessionId: () => session } });
+    expect(rejectedResponses).toContainEqual(expect.objectContaining({ isError: true }));
+    await expect(bridge.verify({ cwd: projectCwd, sessionId: session }))
+      .rejects.toThrow(`current witnessed Standalone Review rejected: ${rejectedRunId}: no transcript capture was witnessed`);
+
     await pi.emit("session_shutdown", {}, {
       cwd: projectCwd,
       sessionManager: { getSessionId: () => session },
     });
     await expect(bridge.verify({ cwd: projectCwd, sessionId: session }))
       .rejects.toThrow(`no request-bound Loom captures were witnessed for Pi session ${session}`);
-  });
+  }, 60_000);
 
   it("reloads durable session authority when the Pi extension restarts between spawn and result", async () => {
     const beforeReload = await extension();

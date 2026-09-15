@@ -26,12 +26,35 @@ import { assertAnchoredFilesystemPlatformSupported } from "./orchestration/no-fo
 const FAILURE_EXIT_CODE = failureExitCode(process.argv[2], process.argv[3]);
 const PACKAGE_ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
+// Bound retained inputs before chunk retention/concatenation. Orchestration submit is
+// shared by every reviewer protocol, so its raw-capture ceiling is intentionally broader
+// than the separate 1 MiB semantic-admission limit applied after durable capture.
+// Every hook route keeps a finite 4 MiB ceiling so an oversized or hostile stdin fails
+// fast with a clear message instead of accumulating chunks until OOM.
+const ORCHESTRATION_STDIN_BYTES = 16_777_216;
+const HOOK_STDIN_BYTES = 4_194_304;
+const dispositionStart = process.argv.slice(2, 6).join("/") === "helper/orchestration/start/standalone-disposition";
+const standaloneStart = process.argv.slice(2, 6).join("/") === "helper/orchestration/start/standalone-review";
+const orchestrationSubmit = process.argv.slice(2, 5).join("/") === "helper/orchestration/submit";
+const orchestrationInput = dispositionStart || standaloneStart || orchestrationSubmit;
+const maximumStdinBytes = orchestrationInput ? ORCHESTRATION_STDIN_BYTES : HOOK_STDIN_BYTES;
 // Eagerly buffer stdin before any async work (bun drains piped data during dynamic imports)
 const stdinPromise: Promise<string> = process.stdin.isTTY
   ? Promise.resolve("")
   : new Promise((resolve, reject) => {
       const chunks: Buffer[] = [];
-      process.stdin.on("data", (chunk) => chunks.push(chunk));
+      let total = 0;
+      process.stdin.on("data", (chunk: Buffer) => {
+        total += chunk.length;
+        if (total > maximumStdinBytes) {
+          chunks.length = 0;
+          // Orchestration routes keep their established message verbatim; hook routes
+          // name the finite bound that now replaces unbounded retention.
+          reject(new Error(orchestrationInput
+            ? "orchestration input exceeds 16777216 byte limit"
+            : `stdin exceeds ${HOOK_STDIN_BYTES} byte limit`));
+        } else chunks.push(chunk);
+      });
       process.stdin.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
       process.stdin.on("error", reject);
     });

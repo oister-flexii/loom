@@ -42,7 +42,7 @@ export const unavailable = <T>(reason: string): ObservedFact<T> =>
 
 /** The registered program kinds a checkpoint's state label can be read through. */
 export const INSPECTABLE_PROGRAMS = [
-  "standalone-review", "remediation", "wave-gate", "architecture", "refutation",
+  "standalone-review", "standalone-disposition", "remediation", "wave-gate", "architecture", "refutation",
 ] as const;
 export type InspectableProgram = (typeof INSPECTABLE_PROGRAMS)[number];
 
@@ -160,7 +160,7 @@ function checkpointStateLabel(
   const root = record(raw);
   if (root === null) return null;
   return match(program)
-    .with("standalone-review", "wave-gate", () => text(root["kind"]))
+    .with("standalone-review", "standalone-disposition", "wave-gate", () => text(root["kind"]))
     .with("remediation", () => {
       const registrationVersion = record(rawRegistration)?.["schemaVersion"];
       const state = record(root["state"]);

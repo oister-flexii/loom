@@ -5,6 +5,13 @@
  * re-exported by index.ts so all existing import sites are unchanged.
  */
 import { createHash } from 'node:crypto';
+import { publishStandalonePanelView, verifyStandalonePanelView } from '../../../orchestration/standalone-panel-context';
+import { parseStandaloneSuccessorRegistration, parseStandaloneSuccessorStartInput, type RegisteredStandaloneSuccessorProgram } from './standalone-successor-registration';
+import type { PreparedStandaloneSuccessor } from '../../../core/standalone-lineage';
+import { buildStandaloneSuccessorReviewerContext, parseIssuedStandaloneSuccessorReviewer, standaloneSuccessorReviewerRegistration } from '../../../core/standalone-successor-reviewer';
+import type { StandaloneReviewerProtocolResolver } from '../../../core/standalone-review';
+import type { StandaloneReviewerContextPacketV3 } from '../../../core/context-packets';
+import { parseRegisteredStandaloneDispositionProgram, type RegisteredStandaloneDispositionProgram } from '../../../core/standalone-disposition-machine';
 import { devNull } from 'node:os';
 import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -36,11 +43,11 @@ type RegisteredReviewerProtocol =
   | Readonly<{ schemaVersion: 1; reviewerProtocol?: never }>
   | Readonly<{ schemaVersion: 2; reviewerProtocol: ReviewerProtocolDescriptor }>;
 
-export type RegisteredStandaloneProgram = RegisteredReviewerProtocol & Readonly<{
+export type RegisteredStandaloneProgram = RegisteredStandaloneSuccessorProgram | (RegisteredReviewerProtocol & Readonly<{
   kind: "standalone-review";
   input: Readonly<{ kind: StandaloneReviewKind; files: readonly string[] | null; dryRun: boolean }>;
   authority: unknown;
-}>;
+}>);
 
 export type WaveGateRestartAudit = Readonly<{
   previousRunId: string;
@@ -61,20 +68,10 @@ export type RegisteredWaveGateProgram = RegisteredReviewerProtocol & Readonly<{
   orphanRecovery?: OrphanedWaveGateRecoveryAudit;
 }>;
 
-export type RegisteredFacadeProgram = RegisteredStandaloneProgram | RegisteredRemediationProgram | RegisteredWaveGateProgram;
+export type RegisteredFacadeProgram = RegisteredStandaloneProgram | RegisteredRemediationProgram | RegisteredWaveGateProgram | RegisteredStandaloneDispositionProgram;
 
-export type FacadeDriveResult =
-  | Readonly<{ ok: true; action: unknown }>
-  | Readonly<{ ok: false; message: string }>;
-
-/**
- * The module's shared Either shape for parse/lookup boundaries — the same role
- * PolicyResult/ParseResult play in the core modules. Success carries the
- * parsed value; failure carries the exact operator-facing message.
- */
-export type ProgramParse<T> =
-  | Readonly<{ ok: true; value: T }>
-  | Readonly<{ ok: false; message: string }>;
+import type { FacadeDriveResult, ProgramParse } from './program-result';
+export type { FacadeDriveResult, ProgramParse } from './program-result';
 
 export const failed = (message: string): FacadeDriveResult => ({ ok: false, message });
 
@@ -87,6 +84,7 @@ export function exactObject(raw: unknown, keys: readonly string[]): raw is Recor
 }
 
 export function parseStandaloneStartInput(raw: unknown): ProgramParse<RegisteredStandaloneProgram["input"]> {
+  if (typeof raw === "object" && raw !== null && Object.hasOwn(raw, "schemaVersion")) return parseStandaloneSuccessorStartInput(raw);
   if (!exactObject(raw, ["kind", "files", "dryRun"])) {
     return { ok: false, message: "standalone-review input must contain exactly kind, files, and dryRun" };
   }
@@ -144,10 +142,10 @@ export type DerivedChangedPaths = Readonly<{
 }>;
 
 /**
- * Fail CLOSED on a path this repository's own parser cannot canonicalize: a
- * path we cannot name is a path we cannot prove is not run evidence, and
- * admitting it would put a Run Directory's own transcripts into the frozen
- * review scope. Exclusion is the safe answer; the reviewed set only shrinks.
+ * Changed-path discovery omits paths this repository cannot canonicalize and
+ * excludes orchestration evidence from the derived review scope. Callers that
+ * require explicit complete coverage must supply and parse that scope instead
+ * of treating this filter as rejection authority.
  */
 export function reviewablePath(path: string): boolean {
   const parsed = parseCanonicalRepositoryRelativePath(path, "standalone review scope path");
@@ -158,7 +156,7 @@ export function deriveChangedPaths(): DerivedChangedPaths {
   const head = gitText(["rev-parse", "HEAD"]);
   let base: string | null = null;
   for (const candidate of ["origin/main", "origin/master", "main", "master"]) {
-    const probe = spawnSync("git", ["merge-base", candidate, "HEAD"], { encoding: "utf8" });
+    const probe = spawnSync("git", ["merge-base", candidate, head], { encoding: "utf8" });
     if (probe.status === 0 && probe.stdout.trim() !== "") { base = probe.stdout.trim(); break; }
   }
   const untracked = gitPaths(["ls-files", "--others", "--exclude-standard", "-z", "--"]).filter(reviewablePath);
@@ -166,12 +164,12 @@ export function deriveChangedPaths(): DerivedChangedPaths {
   const stagedAdded = gitPaths(["diff", "--cached", "--name-only", "--diff-filter=A", "-z", "--"]).filter(reviewablePath);
   const committedAdded = base === null
     ? []
-    : gitPaths(["diff", "--name-only", "--diff-filter=A", "-z", `${base}...HEAD`, "--"]).filter(reviewablePath);
+    : gitPaths(["diff", "--name-only", "--diff-filter=A", "-z", `${base}...${head}`, "--"]).filter(reviewablePath);
   return Object.freeze({
     authority: Object.freeze({
       unstaged: Object.freeze([...new Set([...trackedUnstaged, ...untracked])].sort()),
       staged: gitPaths(["diff", "--cached", "--name-only", "-z", "--"]).filter(reviewablePath),
-      committed: base === null ? Object.freeze([]) : gitPaths(["diff", "--name-only", "-z", `${base}...HEAD`, "--"]).filter(reviewablePath),
+      committed: base === null ? Object.freeze([]) : gitPaths(["diff", "--name-only", "-z", `${base}...${head}`, "--"]).filter(reviewablePath),
       base_revision: base,
       head_revision: head,
     }),
@@ -228,12 +226,7 @@ export function classifyScope(
   const languages = [...new Set(extensions.filter(Boolean).map((extension) => extension.slice(1)))].sort();
   const sourceOrTestChanged = scope.some((path, index) =>
     SOURCE_EXTENSIONS.has(extensions[index]!) || /(^|\/)(test|tests|__tests__)(\/|$)/.test(path));
-  // `docs_only` MEANS "no source or test file changed", and the load boundary
-  // (core/standalone-review) refuses any record where both are true. Matching
-  // the documentation shape alone did not carry that meaning: `docs/tests/x.md`
-  // satisfies the docs pattern AND the test-path pattern, so this producer
-  // could emit a record its own validator would reject. The exclusion is part
-  // of the definition, not a check layered on top of it.
+  // Canonically, docsOnly implies commentsChanged and excludes sourceOrTestChanged.
   const docsOnly = !sourceOrTestChanged
     && scope.every((path) => /(^|\/)(docs?|README)(\/|\.|$)|\.(md|mdx|txt)$/.test(path));
   return Object.freeze({
@@ -348,10 +341,10 @@ export function publicationFile(effectId: string): string {
   return `publications/${createHash("sha256").update(effectId).digest("hex")}.json`;
 }
 
-export function publicationResolver(handle: RunDirHandle): PublicationAuthorityResolver {
+export function publicationResolver(handle: RunDirHandle, maximumBytes?: number): PublicationAuthorityResolver {
   return createPublicationAuthorityResolver((lookup) => {
     try {
-      const bytes = readRunBytesNoFollow(`${handle.runDirectory}/artifacts/${publicationFile(lookup.effectId)}`);
+      const bytes = readRunBytesNoFollow(`${handle.runDirectory}/artifacts/${publicationFile(lookup.effectId)}`, maximumBytes);
       return { ok: true, value: Object.freeze([...bytes]) };
     } catch (error) {
       return { ok: false, error: {
@@ -368,7 +361,7 @@ const protocolUnavailable = (message: string): DomainResult<never, ReviewerProto
 });
 
 /** Read the exact durable publication; reservation or packet hashes alone do not issue a request. */
-function publishedReviewerRequest(handle: RunDirHandle, request: AgentRequestAuthority): ProgramParse<SpawnRequest> {
+export function publishedReviewerRequest(handle: RunDirHandle, request: AgentRequestAuthority, maximumBytes?: number): ProgramParse<SpawnRequest> {
   const reserved = handle.readIssuedRequests();
   if (!reserved.ok) return { ok: false, message: "reviewer request reservations are unavailable" };
   const matching = reserved.value.filter((entry) => entry.requestId === request.requestId);
@@ -378,9 +371,9 @@ function publishedReviewerRequest(handle: RunDirHandle, request: AgentRequestAut
   const directory = openDirectoryNoFollow(join(handle.runDirectory, "artifacts", "publications"));
   try {
     const candidates: SpawnRequest[] = [];
-    for (const name of listDirectoryNamesNoFollow(directory)) {
+    for (const name of listDirectoryNamesNoFollow(directory, maximumBytes === undefined ? undefined : 128)) {
       if (!name.endsWith(".json")) continue;
-      const raw: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(readDirectoryFileNoFollow(directory, name)));
+      const raw: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(readDirectoryFileNoFollow(directory, name, maximumBytes)));
       const receipt = parseBatchPublishedReceipt(raw);
       if (!receipt.ok || receipt.value.runId !== handle.runId || publicationFile(receipt.value.effectId) !== `publications/${name}`) {
         return { ok: false, message: "reviewer publication receipt is malformed or belongs to another run/effect" };
@@ -391,7 +384,7 @@ function publishedReviewerRequest(handle: RunDirHandle, request: AgentRequestAut
       if (!sameAgentRequestAuthority(entry.authority, request)) {
         return { ok: false, message: "reviewer publication differs from the exact requested authority" };
       }
-      const issued = parseIssuedSpawnRequest(publicationResolver(handle), {
+      const issued = parseIssuedSpawnRequest(publicationResolver(handle, maximumBytes), {
         ...entry, issuance: { schemaVersion: 1, kind: "issued-spawn-request-proof", runId: handle.runId,
           effectId: receipt.value.effectId, publicationDigest: receipt.value.publicationDigest, batchIndex },
       });
@@ -438,23 +431,33 @@ function registeredReviewerSubject(
   }) };
 }
 
-/** Independently reread the whole program, publication, reservation and packet on every resolution. */
+/** Legacy resolution retains its exact joins; the explicit successor arm requires nominal source authority. */
+export function reviewerProtocolResolver(handle: RunDirHandle, registration: RegisteredStandaloneProgram | RegisteredWaveGateProgram,
+  maximumBytes?: number): ReviewerProtocolAuthorityResolver;
+export function reviewerProtocolResolver(handle: RunDirHandle, registration: RegisteredStandaloneProgram,
+  maximumBytes: number, successor: PreparedStandaloneSuccessor): StandaloneReviewerProtocolResolver;
 export function reviewerProtocolResolver(
   handle: RunDirHandle,
   registration: RegisteredStandaloneProgram | RegisteredWaveGateProgram,
-): ReviewerProtocolAuthorityResolver {
+  maximumBytes?: number,
+  successor?: PreparedStandaloneSuccessor,
+): StandaloneReviewerProtocolResolver {
+  if (successor !== undefined) return registration.kind === "standalone-review" && registration.schemaVersion === 3
+    ? successorReviewerProtocolResolver(handle, registration, successor, maximumBytes ?? 16_777_216)
+    : () => protocolUnavailable("successor purpose requires an explicit standalone v3 registration");
   return (request) => {
     try {
       const stored = handle.readProgramRegistration();
       if (!stored.ok) return protocolUnavailable("reviewer program registration is unavailable");
       const parsed = parseRegisteredFacadeProgram(stored.value);
       const expected = parseRegisteredFacadeProgram(registration);
-      if (parsed.kind !== "registered" || parsed.program.kind === "remediation" || expected.kind !== "registered" ||
+      if (parsed.kind !== "registered" || (parsed.program.kind !== "standalone-review" && parsed.program.kind !== "wave-gate") || expected.kind !== "registered" ||
           !canonicalStructuralEquals(parsed.program, expected.program) || request.runId !== handle.runId ||
           request.program !== parsed.program.kind) {
         return protocolUnavailable("reviewer registration or request differs from independently parsed durable authority");
       }
-      const published = publishedReviewerRequest(handle, request);
+      if (parsed.program.schemaVersion === 3) return protocolUnavailable("standalone v3 requires the independently authenticated successor purpose");
+      const published = publishedReviewerRequest(handle, request, maximumBytes);
       if (!published.ok) return protocolUnavailable(published.message);
       const packet = handle.readContext(request.contextDigest);
       if (!packet.ok) return protocolUnavailable("published reviewer Context Packet is unavailable");
@@ -470,10 +473,38 @@ export function reviewerProtocolResolver(
   };
 }
 
+/** Select from registration, never reviewer payload shape or a global current version. */
+export function standaloneReviewerProtocolResolver(handle: RunDirHandle, registration: RegisteredStandaloneProgram,
+  successor?: PreparedStandaloneSuccessor, maximumBytes = 16_777_216): StandaloneReviewerProtocolResolver {
+  if (registration.schemaVersion !== 3) return reviewerProtocolResolver(handle, registration, maximumBytes);
+  return successor === undefined ? () => protocolUnavailable("successor resolver requires independently authenticated predecessor")
+    : reviewerProtocolResolver(handle, registration, maximumBytes, successor);
+}
+
+function successorReviewerProtocolResolver(handle: RunDirHandle, registration: RegisteredStandaloneSuccessorProgram,
+  successor: PreparedStandaloneSuccessor, maximumBytes: number): StandaloneReviewerProtocolResolver {
+  // One operation-local immutable registration snapshot; every request still proves
+  // its own publication/reservation and rereads its exact Context Packet bytes.
+  const authority = readRegisteredStandaloneAuthority(handle, registration, successor);
+  return request => {
+    try {
+      if (!authority.ok) return protocolUnavailable(authority.message);
+      const expected = authority.value.roster.orderedSlots.flatMap(slot => slot.attempts).find(entry => entry.requestId === request.requestId);
+      if (expected === undefined || !sameAgentRequestAuthority(expected, request)) return protocolUnavailable("successor request differs from registered roster");
+      const issued = publishedReviewerRequest(handle, request, maximumBytes);
+      if (!issued.ok) return protocolUnavailable(issued.message);
+      const packet = handle.readStandaloneSuccessorContext(request.contextDigest, maximumBytes);
+      if (!packet.ok) return protocolUnavailable(packet.error.message);
+      return parseIssuedStandaloneSuccessorReviewer({ request: issued.value, packet: packet.value,
+        registration: standaloneSuccessorReviewerRegistration(successor), prepared: successor });
+    } catch (cause) { return protocolUnavailable(`successor publication/context unavailable (${safeIoCause(cause)})`); }
+  };
+}
+
 export async function publishInitialBatch(
   handle: RunDirHandle,
   requests: readonly InitialSpawnRequestInput[],
-  packets: readonly ContextPacket[],
+  packets: readonly (ContextPacket | StandaloneReviewerContextPacketV3)[],
   label: string,
 ): Promise<Readonly<{ ok: true; requests: readonly SpawnRequest[]; action: unknown }> | Readonly<{ ok: false; message: string }>> {
   const effectId = parseEffectId(`effect:${label}:${createHash("sha256").update(requests.map((entry) =>
@@ -484,6 +515,15 @@ export async function publishInitialBatch(
   for (const packet of packets) {
     const published = await handle.publishContext(packet);
     if (!published.ok) return { ok: false, message: published.error.message };
+    if (packet.schemaVersion === 1 && packet.role === "review-verifier-agent") {
+      const raw = handle.readProgramRegistration(16_777_216);
+      if (!raw.ok) return { ok: false, message: raw.error.message };
+      const registration = parseRegisteredFacadeProgram(raw.value);
+      if (registration.kind === "invalid") return { ok: false, message: registration.message };
+      if (registration.kind === "registered" && registration.program.kind === "standalone-review" && registration.program.schemaVersion === 3) {
+        await publishStandalonePanelView(handle, packet);
+      }
+    }
   }
   for (const request of intent.value.issuedRequests) {
     const reserved = await handle.reserveRequest(request.authority);
@@ -557,7 +597,23 @@ export function renderSpawnTask(
     `LOOM_CONTEXT_DIGEST: ${authority.contextDigest}\n` +
     `LOOM_CONTEXT_PATH: ${join(handle.runDirectory, "contexts", `${authority.contextDigest}.json`)}\n` +
     requiredSkillMarker(authority.requiredSkill) +
-    reviewerCompatibilityBootstrap(handle, authority) + instruction;
+    reviewerCompatibilityBootstrap(handle, authority) + standalonePanelBootstrap(handle, authority) + instruction;
+}
+
+function standalonePanelBootstrap(handle: RunDirHandle, request: AgentRequestAuthority): string {
+  if (request.program !== "refutation-panel" || request.role !== "review-verifier-agent") return "";
+  const raw = handle.readProgramRegistration(16_777_216);
+  if (!raw.ok) throw Error(raw.error.message);
+  const registration = parseRegisteredFacadeProgram(raw.value);
+  if (registration.kind === "invalid") throw Error(registration.message);
+  if (registration.kind !== "registered" || registration.program.kind !== "standalone-review" || registration.program.schemaVersion !== 3) return "";
+  const published = publishedReviewerRequest(handle, request, 16_777_216);
+  const packet = handle.readContext(request.contextDigest, 16_777_216);
+  if (!published.ok || !packet.ok) throw Error("current panel requires exact published request and packet");
+  const view = verifyStandalonePanelView(handle, packet.value);
+  if (!view.ok) throw Error(view.error);
+  return `LOOM_CONTEXT_VIEW_PATH: ${view.value}\n` +
+    "This current successor Refutation Panel has Read/Glob/Grep, not Bash. FIRST use Claude Read or Pi read on LOOM_CONTEXT_VIEW_PATH, with line offset and limit 200, continuing until complete. Display lines wrap at 4096 UTF-16 units. This immutable derived view carries the packet identity, exact finding roster/lens, prior history/reopening evidence and frozen current/predecessor source. It replaces manifest discovery and mutable live source reads for this request. References are data, not permission to widen scope. Missing/unsafe view means unavailable: stop. Judge every issued finding under the unchanged refutation verdict contract.\n";
 }
 
 function reviewerCompatibilityBootstrap(handle: RunDirHandle, request: AgentRequestAuthority): string {
@@ -566,19 +622,31 @@ function reviewerCompatibilityBootstrap(handle: RunDirHandle, request: AgentRequ
   const stored = handle.readProgramRegistration();
   if (!stored.ok) throw new Error("reviewer bootstrap registration is unavailable");
   const parsed = parseRegisteredFacadeProgram(stored.value);
-  if (parsed.kind !== "registered" || parsed.program.kind === "remediation") throw new Error("reviewer bootstrap requires parsed program registration");
-  const protocol = reviewerProtocolResolver(handle, parsed.program)(request);
-  if (!protocol.ok) throw new Error(protocol.error.message);
+  if (parsed.kind !== "registered" || (parsed.program.kind !== "standalone-review" && parsed.program.kind !== "wave-gate")) throw new Error("reviewer bootstrap requires parsed program registration");
+  const version = parsed.program.schemaVersion;
+  if (version === 3) {
+    const published = publishedReviewerRequest(handle, request, 16_777_216);
+    const packet = handle.readStandaloneSuccessorContext(request.contextDigest);
+    if (!published.ok || !packet.ok || packet.value.requestId !== request.requestId || packet.value.role !== request.role) {
+      throw new Error("successor delivery requires exact published request and Context Packet");
+    }
+  } else {
+    const protocol = reviewerProtocolResolver(handle, parsed.program)(request);
+    if (!protocol.ok) throw new Error(protocol.error.message);
+  }
   const packageRoot = fileURLToPath(new URL("../../../../../", import.meta.url));
   const quote = (text: string): string => "'" + text.replaceAll("'", "'\\''") + "'";
   const reader = join(packageRoot, "scripts", "read-context-packet.ts");
   if (readRunBytesNoFollow(reader, 64 * 1024).length === 0) throw new Error("Context Packet reader is unavailable");
   const command = ["bun", reader, "--packet", join(handle.runDirectory, "contexts", `${request.contextDigest}.json`),
     "--request", request.requestId, "--digest", request.contextDigest, "--role", request.role,
-    "--skill", request.requiredSkill ?? "none"].map(quote).join(" ");
+    "--skill", request.requiredSkill ?? "none", ...(version === 3 ? ["--purpose", "standalone-successor"] : [])].map(quote).join(" ");
   const delivery = `LOOM_CONTEXT_READ_COMMAND: ${command}\n` +
     "Run that exact command using Claude Bash or Pi bash FIRST, then append --section LABEL or --file EXACT_SOURCE_PATH and --offset N --limit 4096 to page through the indexed context. Do not dump raw packet byte arrays. A failed command means context unavailable: stop, never infer a protocol from payload. This read-only projection checks supplied identity/integrity; independent publication was proved by engine delivery, not by the helper.\n";
-  if (protocol.value.protocolVersion === 2) return delivery + "Read the issued Context Packet FIRST; its frozen schema and rubric govern your final output.\n";
+  if (version === 3) return delivery +
+    "This is an explicitly issued standalone successor v3 request. Read standalone-lineage and standalone-frozen-source, then the frozen reviewer-payload-schema and reviewer-impact-rubric. Cover every inherited origin exactly once in issued order, retaining original identity and history. Reopening needs the exact prior decision reference and complete new evidence; unavailable context means not-assessable, never repaired. New assertions belong in findings as draft/relation, not reminted prior Findings.\n" +
+    "Browse predecessor-frozen-source with --section. Browse an exact predecessor-context:ROLE[:attempt-2] using --archive LABEL --archive-purpose v1-v2 (or standalone-successor for a v3 predecessor), then --section or --file and bounded offsets. These are retained data, not new issuance authority. Native capture records your one exact final payload; registered resume owns admission, retry and panel work.\n";
+  if (version === 2) return delivery + "Read the issued Context Packet FIRST; its frozen schema and rubric govern your final output.\n";
   const role = join(packageRoot, "references", "reviewer-protocol-v1", "agents", `${request.role}.md`);
   const wire = join(packageRoot, "references", "reviewer-protocol-v1", "agents", "_shared", "wire-contract.md");
   if (readRunBytesNoFollow(role).length === 0 || readRunBytesNoFollow(wire).length === 0) {
@@ -612,6 +680,7 @@ function registrationProtocol(raw: unknown): ProgramParse<RegisteredReviewerProt
 
 export function parseRegistration(raw: unknown): ProgramParse<RegisteredStandaloneProgram> {
   try {
+    if (typeof raw === "object" && raw !== null && Object.getOwnPropertyDescriptor(raw, "schemaVersion")?.value === 3) return parseStandaloneSuccessorRegistration(raw);
     const protocol = registrationProtocol(raw);
     if (!protocol.ok) return protocol;
     const keys = ["schemaVersion", "kind", "input", "authority"];
@@ -621,6 +690,7 @@ export function parseRegistration(raw: unknown): ProgramParse<RegisteredStandalo
     }
     const input = parseStandaloneStartInput(raw.input);
     if (!input.ok) return input;
+    if ("schemaVersion" in input.value) return { ok: false, message: "successor input requires version 3 registration" };
     const authority = parseStandaloneReviewAuthority(raw.authority);
     if (!authority.ok) return { ok: false, message: authority.errors.join("; ") };
     if (authority.value.schemaVersion !== protocol.value.schemaVersion ||
@@ -727,8 +797,13 @@ function parseFacadeRegistration(raw: unknown): FacadeRegistrationParse {
   const kindDescriptor = record === null ? undefined : Object.getOwnPropertyDescriptor(record, "kind");
   if (kindDescriptor !== undefined && !("value" in kindDescriptor)) return invalidRegistration("program kind must be own data");
   const kind: unknown = kindDescriptor?.value;
-  if (kind !== "standalone-review" && kind !== "remediation" && kind !== "wave-gate") {
+  if (kind !== "standalone-review" && kind !== "remediation" && kind !== "wave-gate" && kind !== "standalone-disposition") {
     return Object.freeze({ kind: "unclaimed" });
+  }
+
+  if (kind === "standalone-disposition") {
+    const disposition = parseRegisteredStandaloneDispositionProgram(raw);
+    return disposition.ok ? registeredProgram(disposition.value) : invalidRegistration(disposition.error.message);
   }
 
   if (kind === "standalone-review") {
@@ -742,7 +817,10 @@ function parseFacadeRegistration(raw: unknown): FacadeRegistrationParse {
       ? registeredProgram(remediation.value)
       : invalidRegistration(remediation.error.message);
   }
+  return parseRegisteredWaveGateProgram(raw);
+}
 
+function parseRegisteredWaveGateProgram(raw: unknown): FacadeRegistrationParse {
   const protocol = registrationProtocol(raw);
   if (!protocol.ok) return invalidRegistration(protocol.message);
   const waveBaseKeys = ["schemaVersion", "kind", "input", "taskIds", "authorityDigest",
@@ -779,34 +857,46 @@ function parseFacadeRegistration(raw: unknown): FacadeRegistrationParse {
     : invalidRegistration(input.message);
 }
 
-export function parsedAuthority(registration: RegisteredStandaloneProgram): ProgramParse<FrozenStandaloneReviewAuthority> {
+export function parsedAuthority(registration: RegisteredStandaloneProgram, successor?: PreparedStandaloneSuccessor): ProgramParse<FrozenStandaloneReviewAuthority> {
   const parsed = parseRegistration(registration);
   if (!parsed.ok) return parsed;
-  const result = parseStandaloneReviewAuthority(parsed.value.authority);
+  const result = parseStandaloneReviewAuthority(parsed.value.authority, successor);
+  if (result.ok && result.value.schemaVersion !== parsed.value.schemaVersion) return { ok: false, message: "registered standalone version differs from frozen authority" };
   return result.ok ? { ok: true, value: result.value } : { ok: false, message: result.errors.join("; ") };
+}
+
+/** Inputs must be parsed registrations: exact section hashes already cover their immutable bytes. */
+export function sameRegisteredStandalonePrograms(left: RegisteredStandaloneProgram, right: RegisteredStandaloneProgram): boolean {
+  const identity = (registration: RegisteredStandaloneProgram) => {
+    if (registration.schemaVersion !== 3) return registration;
+    const section = ({ label, digest, byteLength }: RegisteredStandaloneSuccessorProgram["currentSource"]) => ({ label, digest, byteLength });
+    return { ...registration, currentSource: section(registration.currentSource), previousContexts: registration.previousContexts.map(section) };
+  };
+  return canonicalStructuralEquals(identity(left), identity(right));
 }
 
 export function readRegisteredStandaloneAuthority(
   handle: RunDirHandle,
   expected: RegisteredStandaloneProgram,
+  successor?: PreparedStandaloneSuccessor,
 ): ProgramParse<FrozenStandaloneReviewAuthority> {
   const raw = handle.readProgramRegistration();
   if (!raw.ok) return { ok: false, message: "standalone program registration is unavailable" };
   const registered = parseRegistration(raw.value);
   const supplied = parseRegistration(expected);
-  if (!registered.ok || !supplied.ok || !canonicalStructuralEquals(registered.value, supplied.value)) {
+  if (!registered.ok || !supplied.ok || !sameRegisteredStandalonePrograms(registered.value, supplied.value)) {
     return { ok: false, message: "standalone registration differs from independently parsed durable program authority" };
   }
-  return parsedAuthority(registered.value);
+  return parsedAuthority(registered.value, successor);
 }
 
-export function readPublishedStandaloneResult(handle: RunDirHandle, state: StandaloneDoneState): ProgramParse<StandaloneDoneState> {
+export function readPublishedStandaloneResult(handle: RunDirHandle, state: StandaloneDoneState, maximumBytes?: number): ProgramParse<StandaloneDoneState> {
   try {
     const receipt = handle.readReceipt(state.publicationReceipt.effectId);
     if (!receipt.ok || !canonicalStructuralEquals(receipt.value, state.publicationReceipt)) {
       return { ok: false, message: "standalone result publication receipt is missing or differs from replay" };
     }
-    const bytes = readRunBytesNoFollow(join(handle.runDirectory, "result.json"));
+    const bytes = readRunBytesNoFollow(join(handle.runDirectory, "result.json"), maximumBytes);
     if (!bytes.equals(Buffer.from(serializeAdjudicatedStandaloneReview(state.result)))) {
       return { ok: false, message: "published standalone result bytes differ from replay" };
     }
@@ -919,6 +1009,17 @@ export async function recoverOrPublishStandaloneRetry(
     }),
   });
 
+  if (authority.schemaVersion === 3) {
+    const packet = handle.readStandaloneSuccessorContext(retryAuthority.contextDigest);
+    if (!packet.ok) return { ok: false, message: packet.error.message };
+    const rebuilt = buildStandaloneSuccessorReviewerContext(authority.successor, retryAuthority, packet.value.variableContext);
+    if (!rebuilt.ok || rebuilt.value.digest !== retryAuthority.contextDigest) return { ok: false, message: "successor retry packet differs from frozen authority" };
+    const recovered = durableRefutationRequests(handle, [input], resolver, `standalone-review-retry:${slot.slotId}`);
+    if (recovered.kind === "corrupt") return { ok: false, message: recovered.message };
+    if (recovered.kind === "found") return { ok: true, request: recovered.requests[0]! };
+    const published = await publishInitialBatch(handle, [input], [packet.value], `standalone-review-retry:${slot.slotId}`);
+    return published.ok ? { ok: true, request: published.requests[0]! } : published;
+  }
   let packet = handle.readContext(retryAuthority.contextDigest);
   if (!packet.ok) {
     // Runs started before the engine published attempt-2 packets up front need
@@ -1019,7 +1120,7 @@ export function refutationRetryTask(task: string, diagnostic: string | null): st
  * whenever one survived to here.
  */
 export function standaloneRetryTask(task: string, diagnostic: string | null, authority: FrozenStandaloneReviewAuthority): string {
-  if (authority.schemaVersion === 2) {
+  if (authority.schemaVersion !== 1) {
     return [task, "", "Your previous attempt was rejected by the engine's admission check.",
       ...(diagnostic === null ? [] : [JSON.stringify(diagnostic)]), "",
       "This is your final attempt. Emit exactly one JSON object conforming to the unchanged reviewer-payload-schema and reviewer-impact-rubric sections."].join("\n");

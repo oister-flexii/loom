@@ -21,6 +21,9 @@ export {
 } from './helpers';
 export {
   inspectStandaloneFacade,
+  prepareStandaloneSuccessorFacadeStart,
+  startPreparedStandaloneSuccessor,
+  replayStandaloneCapturedEvidence,
   readStandaloneReviewedSource,
   replayStandaloneResultFromEvidence,
   resumeStandaloneFacade,

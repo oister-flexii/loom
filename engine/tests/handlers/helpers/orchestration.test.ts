@@ -3654,10 +3654,14 @@ describe("orchestration CLI", () => {
       ], JSON.stringify({ kind: "not-a-review-kind", files: null, dryRun: false }), root));
 
       expect(invalidJson.status).not.toBe(0);
-      expect(invalidJson.stderr).toContain("invalid JSON");
+      expect(invalidJson.stderr.trim()).toBe("Reviewer payload must be exactly one strict JSON object.");
+      expect(invalidJson.stdout).toBe("");
       expect(existsSync(join(runsRoot, "run.invalid-json"))).toBe(false);
       expect(invalidShape.status).not.toBe(0);
+      expect(invalidShape.stderr.trim()).toBe("standalone-review kind is invalid");
+      expect(invalidShape.stdout).toBe("");
       expect(existsSync(join(runsRoot, "run.invalid-shape"))).toBe(false);
+      expect(readdirSync(runsRoot)).toEqual([]);
     });
 
     it("names sourceRun as the offender, before the remediation run is claimed", async () => {

@@ -30,6 +30,7 @@
  */
 
 import { readFileSync } from "node:fs";
+import { readRunBytesNoFollow } from "../../orchestration/no-follow-fs";
 import type { HookHandler, HookResult, SubagentStopInput } from "../../types";
 import type { AgentRequestAuthority } from "../../core/orchestration-contract";
 import { isReviewAgent } from "../../config";
@@ -73,7 +74,7 @@ class ClaudeTranscriptJsonError extends Error {}
 
 export type ClaudePayloadReader = (transcriptPath: string) => readonly FinalPayloadCandidate[];
 
-export function claudeFinalPayloadCandidates(transcriptPath: string): readonly FinalPayloadCandidate[] {
+export function claudeFinalPayloadCandidates(transcriptPath: string, maximumBytes?: number): readonly FinalPayloadCandidate[] {
   // One read, no pre-check: `existsSync` returns false for ELOOP/ENOTDIR too,
   // which would turn an unreadable transcript into a silent "no candidates"
   // before readFileSync could surface the cause. Once the locator selected this
@@ -81,7 +82,8 @@ export function claudeFinalPayloadCandidates(transcriptPath: string): readonly F
   // filesystem evidence the operator must see, never a missing-payload claim.
   const lines = ((): readonly string[] => {
     try {
-      return readFileSync(transcriptPath, "utf-8").split("\n");
+      return (maximumBytes === undefined ? readFileSync(transcriptPath, "utf-8")
+        : new TextDecoder("utf-8", { fatal: true }).decode(readRunBytesNoFollow(transcriptPath, maximumBytes))).split("\n");
     } catch (error) {
       throw new ClaudeTranscriptReadError(
         `cannot read Claude transcript ${transcriptPath}: ${error instanceof Error ? error.message : String(error)}`,
@@ -225,7 +227,24 @@ export async function captureClaudeResult(
       );
     }
     try {
-      return captureCandidates(readPayload(transcriptPath));
+      const correlated = resolveCorrelatedRequest({ harness: "claude", runsRoot, runDirectory, nativeId: input.agent_id ?? "" });
+      const registration = correlated.ok ? correlated.value.handle.readProgramRegistration(16_777_216) : null;
+      if (registration !== null && !registration.ok) {
+        return captureUnavailable("program-registration", `program registration is unavailable: ${registration.error.message}`);
+      }
+      const raw = registration?.value ?? null;
+      const parsedRegistration = raw === null ? null : parseRegisteredFacadeProgram(raw);
+      if (parsedRegistration !== null && parsedRegistration.kind !== "registered") {
+        const problem = parsedRegistration.kind === "invalid"
+          ? parsedRegistration.message
+          : "program registration does not name a registered orchestration program";
+        return captureUnavailable("program-registration", `program registration is unavailable: ${problem}`);
+      }
+      // Every current capture is bounded before decoding. The old unbounded
+      // readFileSync branch admitted the impossible foreign escape, because the
+      // correlated request carries no schema version to compare against.
+      return captureCandidates(readPayload === claudeFinalPayloadCandidates
+        ? claudeFinalPayloadCandidates(transcriptPath, 16_777_216) : readPayload(transcriptPath));
     } catch (error) {
       if (error instanceof ClaudeTranscriptReadError) {
         return claudeObservationUnavailable(input, runsRoot, runDirectory, "transcript-read", error.message);

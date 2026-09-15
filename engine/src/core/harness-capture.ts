@@ -25,10 +25,12 @@
 import { createHash } from "node:crypto";
 import {
   canonicalRecord,
+  parseArtifactByteLength,
   parseRequestId,
   parseSlotId,
   type AgentRequestAuthority,
   type ArtifactDigest,
+  type ArtifactRef,
   type DomainResult,
   type RequestId,
   type SemanticAttempt,
@@ -39,13 +41,10 @@ export const CAPTURE_SCHEMA_VERSION = 1;
 /**
  * Why a result could not be accepted BY THESE RULES.
  *
- * This is the core vocabulary only. Harness adapters mint observation reasons:
- * Claude owns `transcript-json` and `transcript-locator`; Pi owns
- * `transcript-shape`, `agent-failed`, and `capture-crashed`. The shared
- * run-directory runtime owns `run-authority`, `run-directory`, `correlator`,
- * `requests`, `context`, `context-binding`, `transcript`, `wrong-agent-role`,
- * and `rejection-persistence`. `CaptureOutcome.reason` is therefore a wider
- * string, and an adapter/runtime reason is not a violation of this union.
+ * This union is only the pure request/payload rejection vocabulary.
+ * Harness observation and run-directory failures belong to `CaptureOutcome`
+ * and its boundary constructors in `harness-capture-runtime`; those diagnostics
+ * intentionally remain wider than this domain union.
  */
 export type CaptureRejectionReason =
   | "no-final-payload"
@@ -239,6 +238,44 @@ export function bindCapture(input: Readonly<{
     byteLength: input.payload.byteLength,
     digest: input.payload.digest,
   }));
+}
+
+/** Write-ahead identity only; never a capture/publication receipt or replay authority. */
+export function nativeCaptureObservation(
+  request: AgentRequestAuthority,
+  receipt: CaptureReceipt,
+  origin: string,
+): string {
+  return JSON.stringify(canonicalRecord({ kind: "native-capture-observed", request, receipt, origin }));
+}
+
+/** A fresh independently bound native observation must match BOTH durable identity and raw bytes. */
+export function recoverNativeCaptureArtifact(input: Readonly<{
+  request: AgentRequestAuthority;
+  receipt: CaptureReceipt;
+  payload: FinalPayload;
+  observation: Uint8Array | null;
+  capturedBytes: Uint8Array;
+}>): DomainResult<ArtifactRef, string> {
+  if (input.receipt.requestId !== input.request.requestId || input.receipt.slotId !== input.request.slotId ||
+      input.receipt.attempt !== input.request.attempt || input.receipt.digest !== input.payload.digest ||
+      input.receipt.byteLength !== input.payload.byteLength) {
+    return { ok: false, error: "native recapture receipt does not bind the fresh request and payload" };
+  }
+  const expected = encoder.encode(nativeCaptureObservation(input.request, input.receipt, input.payload.origin));
+  const observation = input.observation;
+  if (observation === null || observation.length !== expected.length ||
+      !expected.every((byte, index) => observation[index] === byte)) {
+    return { ok: false, error: "native recapture differs from its original request/context/correlator observation" };
+  }
+  if (input.capturedBytes.length !== input.payload.bytes.length ||
+      !input.capturedBytes.every((byte, index) => input.payload.bytes[index] === byte)) {
+    return { ok: false, error: "native recapture differs from the exact already-written transcript bytes" };
+  }
+  const byteLength = parseArtifactByteLength(input.payload.byteLength);
+  if (!byteLength.ok) return { ok: false, error: byteLength.error.message };
+  return { ok: true, value: canonicalRecord({ runId: input.request.runId, slot: input.request.outputSlot,
+    digest: input.payload.digest, byteLength: byteLength.value }) };
 }
 
 // ---------------------------------------------------------------------------

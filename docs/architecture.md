@@ -109,7 +109,9 @@ The project follows “parse, do not cast”: untrusted JSON, transcripts, paths
 | Finding lifecycle | `findings.ts`, `review-output.ts`, `review-packet.ts` | Stable identity, generations, packet-bound remediation verification |
 | Architecture panel | `panel-kernel.ts`, `panel-contract.ts`, `panel-program.ts` | Lenses, exact candidates/criteria, verdict validation, ranking, retries |
 | Refutation panel | `panel-kernel.ts`, `review-panel.ts`, `panel-program.ts` | Exact critical set, verifier lenses, majority tally, retained audit |
-| Standalone review | `standalone-review.ts`, `standalone-review-machine.ts` | Frozen scope/roster, aggregation, optional refutation, authoritative result |
+| Standalone review | `standalone-review.ts` — the cohesive aggregate owner: source/disposition/successor preparation, issued admission, roster aggregation, the LC-2 reducer and its private publication/lineage custody share one owner. `standalone-review-machine.ts`, `standalone-lineage.ts` and `standalone-successor-reviewer.ts` are consumed named entry surfaces into that owner, not three independent implementations | Frozen scope/roster, successor admission, aggregation, current refutation work, authoritative result |
+| Standalone lineage (P5) | `standalone-lineage-contract.ts` (wire contract below the aggregate) plus the `standalone-review.ts` cohesive owner; `standalone-lineage.ts` and `standalone-successor-reviewer.ts` are consumed named entry surfaces | Original identity/history, explicit policy/source joins, complete current assessment and canonical projections |
+| Advisory publication (P5) | `standalone-disposition-machine.ts` | No-agent immutable DECLARED publication and exact effect reconciliation |
 | Wave Gate | `wave-gate-machine.ts` | Review/refutation/advisory/completion lifecycle and canonical status |
 | Remediation | `remediation-machine.ts` | Scope authority, excluded evidence paths, audit/stage/install lifecycle |
 | Model policy | `model-profiles.ts`, `model-calibration.ts` | Explicit cross-harness bindings and deterministic calibration scoring |
@@ -141,7 +143,7 @@ The public action algebra is deliberately small:
 
 ```text
 status
-start <architecture|refutation|standalone-review|wave-gate|remediation>
+start <architecture|refutation|standalone-review|standalone-disposition|wave-gate|remediation>
 restart                 # exhausted Wave reviewer run only
 resume
 submit                   # compatibility/manual capture path
@@ -150,7 +152,11 @@ complete                 # compatibility for old panel callers
 decide                   # user decision
 ```
 
-New registered standalone-review, Wave Gate, and remediation programs are driven by `handlers/helpers/programs/`. The façade materializes Context Packets and complete request authorities before returning an action. Harness adapters capture results directly; the parent does not rewrite transcripts.
+Registered standalone-review, Wave Gate, remediation and P5 standalone-disposition
+programs are driven by `handlers/helpers/programs/`. The façade materializes Context
+Packets and complete request authorities for Agent work; disposition publication has
+no Agents. Harness adapters capture results directly; the parent never rewrites transcripts.
+P5 commands require a matching admitted runtime; see the [bootstrap restriction](operations.md#standalone-lineage-p5).
 
 ### Fugue runtime and operation DAGs
 
@@ -239,6 +245,59 @@ A Review Run freezes:
 - generation and repository revisions.
 
 Every expected reviewer must assess every prior Finding exactly once before finalization. A `still_present` assessment keeps it active. A Finding becomes **resolved** only when the complete roster verifies remediation. A Finding becomes **refuted** only through adjudication (or an audited manual override); refutation is not resolution.
+
+## Standalone lineage and publication (P5)
+
+P4 merged/reloaded; P5 is feature-worktree implementation with final validation,
+registered review and publication pending. [ADR-0010](adr/ADR-0010-standalone-finding-lineage.md)
+records the selected design and [operations](operations.md#standalone-lineage-p5)
+provides exact input, limits and the admitted-main bootstrap restriction.
+
+The pure core separates prepared data, issued request membership, admitted evidence,
+complete roster proof and published result authority, concentrated in the cohesive
+`standalone-review.ts` aggregate owner. Self-hashes never substitute
+for independent publication. Shell shared computation has three named lower owners:
+`program-result.ts` owns the dependency-free ProgramParse/FacadeDriveResult vocabulary,
+`standalone-evidence.ts` owns checkpoint-independent evidence, source observation and
+refutation replay, and `standalone-disposition-source.ts` owns bounded published
+advisory revision authentication. `standalone-source.ts`, `standalone.ts` and
+`standalone-disposition.ts` retain the per-program drivers and source authentication
+and consume those lower volumes instead of importing each other upward. Per-program
+drivers remain distinct (ADR-0005), and the
+façade exports real parent operations rather than every internal parser (ADR-0007).
+
+A no-agent publisher records the full ordered advisory policy immediately, with
+DECLARED provenance and immutable correction/import history. An explicit successor
+joins one exact predecessor result and policy revision, preserves scope/roles,
+freezes source bytes/modes/absence, and conserves every original Finding Origin.
+Historical unknown observations remain unknown; missing current publication refuses.
+Current origins bind Run/request/transcript/ordinal and acquire their original result
+identity from enclosing publication downstream, avoiding a self-digest cycle.
+
+The existing LC-2 reducer—not a second successor lifecycle—admits v3 ordered
+assessments from every current reviewer. All must identify repair/relevant changes
+for resolution. Refuted/resolved/policy-retired origins remain assessment obligations.
+Only new criticals and explicit evidence-bound critical reopening reach a fresh
+bound full panel; unchanged upheld blockers remain active without re-adjudication.
+Old IDs, high-water, assertion/severity/evidence and votes/reasons remain exact.
+Canonical counts distinguish new, inherited and current state; no fresh-panel-count
+or Repair-Checked shortcut can erase a blocker or critical coverage limitation.
+
+Claude/Pi native capture records real durable capture receipts; current replay cannot
+invent missing provenance. Pi adds current-only process witnesses with no older-Run
+fallback. Bounded reader projection and Read-only panel views expose frozen data,
+not independent authority. Fresh predecessor packet references retain exact original
+files rather than recursive copies; original bytes remain mandatory. Checkpoint-
+independent replay derives canonical JSON; published-source admission additionally
+requires the actual result bytes/receipt. P3 retains this **full exact v3 source**
+through unchanged schema-2 checks, candidate witnesses and guarded index installation.
+
+Independent standalone/Wave issuance stays v2. Issued v1/v2 initial/resume/retry and
+packet/result/receipt bytes remain under their original contracts. Pre-B4 development-
+only v3 panel transport changes are not historical v1/v2 migration. Resource limits
+are simultaneous boundary budgets, not an all-reads or whole-process heap proof.
+Formal wording/digests do not prove semantics; no formal planning tool, automatic
+previousRun, fork merge, similarity matching, severity override or review reuse is added.
 
 ## Security and failure posture
 

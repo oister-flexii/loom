@@ -1,9 +1,12 @@
 import { createHash } from "node:crypto";
+import { match } from "ts-pattern";
 import { parseReviewerProtocolDescriptor } from "./reviewer-contract";
+import { parseStandaloneReviewerProtocolV3 } from "./standalone-lineage-contract";
 import { compareStrings } from "./ordering";
 import { frozenSet } from "./frozen";
 import {
   canonicalRecord,
+  canonicalStructuralEquals,
   fieldFailureError,
   parseArtifactDigest,
   parseArtifactRef,
@@ -20,6 +23,7 @@ import {
   type PublishArtifactSet,
   type VerifiedIndexInstalled,
 } from "./orchestration-contract";
+import { readDenseDataArray, type DataBoundaryError } from "./orchestration-contract/bytes";
 import {
   STANDALONE_RESULT_SLOT,
   serializeAdjudicatedStandaloneReview,
@@ -122,35 +126,27 @@ function exactRecord(
   }
 }
 
+/** Dense own-data array boundary delegated to the shared kernel parser
+ *  (orchestration-contract/bytes.ts); the kernel's enumerable/configurable
+ *  own-data length rule is the canonical acceptance corner, so this parser
+ *  can no longer disagree with the kernel about which arrays it accepts. */
 function denseArray(raw: unknown, label: string): DomainResult<readonly unknown[], string> {
-  try {
-    if (!Array.isArray(raw) || Object.getPrototypeOf(raw) !== Array.prototype) {
-      return fail(`${label} must be a plain array`);
-    }
-    const lengthDescriptor = Object.getOwnPropertyDescriptor(raw, "length");
-    if (lengthDescriptor === undefined || !("value" in lengthDescriptor) ||
-        typeof lengthDescriptor.value !== "number" || !Number.isSafeInteger(lengthDescriptor.value) ||
-        lengthDescriptor.value < 0 || lengthDescriptor.value > 1_048_576) {
-      return fail(`${label} has an invalid or excessive length`);
-    }
-    const length = lengthDescriptor.value;
-    const keys = Reflect.ownKeys(raw);
-    if (keys.length !== length + 1 || keys[length] !== "length") {
-      return fail(`${label} must be a dense array without extra fields`);
-    }
-    const values: unknown[] = [];
-    for (let index = 0; index < length; index++) {
-      if (keys[index] !== String(index)) return fail(`${label} has a hole at index ${index}`);
-      const descriptor = Object.getOwnPropertyDescriptor(raw, String(index));
-      if (descriptor === undefined || !("value" in descriptor) || !descriptor.enumerable) {
-        return fail(`${label}[${index}] must be an enumerable own data field`);
-      }
-      values.push(descriptor.value);
-    }
-    return ok(Object.freeze(values));
-  } catch {
-    return fail(`${label} could not be safely inspected`);
+  const result = readDenseDataArray(raw, label);
+  return result.ok ? ok(result.value) : fail(denseArrayProblem(label, result.error));
+}
+
+/** Translate the kernel's typed boundary failure into this module's exact
+ *  vocabulary; callers here discriminate on these strings, not DataBoundaryError. */
+function denseArrayProblem(label: string, error: DataBoundaryError): string {
+  if (error.reason === "sparse-array" && error.index !== null) return `${label} has a hole at index ${error.index}`;
+  if (error.reason === "accessor-field" || error.reason === "non-enumerable-field") {
+    return `${label}[${error.index ?? 0}] must be an enumerable own data field`;
   }
+  return error.reason === "not-array" ? `${label} must be a plain array`
+    : error.reason === "invalid-array-length" ? `${label} has an invalid or excessive length`
+    : error.reason === "symbol-field" || error.reason === "sparse-array"
+      ? `${label} must be a dense array without extra fields`
+    : `${label} could not be safely inspected`;
 }
 
 function sameArray<T>(left: readonly T[], right: readonly T[]): boolean {
@@ -628,13 +624,19 @@ function parsedCanonicalStandaloneResult(
       message: "authoritative standalone result is not valid canonical JSON",
     }));
   }
+  const version = typeof raw === "object" && raw !== null && "schema_version" in raw ? raw.schema_version : undefined;
+  const versionFields = match(version)
+    .with(2, () => ["reviewer_protocol"])
+    .with(3, () => ["reviewer_protocol", "successor", "lineage"])
+    .otherwise(() => []);
   const record = exactRecord(raw, [
     "schema_version", "run_id", "subject_id", "scope", "reviewer_evidence",
     "surviving_critical_findings", "advisory_findings", "refuted_critical_findings", "panel",
-    ...(typeof raw === "object" && raw !== null && "schema_version" in raw && raw.schema_version === 2 ? ["reviewer_protocol"] : []),
+    ...versionFields,
   ], "standaloneResult");
-  if (!record.ok || (record.value.schema_version !== 1 && record.value.schema_version !== 2) ||
+  if (!record.ok || (record.value.schema_version !== 1 && record.value.schema_version !== 2 && record.value.schema_version !== 3) ||
       (record.value.schema_version === 2 && !parseReviewerProtocolDescriptor(record.value.reviewer_protocol).ok) ||
+      (record.value.schema_version === 3 && !parseStandaloneReviewerProtocolV3(record.value.reviewer_protocol).ok) ||
       record.value.subject_id !== "standalone-review") {
     return fail(canonicalRecord({
       kind: "invalid-path-authority",
@@ -644,6 +646,18 @@ function parsedCanonicalStandaloneResult(
         ? "authoritative standalone result schema or subject is invalid"
         : record.error,
     }));
+  }
+  // This is the path projection, not a second lineage authority parser. Initial input
+  // has LC-2 membership; rehydration independently joins the exact publication below.
+  // Preserve the complete serialization, and never let historical critical uncertainty
+  // acquire path authority merely because the current active partition is empty.
+  if (record.value.schema_version === 3) {
+    const lineage = exactRecord(record.value.lineage,
+      ["inventory", "reports", "assessments", "dispositions", "currentCriticalCoverage", "counts"], "standaloneResult.lineage");
+    if (!lineage.ok || !canonicalStructuralEquals(lineage.value.currentCriticalCoverage, { kind: "complete", origins: [] })) {
+      return fail(canonicalRecord({ kind: "invalid-path-authority", field: "standaloneResult.lineage.currentCriticalCoverage",
+        path: null, message: "standalone successor requires complete current critical coverage before remediation path authority" }));
+    }
   }
   const reviewerEvidence = denseArray(record.value.reviewer_evidence, "standaloneResult.reviewer_evidence");
   const surviving = denseArray(record.value.surviving_critical_findings, "standaloneResult.surviving_critical_findings");
@@ -2297,6 +2311,30 @@ function recoveryReceiptDigest(fields: Omit<RemediationRecoveryReceipt, "kind" |
   return digestJson(fields);
 }
 
+type RecoveryReceiptMismatchField = "runId" | "recoveryAttemptId" | "effectId" | "predecessorState" | "witnessDigest";
+
+/** Sequential field guards over [field, actual, expected] pairs; the first
+ *  mismatch names its receipt field and null reconciles. The five-arm ternary
+ *  this replaces chained five independent comparisons into one data-driven
+ *  scan, so a sixth receipt field extends the pairs instead of the chain. */
+function firstRecoveryReceiptMismatch(
+  receipt: RemediationRecoveryReceipt,
+  authorityRunId: OrchestrationRunId,
+  failure: RemediationRecoveryFailure,
+): RecoveryReceiptMismatchField | null {
+  const pairs: readonly [RecoveryReceiptMismatchField, unknown, unknown][] = [
+    ["runId", receipt.runId, authorityRunId],
+    ["recoveryAttemptId", receipt.recoveryAttemptId, failure.recoveryAttemptId],
+    ["effectId", receipt.effectId, failure.effectId],
+    ["predecessorState", receipt.predecessorState, failure.predecessorState],
+    ["witnessDigest", receipt.witnessDigest, failure.witnessDigest],
+  ];
+  for (const [field, actual, expected] of pairs) {
+    if (actual !== expected) return field;
+  }
+  return null;
+}
+
 function parseRecoveryReceipt(raw: unknown): DomainResult<RemediationRecoveryReceipt, string> {
   const record = exactRecord(raw, [
     "kind", "receiptId", "recoveryAttemptId", "runId", "effectId", "predecessorState", "witnessDigest", "digest",
@@ -2475,12 +2513,7 @@ function reduceParserMintedRemediation(
     if (state.consumedRecoveryReceiptIds.includes(receipt.value.receiptId)) {
       return transitionFailure(state, event, "invalid-recovery-receipt", "receipt.receiptId", "recovery receipt is stale or already consumed");
     }
-    const mismatch = receipt.value.runId !== state.authority.runId ? "runId"
-      : receipt.value.recoveryAttemptId !== state.failure.recoveryAttemptId ? "recoveryAttemptId"
-      : receipt.value.effectId !== state.failure.effectId ? "effectId"
-      : receipt.value.predecessorState !== state.failure.predecessorState ? "predecessorState"
-      : receipt.value.witnessDigest !== state.failure.witnessDigest ? "witnessDigest"
-      : null;
+    const mismatch = firstRecoveryReceiptMismatch(receipt.value, state.authority.runId, state.failure);
     if (mismatch !== null) {
       return transitionFailure(state, event, "invalid-recovery-receipt", `receipt.${mismatch}`, `recovery receipt is stale or foreign: ${mismatch} mismatch`);
     }

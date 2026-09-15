@@ -113,6 +113,7 @@ import {
   captureAuditLine,
   captureCandidates,
   captureHarnessResult,
+  captureUnavailable,
   RUN_DIR_ENV,
   describeCaptureFailure,
   resolveCorrelatedRequest,
@@ -124,12 +125,13 @@ import {
   type CorrelatedRequestResolution,
   type TerminalCaptureRefusal,
 } from "../engine/src/orchestration/harness-capture-runtime";
-import { openRunDirectory, type RunDirHandle } from "../engine/src/orchestration/run-directory-handle";
+import { openRegisteredRunDirectory, type RunDirHandle } from "../engine/src/orchestration/run-directory-handle";
 import {
   parseRegisteredFacadeProgram,
   readStandaloneReviewedSource,
   renderSpawnTask,
   replayStandaloneResultFromEvidence,
+  replayStandaloneCapturedEvidence,
   type StandaloneReviewedSource,
 } from "../engine/src/handlers/helpers/programs";
 import {
@@ -141,6 +143,7 @@ import {
   type SessionRunBinding,
 } from "../engine/src/orchestration/session-run-bindings";
 import { captureKey, type CaptureKey } from "../engine/src/core/harness-capture";
+import { reduceStandaloneReviewMachine } from "../engine/src/core/standalone-review-machine";
 import {
   parseArtifactDigest,
   parseContextDigest,
@@ -236,6 +239,37 @@ type LoomReviewAuthorityReceipt = Readonly<{
 const trustedReviewRuns = new Map<string, Map<string, TrustedReviewRoot>>();
 const trustedRunIdentity = ({ runsRoot, runDirectory }: Pick<SessionRunBinding, "runsRoot" | "runDirectory">): string =>
   `${runsRoot}\0${runDirectory}`;
+
+function updateTrustedReviewRun(
+  sessionId: string,
+  binding: SessionRunBinding,
+  updateCaptures: (captures: ReadonlyMap<CaptureKey, TrustedReviewCapture>) => ReadonlyMap<CaptureKey, TrustedReviewCapture>,
+): void {
+  const sessionRoots = trustedReviewRuns.get(sessionId) ?? new Map<string, TrustedReviewRoot>();
+  trustedReviewRuns.set(sessionId, sessionRoots);
+  const rootIdentity = resolve(binding.runsRoot);
+  const root = sessionRoots.get(rootIdentity) ?? Object.freeze({
+    nextTouch: 1,
+    runs: new Map<string, TrustedReviewRun>(),
+  });
+  const identity = trustedRunIdentity(binding);
+  const previous = root.runs.get(identity);
+  const runs = new Map(root.runs);
+  runs.set(identity, Object.freeze({
+    binding,
+    captures: updateCaptures(previous?.captures ?? new Map<CaptureKey, TrustedReviewCapture>()),
+    touchedAt: previous?.touchedAt ?? root.nextTouch,
+  }));
+  sessionRoots.set(rootIdentity, Object.freeze({
+    nextTouch: previous === undefined ? root.nextTouch + 1 : root.nextTouch,
+    runs,
+  }));
+}
+
+/** First exact standalone spawn selects the current run; retries never reorder runs. */
+function touchTrustedReviewRun(sessionId: string, binding: SessionRunBinding): void {
+  updateTrustedReviewRun(sessionId, binding, captures => captures);
+}
 
 /**
  * Fail-closed path existence check. Returns `true` (assume active) for any
@@ -441,31 +475,22 @@ function rememberTrustedReviewCapture(
   if (!digest.ok) {
     throw new Error(`captured request ${outcome.receipt.requestId} carries an invalid receipt digest: ${digest.error.message}`);
   }
-  const sessionRoots = trustedReviewRuns.get(sessionId) ?? new Map<string, TrustedReviewRoot>();
-  trustedReviewRuns.set(sessionId, sessionRoots);
-  const rootIdentity = resolve(binding.runsRoot);
-  const root = sessionRoots.get(rootIdentity) ?? Object.freeze({
-    nextTouch: 1,
-    runs: new Map<string, TrustedReviewRun>(),
+  updateTrustedReviewRun(sessionId, binding, previous => {
+    const captures = new Map(previous);
+    captures.set(
+      captureKey(outcome.receipt.slotId, outcome.receipt.attempt),
+      Object.freeze({
+        requestId: outcome.receipt.requestId,
+        slotId: outcome.receipt.slotId,
+        attempt: outcome.receipt.attempt,
+        role,
+        contextDigest: contextDigest.value,
+        digest: digest.value,
+        byteLength: outcome.receipt.byteLength,
+      }),
+    );
+    return captures;
   });
-  const identity = trustedRunIdentity(binding);
-  const previousRun = root.runs.get(identity);
-  const captures = new Map(previousRun?.captures ?? []);
-  captures.set(
-    captureKey(outcome.receipt.slotId, outcome.receipt.attempt),
-    Object.freeze({
-      requestId: outcome.receipt.requestId,
-      slotId: outcome.receipt.slotId,
-      attempt: outcome.receipt.attempt,
-      role,
-      contextDigest: contextDigest.value,
-      digest: digest.value,
-      byteLength: outcome.receipt.byteLength,
-    }),
-  );
-  const runs = new Map(root.runs);
-  runs.set(identity, Object.freeze({ binding, captures, touchedAt: root.nextTouch }));
-  sessionRoots.set(rootIdentity, Object.freeze({ nextTouch: root.nextTouch + 1, runs }));
 }
 
 function environmentRunBinding(): SessionRunBinding | null {
@@ -475,7 +500,7 @@ function environmentRunBinding(): SessionRunBinding | null {
   if (runsRoot === undefined || runDirectory === undefined) {
     throw new Error("Pi orchestration requires both run-root and run-directory authority");
   }
-  const opened = openRunDirectory(runsRoot, runDirectory);
+  const opened = openRegisteredRunDirectory(runsRoot, runDirectory);
   if (!opened.ok) throw new Error(opened.error.message);
   const issued = opened.value.readIssuedRequests();
   if (!issued.ok) throw new Error(issued.error.message);
@@ -497,7 +522,7 @@ function sessionRunBinding(
     [...requestIds].every((requestId) => binding.requestIds.some((candidate) => candidate === requestId))
   );
   const matches = candidates.filter((binding) => {
-    const opened = openRunDirectory(binding.runsRoot, binding.runDirectory);
+    const opened = openRegisteredRunDirectory(binding.runsRoot, binding.runDirectory);
     if (!opened.ok) throw new Error(opened.error.message);
     const issued = opened.value.readIssuedRequests();
     if (!issued.ok) throw new Error(issued.error.message);
@@ -551,7 +576,7 @@ export async function recordPiSpawnCorrelators(
     throw new Error("Pi orchestration spawn batch must not mix request-bound and unbound items");
   }
   const runBinding = explicit ?? sessionRunBinding(rawSessionId, marked);
-  const opened = openRunDirectory(runBinding.runsRoot, runBinding.runDirectory);
+  const opened = openRegisteredRunDirectory(runBinding.runsRoot, runBinding.runDirectory);
   if (!opened.ok) throw new Error(opened.error.message);
   const issued = opened.value.readIssuedRequests();
   if (!issued.ok) throw new Error(issued.error.message);
@@ -597,6 +622,9 @@ export async function recordPiSpawnCorrelators(
     consumed.add(request.requestId);
   }
   for (const [index, task] of canonicalTasks.entries()) replacePiSpawnTask(rawInput, index, task);
+  if (items.some(({ task }) => hasStandaloneReviewContext(task))) {
+    touchTrustedReviewRun(rawSessionId, runBinding);
+  }
   return runBinding;
 }
 
@@ -708,7 +736,25 @@ export async function capturePiSubagentResult(
   const runDirectory = runBinding?.runDirectory ?? process.env[RUN_DIR_ENV];
   const observe = (): CaptureObservation => {
     if (observationRefusal !== null) return observationRefusal;
-    const candidates = piResultFinalPayloadCandidates(messages ?? []);
+    const correlation = resolveCorrelatedRequest({ harness: "pi", runsRoot, runDirectory,
+      nativeId: piSpawnRosterId(toolCallId, resultIndex, agentType) });
+    const registration = correlation.ok ? correlation.value.handle.readProgramRegistration(16_777_216) : null;
+    if (registration !== null && !registration.ok) {
+      return captureUnavailable("program-registration", `program registration is unavailable: ${registration.error.message}`);
+    }
+    const raw = registration?.value ?? null;
+    const parsedRegistration = raw === null ? null : parseRegisteredFacadeProgram(raw);
+    if (parsedRegistration !== null && parsedRegistration.kind !== "registered") {
+      const problem = parsedRegistration.kind === "invalid"
+        ? parsedRegistration.message
+        : "program registration does not name a registered orchestration program";
+      return captureUnavailable("program-registration", `program registration is unavailable: ${problem}`);
+    }
+    // Every current capture applies the successor decoded-work budget before
+    // the legacy adapter allocates copied arrays; the old undefined purpose
+    // admitted the impossible foreign escape, because the correlated request
+    // carries no schema version to compare against.
+    const candidates = piResultFinalPayloadCandidates(messages ?? [], "standalone-successor");
     return candidates.ok
       ? captureCandidates(candidates.value)
       : terminalCaptureRefusal("transcript-shape", candidates.errors.join("; "));
@@ -943,7 +989,7 @@ function recoverPiSpawnReservation(
   const inaccessibleBindings: string[] = [];
 
   for (const binding of bindings.value) {
-    const opened = openRunDirectory(binding.runsRoot, binding.runDirectory);
+    const opened = openRegisteredRunDirectory(binding.runsRoot, binding.runDirectory);
     if (!opened.ok) {
       inaccessibleBindings.push(`${binding.runId}: ${opened.error.message}`);
       continue;
@@ -1092,15 +1138,15 @@ function trustedCaptureProblem(handle: RunDirHandle, run: TrustedReviewRun): str
   return run.captures.size === 0 ? "no transcript capture was witnessed" : null;
 }
 
-function verifyTrustedReviewRun(
+async function verifyTrustedReviewRun(
   input: Readonly<{ sessionId: string }>,
   run: TrustedReviewRun,
-): TrustedRunVerification {
+): Promise<TrustedRunVerification> {
   const reject = (message: string): TrustedRunVerification => ({
     kind: "rejected",
     message: `${run.binding.runId}: ${message}`,
   });
-  const opened = openRunDirectory(run.binding.runsRoot, run.binding.runDirectory);
+  const opened = openRegisteredRunDirectory(run.binding.runsRoot, run.binding.runDirectory);
   if (!opened.ok) return reject(opened.error.message);
   const programRaw = opened.value.readProgramRegistration();
   if (!programRaw.ok || programRaw.value === null) {
@@ -1112,7 +1158,9 @@ function verifyTrustedReviewRun(
   }
   const captureProblem = trustedCaptureProblem(opened.value, run);
   if (captureProblem !== null) return reject(captureProblem);
-  const replayed = replayStandaloneResultFromEvidence(opened.value, program.program, run.captures);
+  const replayed = program.program.schemaVersion === 3
+    ? await replayStandaloneCapturedEvidence(opened.value, program.program, run.captures)
+    : replayStandaloneResultFromEvidence(opened.value, program.program, run.captures);
   if (!replayed.ok) return reject(`engine evidence replay did not prove completion: ${replayed.message}`);
   let resultBytes: Buffer;
   try {
@@ -1123,7 +1171,14 @@ function verifyTrustedReviewRun(
   if (!resultBytes.equals(Buffer.from(replayed.json, "utf8"))) {
     return reject("result.json does not match checkpoint-independent evidence replay");
   }
-  const reviewedSource = readStandaloneReviewedSource(opened.value, program.program);
+  if (program.program.schemaVersion === 3) {
+    const receipt = opened.value.readReceipt(replayed.ready.publicationIntent.effectId, 16_384);
+    if (!receipt.ok || receipt.value?.kind !== "artifact-set-published") return reject("successor result publication receipt is unavailable");
+    const published = reduceStandaloneReviewMachine(replayed.ready, { kind: "result-published", result: JSON.parse(replayed.json), receipt: receipt.value });
+    if (!published.ok || published.value.kind !== "done") return reject("successor result publication receipt differs from native replay");
+  }
+  const reviewedSource = readStandaloneReviewedSource(opened.value, program.program, 16_777_216,
+    replayed.ready.authority.schemaVersion === 3 ? replayed.ready.authority.successor : undefined);
   if (!reviewedSource.ok) return reject(`reviewed source attestation failed: ${reviewedSource.message}`);
   return { kind: "accepted", receipt: Object.freeze({
     schemaVersion: 1,
@@ -1148,7 +1203,10 @@ async function verifyTrustedStandaloneReview(input: Readonly<{ cwd: string; sess
   }
   const current = [...root.runs.entries()].reduce((latest, candidate) =>
     candidate[1].touchedAt > latest[1].touchedAt ? candidate : latest);
-  const outcome = verifyTrustedReviewRun(input, current[1]);
+  const outcome = await verifyTrustedReviewRun(input, current[1]);
+  if (trustedReviewRuns.get(input.sessionId)?.get(expectedRoot) !== root) {
+    throw new Error("current witnessed Standalone Review changed during verification; no older authority accepted");
+  }
   if (outcome.kind === "rejected") {
     throw new Error(`current witnessed Standalone Review rejected: ${outcome.message}`);
   }

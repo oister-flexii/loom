@@ -1,6 +1,6 @@
 # Loom documentation
 
-This directory documents Loom 1.1 and the implemented P4 Reviewer Protocol v2 source contract. P4 source review, merge, publication, hosted CI, and loaded-runtime cutover are not claimed. Existing P3 installation/report policy is unchanged. Operational command files under `commands/` and `skills/` remain the executable runbooks; these documents explain the system around them.
+This directory documents Loom 1.1 and P4 Reviewer Protocol v2 (merged `96153ed`, publication/reload verified). P5 standalone lineage is implemented on the feature worktree; final validation, registered review and publication remain pending. Existing P3 installation/report policy is unchanged. Operational command files under `commands/` and `skills/` remain the runbooks; their P5 bootstrap restrictions take precedence over new-feature examples.
 
 ## Start here
 
@@ -18,7 +18,7 @@ This directory documents Loom 1.1 and the implemented P4 Reviewer Protocol v2 so
 
 ## Reviewer protocol boundary
 
-Fresh reviewer registrations use one v2 JSON payload under independently issued
+Fresh independent standalone/Wave registrations use one v2 JSON payload under independently issued
 schema/rubric authority; counts/IDs and human summaries are engine-derived.
 Critical basis is mandatory but not proof of truth or impact. Malformed current
 evidence never becomes a synthetic Finding; the same panel/majority cannot refute
@@ -28,6 +28,24 @@ archived instructions. Two lossless gzip goldens retain 90 exact logical files
 (20,250,407 bytes; 3,395,759 stored bytes), checked against the unchanged inventory.
 Semantic in-memory historical replay is separate from native disposable fixture
 admission/P3 installation evidence. See [operations](operations.md#reviewer-protocol-v2).
+
+## Standalone lineage boundary (P5)
+
+P5 adds immediate no-agent immutable advisory publication and explicit schema-3
+successor review. Parent policy remains DECLARED; exact published revisions, full
+ordered origin coverage, whole-roster semantic resolution and evidence-bound
+reopening retain original Findings/history. P3 uses actual active criticals and
+refuses limited current critical coverage even when the active set is empty.
+CLI/Claude/Pi capture, bounded context projection, durable receipts and current-only
+Pi witnesses share the same authority. No review reuse, automatic predecessor,
+branch join, similarity/severity override or formal planning feature is added.
+
+**Bootstrap:** P5's own final registered review/remediation uses admitted main
+runtime `sha256:086c472e4e913376c07d69f5116c9ad9655546e22c91e40d28cba9fdd795bc79`
+and Skill 5.0.0 with existing Plan advisory triage—not the unsupported new publisher.
+New P5 records may be published honestly after merge/publication/reload; never
+retrofit source review or unset admission. See [exact operations and bounds](operations.md#standalone-lineage-p5)
+and [ADR-0010](adr/ADR-0010-standalone-finding-lineage.md).
 
 ## P3 operating boundary
 
@@ -46,6 +64,7 @@ Architecture Decision Records preserve why the system has its current shape:
 - [ADR-0007: Curated Public Surface](adr/ADR-0007-curated-public-surface.md)
 - [ADR-0008: Versioned Defect-Family installation authority](adr/ADR-0008-versioned-defect-family-installation-authority.md)
 - [ADR-0009: Versioned reviewer protocol](adr/ADR-0009-versioned-reviewer-protocol.md)
+- [ADR-0010: Standalone Finding and disposition lineage](adr/ADR-0010-standalone-finding-lineage.md)
 
 ## Harness and migration notes
 

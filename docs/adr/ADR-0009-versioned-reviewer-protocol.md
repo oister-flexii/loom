@@ -2,9 +2,11 @@
 
 ## Status
 
-Accepted direction; implemented in the P4 feature checkout. Source review, merge,
-publication and loaded-runtime cutover remain pending. Development tests are not
-a registered review or installation receipt.
+Accepted; P4 merged as `96153edc3dd755b4ac648ed48920b6670753c5a6` on
+2026-09-10, and publication/loaded-runtime reload were verified. The historical
+body below preserves P4's design, compatibility and bootstrap decisions. P5's
+separate successor implementation is tracked in [ADR-0010](ADR-0010-standalone-finding-lineage.md);
+its final validation, registered review and publication remain pending.
 
 ## Context
 

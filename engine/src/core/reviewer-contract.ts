@@ -23,7 +23,7 @@ export type ReviewerProtocolFailure = Readonly<{
 }>;
 
 const encoder = new TextEncoder();
-function boundedText(maxBytes: number) {
+export function boundedText(maxBytes: number) {
   return z.string().min(1).max(maxBytes).refine((text) =>
     text.trim().length > 0 && !text.includes("\0") &&
     !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(text) &&
@@ -34,7 +34,7 @@ const concise = boundedText(REVIEWER_PAYLOAD_LIMITS.concise);
 const reference = boundedText(REVIEWER_PAYLOAD_LIMITS.reference);
 const narrative = boundedText(REVIEWER_PAYLOAD_LIMITS.narrative);
 const traceEntries = z.tuple([narrative]).rest(narrative).check(z.maxLength(REVIEWER_PAYLOAD_LIMITS.traceEntries)).readonly();
-const evidenceSchema = z.discriminatedUnion("kind", [
+export const evidenceSchema = z.discriminatedUnion("kind", [
   z.strictObject({
     kind: z.literal("reproduction"), execution: z.enum(["not-executed", "reviewer-reported"]),
     setup: narrative, input: narrative, observed: narrative, expected: narrative, reference,
