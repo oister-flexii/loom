@@ -231,8 +231,12 @@ export function resolveCorrelatedRequest(args: Readonly<{
       },
     };
   }
-  const binding = correlator.value;
+  return resolveIssuedMatch(handle, correlator.value);
+}
 
+function resolveIssuedMatch(handle: RunDirHandle,
+  binding: NonNullable<Extract<ReturnType<RunDirHandle["readHarnessCorrelator"]>, { ok: true }>["value"]>,
+): CorrelatedRequestResolution {
   const issued = handle.readIssuedRequests();
   if (!issued.ok) {
     return { ok: false, outcome: retriableFailure("requests", issued.error.message) };

@@ -78,6 +78,60 @@ function parsePiContentBlock(
   return Object.freeze({ type: "opaque", originalType: block.type });
 }
 
+function parseMessageRole(message: Readonly<Record<string, unknown>>, messageLabel: string, errors: string[]): string | null {
+  const role = typeof message.role === "string" && message.role.trim() !== "" ? message.role : null;
+  if (role === null) errors.push(`${messageLabel}.role must be a non-empty string`);
+  return role;
+}
+
+function classifyMessageContent(contentValue: unknown, messageLabel: string, rolePresent: boolean): {
+  blocks: readonly (readonly [unknown, string])[];
+  stringContent: string | null;
+  valid: boolean;
+} {
+  if (typeof contentValue === "string") {
+    return rolePresent
+      ? { blocks: [], stringContent: contentValue, valid: true }
+      : { blocks: [], stringContent: null, valid: false };
+  }
+  if (Array.isArray(contentValue)) {
+    return {
+      blocks: contentValue.map(
+        (block, blockIndex) => [block, `${messageLabel}.content[${blockIndex}]`] as const,
+      ),
+      stringContent: null,
+      valid: true,
+    };
+  }
+  if (isRecord(contentValue)) {
+    return { blocks: [[contentValue, `${messageLabel}.content`] as const], stringContent: null, valid: true };
+  }
+  return { blocks: [], stringContent: null, valid: false };
+}
+
+function parseToolFields(message: Readonly<Record<string, unknown>>, messageLabel: string, errors: string[]): Pick<PiMessage, "toolCallId" | "toolName" | "isError"> {
+  const toolCallId = typeof message.toolCallId === "string" && message.toolCallId.trim() !== "" ? message.toolCallId : null;
+  const toolName = typeof message.toolName === "string" && message.toolName.trim() !== "" ? message.toolName : null;
+  if (message.toolCallId !== undefined && toolCallId === null) {
+    errors.push(`${messageLabel}.toolCallId must be non-empty when present`);
+  }
+  if (message.toolName !== undefined && toolName === null) {
+    errors.push(`${messageLabel}.toolName must be non-empty when present`);
+  }
+  if (message.role === "toolResult") {
+    if (toolCallId === null) errors.push(`${messageLabel}.toolCallId must be non-empty`);
+    if (toolName === null) errors.push(`${messageLabel}.toolName must be non-empty`);
+  }
+  if (message.isError !== undefined && typeof message.isError !== "boolean") {
+    errors.push(`${messageLabel}.isError must be a boolean when present`);
+  }
+  return Object.freeze({
+    ...(toolCallId === null ? {} : { toolCallId }),
+    ...(toolName === null ? {} : { toolName }),
+    ...(typeof message.isError === "boolean" ? { isError: message.isError } : {}),
+  });
+}
+
 /** Parse the untrusted harness payload once so every consumer receives fresh,
  * immutable messages whose complete trusted shape has already been proven. */
 export function parsePiMessages(messages: unknown): PiTranscriptResult<readonly PiMessage[]> {
@@ -90,67 +144,26 @@ export function parsePiMessages(messages: unknown): PiTranscriptResult<readonly 
       errors.push(`${messageLabel} must be an object`);
       return;
     }
-    const role = typeof message.role === "string" && message.role.trim() !== ""
-      ? message.role
-      : null;
-    if (role === null) errors.push(`${messageLabel}.role must be a non-empty string`);
-
-    const contentValue = message.content;
-    const isStringContent = role !== null && typeof contentValue === "string";
-    const isArrayContent = Array.isArray(contentValue);
-    const isSingletonContentBlock = isRecord(contentValue);
-    let contentBlocks: readonly (readonly [unknown, string])[];
-    if (isArrayContent) {
-      contentBlocks = contentValue.map(
-        (block, blockIndex) => [block, `${messageLabel}.content[${blockIndex}]`] as const,
-      );
-    } else if (isSingletonContentBlock) {
-      contentBlocks = [[contentValue, `${messageLabel}.content`] as const];
-    } else {
-      contentBlocks = [];
-    }
-    if (!isStringContent && !isArrayContent && !isSingletonContentBlock) {
+    const role = parseMessageRole(message, messageLabel, errors);
+    const classified = classifyMessageContent(message.content, messageLabel, role !== null);
+    if (!classified.valid) {
       errors.push(`${messageLabel}.content must be an array, string, or typed content block`);
       return;
     }
 
     const blockErrorsBefore = errors.length;
-    const content: PiContentBlock[] = isStringContent
-      ? [Object.freeze({ type: "text", text: contentValue })]
-      : [];
-    for (const [block, label] of contentBlocks) {
+    const content: PiContentBlock[] = classified.stringContent === null
+      ? []
+      : [Object.freeze({ type: "text", text: classified.stringContent })];
+    for (const [block, label] of classified.blocks) {
       const parsedBlock = parsePiContentBlock(block, label, errors);
       if (parsedBlock !== null) content.push(parsedBlock);
     }
 
-    const toolCallId = typeof message.toolCallId === "string" && message.toolCallId.trim() !== ""
-      ? message.toolCallId
-      : null;
-    const toolName = typeof message.toolName === "string" && message.toolName.trim() !== ""
-      ? message.toolName
-      : null;
-    if (message.toolCallId !== undefined && toolCallId === null) {
-      errors.push(`${messageLabel}.toolCallId must be non-empty when present`);
-    }
-    if (message.toolName !== undefined && toolName === null) {
-      errors.push(`${messageLabel}.toolName must be non-empty when present`);
-    }
-    if (message.role === "toolResult") {
-      if (toolCallId === null) errors.push(`${messageLabel}.toolCallId must be non-empty`);
-      if (toolName === null) errors.push(`${messageLabel}.toolName must be non-empty`);
-    }
-    if (message.isError !== undefined && typeof message.isError !== "boolean") {
-      errors.push(`${messageLabel}.isError must be a boolean when present`);
-    }
+    const toolFields = parseToolFields(message, messageLabel, errors);
 
     if (role !== null && errors.length === blockErrorsBefore) {
-      parsedMessages.push(Object.freeze({
-        role,
-        content: Object.freeze(content),
-        ...(toolCallId === null ? {} : { toolCallId }),
-        ...(toolName === null ? {} : { toolName }),
-        ...(typeof message.isError === "boolean" ? { isError: message.isError } : {}),
-      }));
+      parsedMessages.push(Object.freeze({ role, content: Object.freeze(content), ...toolFields }));
     }
   });
   return errors.length > 0
@@ -472,6 +485,33 @@ export function piFinalPayloadCandidates(
 }
 
 /** Bound decoded native input before the legacy adapter allocates copied message/block arrays. */
+const MAX_CAUSE_TEXT = 256;
+const boundedCauseText = (value: string): string =>
+  value.length <= MAX_CAUSE_TEXT ? value : `${value.slice(0, MAX_CAUSE_TEXT - 1)}…`;
+/**
+ * Bounded thrown-cause capture (the boundedParserCause pattern): the budget
+ * traversal walks potentially hostile in-memory values (Reflect.ownKeys and
+ * Object.getOwnPropertyDescriptor over getters that can throw), and the cause
+ * is the debugging context an operator needs — bounded so no full input is
+ * exposed.
+ */
+function boundedThrownCause(thrown: unknown): { name: string; message: string } {
+  try {
+    if (thrown instanceof Error) {
+      return {
+        name: boundedCauseText(typeof thrown.name === "string" && thrown.name !== "" ? thrown.name : "Error"),
+        message: boundedCauseText(typeof thrown.message === "string" ? thrown.message : "successor transcript inspection failed"),
+      };
+    }
+    return {
+      name: "NonErrorThrown",
+      message: boundedCauseText(typeof thrown === "string" ? thrown : "successor transcript inspection failed with a non-Error cause"),
+    };
+  } catch {
+    return { name: "UninspectableCause", message: "successor transcript inspection failed with an uninspectable cause" };
+  }
+}
+
 function successorTranscriptBudgetProblem(raw: unknown): string | null {
   const pending: { value: unknown; depth: number }[] = [{ value: raw, depth: 0 }];
   let remainingValues = 65_536;
@@ -518,7 +558,10 @@ export function piResultFinalPayloadCandidates(
     try {
       const problem = successorTranscriptBudgetProblem(messages);
       if (problem !== null) return { ok: false, errors: [problem] };
-    } catch { return { ok: false, errors: ["successor native transcript cannot be inspected safely"] }; }
+    } catch (thrown) {
+      const cause = boundedThrownCause(thrown);
+      return { ok: false, errors: [`successor native transcript cannot be inspected safely: ${cause.name}: ${cause.message}`] };
+    }
   }
   const parsed = parsePiMessages(messages);
   if (!parsed.ok) return parsed;

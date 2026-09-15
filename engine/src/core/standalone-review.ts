@@ -274,6 +274,52 @@ function parseStringSet(raw: unknown, label: string, errors: string[]): readonly
   return Object.freeze(values);
 }
 
+function boolField(raw: Readonly<Record<string, unknown>>, key: string, errors: string[]): boolean {
+  if (typeof raw[key] !== "boolean") errors.push(`review_metadata.${key} must be boolean`);
+  return raw[key] === true;
+}
+
+function integerField(raw: Readonly<Record<string, unknown>>, key: "additions" | "file_count", errors: string[]): number {
+  const value = raw[key];
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    errors.push(`review_metadata.${key} must be a non-negative safe integer`);
+    return 0;
+  }
+  return value;
+}
+
+function checkDocsOnlyInvariants(docsOnly: boolean, sourceOrTestChanged: boolean, commentsChanged: boolean, errors: string[]): void {
+  // A docs-only scope always changes comments — comment-analyzer is the role
+  // selected specifically for docs, so the producer's invariant (`metadata` in
+  // handlers/helpers/programs/helpers.ts: commentsChanged = docsOnly || scope
+  // has .md/.mdx) must hold at the boundary too. The check's remaining value is
+  // rejecting the contradictory record outright: without it, the caller's ok
+  // branch silently NORMALIZES docs_only=true to commentsChanged=true, so the
+  // contradiction hides behind accepted output instead of failing at the
+  // untrusted-JSON boundary (parse-don't-validate honesty).
+  if (docsOnly && !commentsChanged) {
+    errors.push("review_metadata.comments_changed must be true when docs_only is true (a docs-only scope always changes comments)");
+  }
+  // The producer's OTHER docs-only invariant, and the more dangerous one to
+  // leave unproven. `docs_only` is by definition "no source or test file
+  // changed" — `classifyScope` derives it as the docs pattern AND
+  // `!sourceOrTestChanged`, precisely so the pair cannot both be true — yet
+  // only the comments half was checked here, leaving
+  // `docs_only && source_or_test_changed` representable at the boundary.
+  // The check's remaining value is rejecting that record outright: without it,
+  // the caller's ok branch normalizes it to {docsOnly: true,
+  // sourceOrTestChanged: false, commentsChanged: true}, so the contradictory
+  // pair never reaches `selectStandaloneReviewers` — the metadata passed to
+  // selection claims docs-only (not real source changed), pr-test-analyzer is
+  // never admitted, and the silent-failure-hunter drop is the same accepted
+  // docs-only behavior `classifyScope` produces for a genuinely docs-only
+  // scope. Rejecting the record keeps the contradiction audible instead of
+  // silently normalized.
+  if (docsOnly && sourceOrTestChanged) {
+    errors.push("review_metadata.source_or_test_changed must be false when docs_only is true (a docs-only scope changes no source or test file)");
+  }
+}
+
 function parseReviewMetadata(raw: unknown): ParseResult<StandaloneReviewMetadata> {
   if (!isRecord(raw)) return fail(["review_metadata must be an object"]);
   const keys = [
@@ -285,48 +331,15 @@ function parseReviewMetadata(raw: unknown): ParseResult<StandaloneReviewMetadata
   const requestedKinds = requested.filter((kind): kind is StandaloneReviewKind =>
     (STANDALONE_REVIEW_KINDS as readonly string[]).includes(kind));
   if (requestedKinds.length !== requested.length) errors.push("review_metadata.requested_kinds contains an unknown review kind");
-  const bool = (key: typeof keys[number]): boolean => {
-    if (typeof raw[key] !== "boolean") errors.push(`review_metadata.${key} must be boolean`);
-    return raw[key] === true;
-  };
-  const integer = (key: "additions" | "file_count"): number => {
-    const value = raw[key];
-    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-      errors.push(`review_metadata.${key} must be a non-negative safe integer`);
-      return 0;
-    }
-    return value;
-  };
   const languages = parseStringSet(raw.languages, "review_metadata.languages", errors);
-  const docsOnly = bool("docs_only");
-  const sourceOrTestChanged = bool("source_or_test_changed");
-  const typesChanged = bool("types_changed");
-  const commentsChanged = bool("comments_changed");
-  // A docs-only scope always changes comments — comment-analyzer is the role
-  // selected specifically for docs, so the producer's invariant (`metadata` in
-  // handlers/helpers/programs/helpers.ts: commentsChanged = docsOnly || scope
-  // has .md/.mdx) must hold at the boundary too. Without it, a contradictory
-  // persisted record silently drops comment-analyzer from a docs-only review.
-  if (docsOnly && !commentsChanged) {
-    errors.push("review_metadata.comments_changed must be true when docs_only is true (a docs-only scope always changes comments)");
-  }
-  // The producer's OTHER docs-only invariant, and the more dangerous one to
-  // leave unproven. `docs_only` is by definition "no source or test file
-  // changed" — `classifyScope` derives it as the docs pattern AND
-  // `!sourceOrTestChanged`, precisely so the pair cannot both be true — yet
-  // only the comments half was checked here, leaving
-  // `docs_only && source_or_test_changed` representable at the boundary.
-  // `selectStandaloneReviewers` reads exactly those two fields independently:
-  // such a record claims real source changed AND silently drops
-  // silent-failure-hunter (gated on `!docsOnly`) while admitting
-  // pr-test-analyzer (gated on `sourceOrTestChanged`) — a scope reviewed by a
-  // roster no policy would ever select.
-  if (docsOnly && sourceOrTestChanged) {
-    errors.push("review_metadata.source_or_test_changed must be false when docs_only is true (a docs-only scope changes no source or test file)");
-  }
-  const additions = integer("additions");
-  const fileCount = integer("file_count");
-  const newStructure = bool("new_structure");
+  const docsOnly = boolField(raw, "docs_only", errors);
+  const sourceOrTestChanged = boolField(raw, "source_or_test_changed", errors);
+  const typesChanged = boolField(raw, "types_changed", errors);
+  const commentsChanged = boolField(raw, "comments_changed", errors);
+  checkDocsOnlyInvariants(docsOnly, sourceOrTestChanged, commentsChanged, errors);
+  const additions = integerField(raw, "additions", errors);
+  const fileCount = integerField(raw, "file_count", errors);
+  const newStructure = boolField(raw, "new_structure", errors);
   const [firstKind, ...otherKinds] = requestedKinds;
   if (firstKind === undefined) errors.push("review_metadata.requested_kinds must be non-empty");
   const nonEmptyKinds = firstKind === undefined
@@ -784,13 +797,13 @@ export function decodeCapturedReviewerText(captured: CapturedReviewerResult): Do
 
 /** Stable identity retained by LC-2 when a sibling result is accepted early. */
 export function fingerprintCapturedReviewerResult(result: CapturedReviewerResult): string {
-  return createHash("sha256").update(JSON.stringify({
+  return canonicalDigest({
     runId: result.artifact.runId,
     slot: result.artifact.slot.path,
     digest: result.artifact.digest,
     byteLength: result.artifact.byteLength,
     rawBytes: result.rawBytes,
-  })).digest("hex");
+  });
 }
 
 declare class StandaloneRosterCompletionMembership {
@@ -1067,7 +1080,11 @@ export function captureStandaloneReviewerBytes(
     digest: encoded.sha256,
     byteLength: encoded.byteLength,
   });
-  const effectId = parseEffectId(`effect:capture:${createHash("sha256").update(request.authority.requestId).digest("hex")}`);
+  // One canonical derivation shared by the core intent, the durable runtime
+  // receipt and the witness reader: the attempt is part of every durable
+  // capture receipt's identity, so a receipt reconciled directly against this
+  // intent cannot diverge from the runtime-recorded form.
+  const effectId = parseEffectId(`effect:capture:${createHash("sha256").update(`${request.authority.requestId}:${request.authority.attempt}`).digest("hex")}`);
   if (!artifact.ok) return captureFailure(artifact.error.message);
   if (!effectId.ok) return captureFailure(effectId.error.message);
   const prepared = canonicalRecord({
@@ -1283,7 +1300,7 @@ export function admitStandaloneTranscript(
   rawBytes: Uint8Array,
 ): StandaloneTranscriptAdmission {
   const parsed = parseIssuedReviewerEvidence(authority, rawBytes);
-  if ((!parsed.ok && parsed.error.code !== "authority-unavailable") || parsed.ok) {
+  if (parsed.ok || parsed.error.code !== "authority-unavailable") {
     if (authority.protocolVersion === 1 && authority.subject.kind === "standalone-review") {
       let text: string;
       try { text = new TextDecoder("utf-8", { fatal: true }).decode(rawBytes); }
@@ -2753,7 +2770,7 @@ function replaySerializedRefutationCompletion(
   }
   if (!canonicalStructuralEquals(
     serializableCompletedPanelState(replayed.value.state),
-    serializableCompletedPanelState({ ...record, authority: authority.value } as unknown as RefutationPanelState),
+    serializableCompletedPanelState({ ...record, authority: authority.value }),
   )) {
     return { ok: false, message: "persisted Refutation Panel state disagrees with verified T2 replay" };
   }
@@ -3599,11 +3616,24 @@ function serializableRefutationAuthority(authority: RefutationPanelAuthority): u
   };
 }
 
-function serializableCompletedPanelState(state: RefutationPanelState): unknown {
+/**
+ * The lossy shape a persisted panel checkpoint actually carries: the verifier
+ * roster Map is projected to its parser inputs, so this is deliberately NOT a
+ * RefutationPanelState — the compiler tracks that seam instead of an
+ * `as unknown as` cast bridging it. Only the parsed `authority` is restored;
+ * every other field stays the persisted JSON it was.
+ */
+type SerializedRefutationPanelState = Readonly<{ authority: RefutationPanelAuthority }> & Record<string, unknown>;
+
+function serializableCompletedPanelState(
+  state: Readonly<{ authority: RefutationPanelAuthority }> & Record<string, unknown>,
+): unknown {
   return { ...state, authority: serializableRefutationAuthority(state.authority) };
 }
 
-function serializableRefutationCompletion(receipt: StandaloneRefutationCompletionReceipt): unknown {
+function serializableRefutationCompletion(
+  receipt: Readonly<{ completedPanelState: Readonly<{ authority: RefutationPanelAuthority }> }>,
+): unknown {
   return { ...receipt, completedPanelState: serializableCompletedPanelState(receipt.completedPanelState) };
 }
 
@@ -3652,11 +3682,11 @@ function parseSerializedRefutationAuthority(raw: unknown) {
   });
 }
 
-function restoreRefutationPanelState(raw: unknown): RefutationPanelState | null {
+function restoreRefutationPanelState(raw: unknown): SerializedRefutationPanelState | null {
   if (typeof raw !== "object" || raw === null || !("authority" in raw)) return null;
   const record = raw as Record<string, unknown>;
   const parsed = parseSerializedRefutationAuthority(record.authority);
-  return parsed.ok ? ({ ...record, authority: parsed.value } as unknown as RefutationPanelState) : null;
+  return parsed.ok ? { ...record, authority: parsed.value } : null;
 }
 
 function restoreRefutationCompletion(
@@ -3686,7 +3716,7 @@ function restoreRefutationCompletion(
   };
   return canonicalStructuralEquals(
     serializableRefutationCompletion(parsed.value),
-    serializableRefutationCompletion(supplied as unknown as StandaloneRefutationCompletionReceipt),
+    serializableRefutationCompletion(supplied),
   ) ? parsed.value : null;
 }
 

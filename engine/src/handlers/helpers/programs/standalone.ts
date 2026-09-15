@@ -16,8 +16,8 @@ export type { StandaloneCaptureWitness, StandaloneEvidenceReplayResult, Standalo
 import { parseRunDirectoryReference } from '../../../orchestration/run-directory-handle';
 import { publishStandalonePanelView } from '../../../orchestration/standalone-panel-context';
 import { CURRENT_REVIEWER_PROTOCOL } from '../../../core/reviewer-contract';
-import type { AgentRequestAuthority, SpawnRequest } from '../../../core/orchestration-contract';
-import { aggregateStandaloneReview, bindStandaloneCaptureAuthority, captureStandaloneReviewerBytes, canonicalStandaloneResultArtifact, completeStandaloneReviewerCapture, parseStandaloneReviewScope, prepareFreshStandaloneReview, proveStandaloneRosterCompletion, serializeStandaloneReviewAuthority, serializeAdjudicatedStandaloneReview, type FrozenStandaloneReviewAuthority } from '../../../core/standalone-review';
+import type { AgentRequestAuthority, SpawnRequest, PublicationAuthorityResolver } from '../../../core/orchestration-contract';
+import { aggregateStandaloneReview, bindStandaloneCaptureAuthority, captureStandaloneReviewerBytes, canonicalStandaloneResultArtifact, completeStandaloneReviewerCapture, parseStandaloneReviewScope, prepareFreshStandaloneReview, proveStandaloneRosterCompletion, serializeStandaloneReviewAuthority, serializeAdjudicatedStandaloneReview, type FrozenStandaloneReviewAuthority, type StandaloneReviewerProtocolResolver } from '../../../core/standalone-review';
 import { parseStandaloneReviewMachineState, reduceStandaloneReviewMachine, parseStandaloneRefutationCompletion, serializeStandaloneReviewMachineState, startStandaloneReviewMachine, type StandaloneReviewMachineState } from '../../../core/standalone-review-machine';
 import { completePersistentRefutationPanel, panelRequestIdentity, refutationPanelCheckpoint, rejectRefutationVerdict, startPersistentRefutationPanel, submitRefutationVerdict, type PersistentRefutationPanelEvent } from '../../../core/panel-program';
 import { readRunBytesNoFollow, writeRunBytesExclusiveNoFollow } from '../../../orchestration/no-follow-fs';
@@ -207,7 +207,11 @@ export async function finalizeStandaloneState(
       );
     }
     if (!existing.equals(resultBytes)) {
-      return failed(error instanceof Error ? error.message : String(error));
+      return failed(
+        `standalone result publication collision for ${handle.runDirectory}: existing result.json differs from the bytes this finalize derived `
+        + `(existing sha256 ${createHash("sha256").update(existing).digest("hex")}, derived sha256 ${createHash("sha256").update(resultBytes).digest("hex")}); `
+        + `original exclusive-write error: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
   const receipt = { kind: "artifact-set-published" as const, effectId: ready.publicationIntent.effectId,
@@ -350,362 +354,385 @@ export async function resumeStandaloneFacade(
     const reviewerProtocols = standaloneReviewerProtocolResolver(handle, registration, successor);
     const state = parseStandaloneReviewMachineState(rawState, resolver, reviewerProtocols, authorityResult.value);
     if (!state.ok) return failed(state.error.message);
-    if (state.value.kind === "done") {
-      const published = readPublishedStandaloneResult(handle, state.value);
-      return published.ok ? { ok: true, action: { kind: "done", runId: handle.runId, outcome: published.value.outcome } } : failed(published.message);
+    switch (state.value.kind) {
+      case "done": {
+        const published = readPublishedStandaloneResult(handle, state.value);
+        return published.ok ? { ok: true, action: { kind: "done", runId: handle.runId, outcome: published.value.outcome } } : failed(published.message);
+      }
+      case "terminal-blocked":
+      case "recoverable-blocked":
+        return { ok: true, action: { kind: "blocked", runId: handle.runId, diagnostic: state.value } };
+      case "ready-to-finalize":
+        return finalizeStandaloneState(handle, state.value);
+      case "awaiting-refutation":
+        return resumeAwaitingRefutation(handle, state.value, resolver);
+      case "awaiting-results":
+        return resumeAwaitingResults(handle, state.value, resolver, reviewerProtocols);
+      case "preparing":
+      case "aggregating":
+        return failed(`unsupported standalone resume state ${state.value.kind}`);
+      default: {
+        // Exhaustive totality proof: a new StandaloneReviewMachineState variant
+        // is a compile error here instead of an unhandled resume fall-through.
+        const exhausted: never = state.value;
+        return failed(`unsupported standalone resume state ${JSON.stringify(exhausted)}`);
+      }
     }
-    if (state.value.kind === "terminal-blocked" || state.value.kind === "recoverable-blocked") {
-      return { ok: true, action: { kind: "blocked", runId: handle.runId, diagnostic: state.value } };
-    }
-    if (state.value.kind === "ready-to-finalize") return finalizeStandaloneState(handle, state.value);
-    if (state.value.kind === "awaiting-refutation") {
-      const preparation = standaloneRefutationPreparation(handle, state.value.authority, state.value.aggregate);
-      if (state.value.authority.schemaVersion === 3) for (const packet of preparation.packets) await publishStandalonePanelView(handle, packet);
-      const recovered = durableRefutationRequests(handle, preparation.inputs, resolver);
-      if (recovered.kind === "corrupt") return failed(recovered.message);
-      if (recovered.kind === "absent") {
-        const published = await publishInitialBatch(handle, preparation.inputs, preparation.packets, "standalone-refutation");
-        return published.ok ? { ok: true, action: published.action } : failed(published.message);
-      }
-      const panelRequests = recovered.requests;
-      const captured = handle.readCapturedAttempts();
-      if (!captured.ok) return failed(captured.error.message);
-      // Phase A — admission check for every attempt-1 slot the panel still
-      // expects at attempt 1. Two independent refusal classes both REJECT the
-      // slot HERE — where the panel machine can advance it to attempt 2 —
-      // instead of dead-locking the roster on every resume:
-      //   1. captured transcript the frozen-scope validator refuses (semantic);
-      //   2. capture terminally rejected by the harness runtime (no bytes
-      //      landed at all — a child that exited without a final payload).
-      // Without case 2 the refutation resume re-issues the terminally rejected
-      // attempt-1 request forever — the capture runtime will never accept its
-      // bytes again — dead-locking the panel. The tombstoned slot is dead for
-      // capture, so it is NOT re-issued here; the verdict loop below advances
-      // it to its attempt-2 retry through the panel's rejection path.
-      const reissues: (typeof panelRequests)[number][] = [];
-      const tombstones = new Map<string, string>();
-      for (const request of panelRequests) {
-        if (captured.value.has(captureKey(request.authority.slotId, request.authority.attempt))) continue;
-        const rejection = await durableCaptureRejection(handle, request.authority);
-        if (rejection === null) reissues.push(request);
-        else tombstones.set(request.authority.slotId, rejection);
-      }
-      if (reissues.length > 0) {
-        return {
-          ok: true,
-          action: { kind: "spawn-batch", runId: handle.runId, requests: executableRefutationRequests(handle, reissues, true) },
-        };
-      }
-      let panelState = startPersistentRefutationPanel(preparation.panel).state;
-      // Collect the FULL immutable event prefix as the panel runs. The legacy
-      // completed-state projection records accepted verdicts only, so a slot
-      // accepted on attempt 2 (after an attempt-1 verdict was rejected) cannot
-      // be replayed from it — the durable restart would see the slot still
-      // awaiting attempt 1 and reject the :2 request. The canonical T2
-      // checkpoint below carries the rejection events and replay reaches the
-      // exact terminal state.
-      const panelEvents: PersistentRefutationPanelEvent[] = [];
-      for (const request of panelRequests) {
-        const bytes = handle.readTranscriptBytes(request.authority);
-        // A tombstoned attempt-1 slot has no evidence: the capture runtime
-        // terminally rejected the attempt, so there is no verdict to parse.
-        // The slot advances to its attempt-2 retry through the panel's
-        // rejection path — with the capture diagnostic as the rejection
-        // message, which the attempt-2 task repeats to the verifier. Kept
-        // as a fail-closed guard: a runtime whose missing-filter and this
-        // loop disagree must fail loudly, not pass an undefined tombstone
-        // downstream as if the slot had a verdict.
-        let submitted = bytes.ok
-          ? submitRefutationVerdict(panelState, resolver, panelRequestIdentity(request), Buffer.from(bytes.value).toString("utf8"))
-          : rejectRefutationVerdict(panelState, resolver, panelRequestIdentity(request), tombstones.get(request.authority.slotId) ?? bytes.error.message);
-        if (!submitted.ok) return failed(submitted.error.message);
-        panelState = submitted.value.state;
-        if (submitted.value.recordedEvent !== undefined) panelEvents.push(submitted.value.recordedEvent);
-        if (submitted.value.action?.kind === "spawn-refutation-verifiers") {
-          const retryAuthority = submitted.value.action.requests[0];
-          const retry = await recoverOrPublishRefutationRetry(
-            handle, retryAuthority, preparation.retryInputs, resolver, "standalone-refutation",
-          );
-          if (!retry.ok) {
-            // The attempt-2 capture was TERMINALLY rejected: the capture
-            // runtime refuses any future capture for this slot, so re-issuing
-            // the spawn can never land evidence — that is the attempt-2 doom
-            // loop this exists to break. Attempt 2 is the FINAL attempt, so
-            // the panel machine records the rejection as an explicit panel
-            // rejection (terminal-blocked) instead of the resume re-failing
-            // the same raw recovery error forever — the same terminal path a
-            // semantic attempt-2 rejection already takes.
-            if (retry.kind !== "capture-rejected" || retry.request === null) return failed(retry.message);
-            submitted = rejectRefutationVerdict(panelState, resolver, panelRequestIdentity(retry.request), retry.rejection);
-            if (!submitted.ok) return failed(submitted.error.message);
-            panelState = submitted.value.state;
-            if (submitted.value.recordedEvent !== undefined) panelEvents.push(submitted.value.recordedEvent);
-            if (submitted.value.action?.kind === "refutation-blocked") {
-              return failed(submitted.value.action.diagnostic.message);
-            }
-            return failed("refutation capture rejection did not terminal-block the panel");
-          }
-          const attempts = handle.readCapturedAttempts();
-          if (!attempts.ok) return failed(attempts.error.message);
-          if (!attempts.value.has(captureKey(retry.request.authority.slotId, retry.request.authority.attempt))) {
-            return { ok: true, action: {
-              kind: "spawn-batch", runId: handle.runId,
-              requests: executableRefutationRequests(
-                handle, [retry.request], true, refutationRejectionDiagnostic(submitted.value.recordedEvent),
-              ),
-            } };
-          }
-          const retryBytes = handle.readTranscriptBytes(retry.request.authority);
-          if (!retryBytes.ok) return failed(retryBytes.error.message);
-          submitted = submitRefutationVerdict(
-            panelState, resolver, panelRequestIdentity(retry.request), Buffer.from(retryBytes.value).toString("utf8"),
-          );
-          if (!submitted.ok) return failed(submitted.error.message);
-          panelState = submitted.value.state;
-          if (submitted.value.recordedEvent !== undefined) panelEvents.push(submitted.value.recordedEvent);
-          if (submitted.value.action?.kind === "refutation-blocked") {
-            return failed(submitted.value.action.diagnostic.message);
-          }
-        }
-      }
-      const completed = completePersistentRefutationPanel(panelState, resolver, preparation.threshold);
-      if (!completed.ok || completed.value.state.stage !== "done") return failed(completed.ok ? "refutation did not reach done" : completed.error.message);
-      if (completed.value.recordedEvent !== undefined) panelEvents.push(completed.value.recordedEvent);
-      const canonical = refutationPanelCheckpoint(completed.value.state, panelEvents, resolver);
-      if (!canonical.ok) return failed(canonical.error.message);
-      const completion = parseStandaloneRefutationCompletion({
-        panelAuthority: preparation.frozen,
-        aggregate: state.value.aggregate,
-        completedPanelState: completed.value.state,
-        completedPanelCheckpoint: canonical.value,
-        publicationResolver: resolver,
-      });
-      if (!completion.ok) return failed(completion.error.message);
-      const ready = reduceStandaloneReviewMachine(state.value, { kind: "refutation-completed", completion: completion.value });
-      if (!ready.ok || ready.value.kind !== "ready-to-finalize") return failed(ready.ok ? "refutation did not unlock finalization" : ready.error.message);
-      return finalizeStandaloneState(handle, ready.value);
-    }
-    if (state.value.kind !== "awaiting-results") return failed(`unsupported standalone resume state ${state.value.kind}`);
-
-    const activeAuthority = state.value.authority;
-    const recovered = durableRequests(handle, activeAuthority, resolver);
-    if (recovered.kind !== "found") {
-      return failed(recovered.kind === "absent"
-        ? "standalone publication authority is absent"
-        : recovered.message);
-    }
-    const attemptOneBySlot = new Map(recovered.requests.map((request) => [request.authority.slotId, request] as const));
-    const captured = handle.readCapturedAttempts();
-    if (!captured.ok) return failed(captured.error.message);
-    const pendingBySlot = new Map(state.value.pending.map(({ slotId, expectedAttempt }) => [slotId, expectedAttempt] as const));
-
-    // Phase A — admission check for every attempt-1 slot the machine still
-    // expects at attempt 1. Two independent refusal classes both REJECT the
-    // slot HERE — where the LC-2 lifecycle can advance it to attempt 2 —
-    // instead of dead-ending the whole run with no recovery path:
-    //   1. captured transcript the frozen-scope validator refuses (semantic);
-    //   2. capture that was terminally rejected by the harness runtime (no
-    //      bytes landed at all, e.g. a child that exited without a final
-    //      payload). Without case 2 the façade re-issues the terminally
-    //      rejected attempt-1 request on every resume — the capture runtime
-    //      will never accept its bytes again — dead-locking the roster.
-    const rejected: Readonly<{ slot: AgentRequestAuthority; problems: readonly string[] }>[] = [];
-    for (const slot of activeAuthority.roster.orderedSlots) {
-      if ((pendingBySlot.get(slot.slotId) ?? 1) !== 1) continue;
-      const attemptOne = attemptOneBySlot.get(slot.slotId);
-      if (attemptOne === undefined) {
-        return failed(`standalone attempt-1 issuance authority is missing for ${slot.slotId}`);
-      }
-      if (!captured.value.has(captureKey(attemptOne.authority.slotId, 1))) {
-        const captureRejection = await durableCaptureRejection(handle, attemptOne.authority);
-        if (captureRejection !== null) {
-          rejected.push({ slot: attemptOne.authority, problems: Object.freeze([captureRejection]) });
-        }
-        continue;
-      }
-      const bytes = handle.readTranscriptBytes(attemptOne.authority);
-      if (!bytes.ok) return failed(bytes.error.message);
-      const admission = admitCapturedStandaloneTranscript(
-        reviewerProtocols,
-        attemptOne.authority,
-        bytes.value,
-      );
-      if (!admission.ok) rejected.push({ slot: attemptOne.authority, problems: [...admission.problems] });
-    }
-    let machine: StandaloneReviewMachineState = state.value;
-    if (rejected.length > 0) {
-      for (const { slot, problems } of rejected) {
-        const reduced = reduceStandaloneReviewMachine(machine, {
-          kind: "result-rejected",
-          request: { runId: handle.runId, slotId: slot.slotId, requestId: slot.requestId, attempt: 1 },
-          message: problems.join("; "),
-        });
-        if (!reduced.ok || reduced.value.kind !== "awaiting-results") {
-          return failed(reduced.ok ? "standalone semantic rejection did not remain awaiting results" : reduced.error.message);
-        }
-        machine = reduced.value;
-      }
-      // Append the append-only audit events BEFORE committing the attempt-2
-      // projection: a failed append leaves the checkpoint still expecting
-      // attempt 1, so the next resume rediscovers the rejection and retries
-      // it; a succeeded append followed by a failed checkpoint write is
-      // re-discovered the same way, and the journal's dedup key makes the
-      // repeat idempotent.
-      for (const { slot, problems } of rejected) {
-        await appendStandaloneRejection(handle, slot, slot.attempt, problems.join("; "));
-      }
-      await handle.writeCheckpoint(serializeStandaloneReviewMachineState(machine));
-    }
-
-    // Phase B — assemble the issued-request set. Slots still expected at
-    // attempt 1 come from the original batch publication; slots at attempt 2
-    // (freshly rejected here or retried in an earlier resume) come from the
-    // per-slot retry batch, published now if a crash left it unpublished.
-    const rejectedSlotIds = new Set(rejected.map(({ slot }) => slot.slotId));
-    // Read the diagnostic off the REDUCED machine, not off this pass's `rejected`
-    // set: a resume that merely re-issues an already-recorded retry has an empty
-    // `rejected` set, and reading from it there silently degraded the attempt-2
-    // prompt to the generic fallback.
-    const rejectedDiagnostics = new Map(machine.pending.flatMap(({ slotId, rejectionDiagnostic }) =>
-      rejectionDiagnostic === null ? [] : [[slotId, rejectionDiagnostic] as const]));
-    const issued: SpawnRequest[] = [];
-    for (const slot of activeAuthority.roster.orderedSlots) {
-      const expected = rejectedSlotIds.has(slot.slotId) ? 2 : (pendingBySlot.get(slot.slotId) ?? 1);
-      if (expected === 1) {
-        const attemptOne = attemptOneBySlot.get(slot.slotId);
-        if (attemptOne === undefined) {
-          return failed(`standalone attempt-1 issuance authority is missing for ${slot.slotId}`);
-        }
-        issued.push(attemptOne);
-        continue;
-      }
-      const retry = await recoverOrPublishStandaloneRetry(handle, activeAuthority, slot, resolver);
-      if (!retry.ok) return failed(retry.message);
-      issued.push(retry.request);
-    }
-    const captureAuthority = bindStandaloneCaptureAuthority(activeAuthority, issued);
-    if (!captureAuthority.ok) return failed(captureAuthority.error.message);
-
-    // Phase C — accept captured expected attempts. A captured attempt 2 that
-    // STILL fails the frozen-scope validator terminal-blocks the run exactly as
-    // the LC-2 lifecycle prescribes for a second and final attempt.
-    const accepted = [];
-    const missing: SpawnRequest[] = [];
-    for (const request of issued) {
-      if (!captured.value.has(captureKey(request.authority.slotId, request.authority.attempt))) {
-        const rejection = request.authority.attempt === 2 ? await durableCaptureRejection(handle, request.authority) : null;
-        if (rejection !== null) {
-          const terminal = reduceStandaloneReviewMachine(machine, { kind: "result-rejected", request: request.authority, message: rejection });
-          if (!terminal.ok || terminal.value.kind !== "terminal-blocked") {
-            return failed(terminal.ok ? "final capture rejection did not terminal-block" : terminal.error.message);
-          }
-          // Audit event before the terminal checkpoint commit: a failed append
-          // leaves the machine awaiting results, so the next resume re-derives
-          // and retries it; the journal dedup key makes the repeat idempotent.
-          await appendStandaloneRejection(handle, request.authority, 2, rejection);
-          await handle.writeCheckpoint(serializeStandaloneReviewMachineState(terminal.value));
-          return { ok: true, action: { kind: "blocked", runId: handle.runId, diagnostic: terminal.value } };
-        }
-        missing.push(request);
-        continue;
-      }
-      const bytes = handle.readTranscriptBytes(request.authority);
-      if (!bytes.ok) return failed(bytes.error.message);
-      if (request.authority.attempt === 2) {
-        const admission = admitCapturedStandaloneTranscript(
-          reviewerProtocols,
-          request.authority,
-          bytes.value,
-        );
-        if (!admission.ok) {
-          const problems = [...admission.problems];
-          const terminal = reduceStandaloneReviewMachine(machine, {
-            kind: "result-rejected",
-            request: { runId: handle.runId, slotId: request.authority.slotId, requestId: request.authority.requestId, attempt: 2 },
-            message: problems.join("; "),
-          });
-          if (!terminal.ok || terminal.value.kind !== "terminal-blocked") {
-            return failed(terminal.ok ? "standalone attempt-2 rejection did not terminal-block" : terminal.error.message);
-          }
-          // Audit event before the terminal checkpoint commit: a failed append
-          // leaves the machine awaiting results, so the next resume re-derives
-          // and retries it; the journal dedup key makes the repeat idempotent.
-          await appendStandaloneRejection(handle, request.authority, 2, problems.join("; "));
-          await handle.writeCheckpoint(serializeStandaloneReviewMachineState(terminal.value));
-          return { ok: true, action: { kind: "blocked", runId: handle.runId, diagnostic: terminal.value } };
-        }
-      }
-      const prepared = captureStandaloneReviewerBytes(captureAuthority.value, request.authority.requestId, bytes.value);
-      if (!prepared.ok) return failed(prepared.error.message);
-      const completed = completeStandaloneReviewerCapture(prepared.value, {
-        kind: "raw-transcript-captured",
-        effectId: prepared.value.intent.effectId,
-        runId: handle.runId,
-        requestId: request.authority.requestId,
-        artifact: prepared.value.expectedArtifact,
-      });
-      if (!completed.ok) return failed(completed.error.message);
-      accepted.push(completed.value);
-    }
-    if (missing.length > 0) {
-      const effectId = standalonePublicationEffectId(activeAuthority);
-      if (!effectId.ok) return failed(effectId.error.message);
-      const receipt = JSON.parse(readRunBytesNoFollow(
-        `${handle.runDirectory}/artifacts/${publicationFile(effectId.value)}`,
-      ).toString("utf8")) as Record<string, unknown>;
-      return { ok: true, action: {
-        kind: "spawn-batch",
-        runId: handle.runId,
-        publicationIdentity: {
-          schemaVersion: 1,
-          kind: "batch-publication-identity",
-          runId: handle.runId,
-          effectId: effectId.value,
-          publicationDigest: receipt.publicationDigest,
-        },
-        idempotencyKey: { runId: handle.runId, effectId: effectId.value },
-        receipt,
-        requests: missing.map((request) => {
-          const task = renderSpawnTask(
-            handle,
-            request.authority,
-            "Read the immutable context packet at LOOM_CONTEXT_PATH and emit only the required reviewer result.",
-            { standalone: true },
-          );
-          return {
-            ...request,
-            task: request.authority.attempt === 2
-              ? standaloneRetryTask(task, rejectedDiagnostics.get(request.authority.slotId) ?? null, activeAuthority)
-              : task,
-          };
-        }),
-      } };
-    }
-    const completion = proveStandaloneRosterCompletion(activeAuthority, resolver, accepted, reviewerProtocols);
-    if (!completion.ok) return failed(completion.error.violations.map((entry) => JSON.stringify(entry)).join("; "));
-    let reduced = reduceStandaloneReviewMachine(machine, { kind: "complete-roster-proved", completion: completion.value });
-    if (!reduced.ok) return failed(reduced.error.message);
-    if (reduced.value.kind !== "aggregating") return failed("standalone roster did not reach aggregation");
-    const aggregate = aggregateStandaloneReview({ authority: activeAuthority, completion: completion.value });
-    if (!aggregate.ok) return failed(aggregate.errors.join("; "));
-    if (aggregate.value.kind !== "clean") {
-      const preparation = standaloneRefutationPreparation(handle, activeAuthority, aggregate.value.aggregate);
-      reduced = reduceStandaloneReviewMachine(reduced.value, {
-        kind: "aggregate-has-criticals",
-        aggregate: aggregate.value.aggregate,
-        panelAuthority: preparation.frozen,
-        refutationAuthority: preparation.panel,
-      });
-      if (!reduced.ok || reduced.value.kind !== "awaiting-refutation") return failed(reduced.ok ? "critical route did not reach refutation" : reduced.error.message);
-      await handle.writeCheckpoint(serializeStandaloneReviewMachineState(reduced.value));
-      const published = await publishInitialBatch(handle, preparation.inputs, preparation.packets, "standalone-refutation");
-      return published.ok ? { ok: true, action: published.action } : failed(published.message);
-    }
-    reduced = reduceStandaloneReviewMachine(reduced.value, { kind: "aggregate-clean", aggregate: aggregate.value.aggregate });
-    if (!reduced.ok || reduced.value.kind !== "ready-to-finalize") return failed(reduced.ok ? "standalone finalization did not become ready" : reduced.error.message);
-    return finalizeStandaloneState(handle, reduced.value);
   } catch (error) {
     return failed(error instanceof Error ? error.message : String(error));
   }
 }
+
+async function resumeAwaitingRefutation(
+  handle: RunDirHandle,
+  state: Extract<StandaloneReviewMachineState, { kind: "awaiting-refutation" }>,
+  resolver: PublicationAuthorityResolver,
+): Promise<FacadeDriveResult> {
+  const preparation = standaloneRefutationPreparation(handle, state.authority, state.aggregate);
+  if (state.authority.schemaVersion === 3) for (const packet of preparation.packets) await publishStandalonePanelView(handle, packet);
+  const recovered = durableRefutationRequests(handle, preparation.inputs, resolver);
+  if (recovered.kind === "corrupt") return failed(recovered.message);
+  if (recovered.kind === "absent") {
+    const published = await publishInitialBatch(handle, preparation.inputs, preparation.packets, "standalone-refutation");
+    return published.ok ? { ok: true, action: published.action } : failed(published.message);
+  }
+  const panelRequests = recovered.requests;
+  const captured = handle.readCapturedAttempts();
+  if (!captured.ok) return failed(captured.error.message);
+  // Phase A — admission check for every attempt-1 slot the panel still
+  // expects at attempt 1. Two independent refusal classes both REJECT the
+  // slot HERE — where the panel machine can advance it to attempt 2 —
+  // instead of dead-locking the roster on every resume:
+  //   1. captured transcript the frozen-scope validator refuses (semantic);
+  //   2. capture terminally rejected by the harness runtime (no bytes
+  //      landed at all — a child that exited without a final payload).
+  // Without case 2 the refutation resume re-issues the terminally rejected
+  // attempt-1 request forever — the capture runtime will never accept its
+  // bytes again — dead-locking the panel. The tombstoned slot is dead for
+  // capture, so it is NOT re-issued here; the verdict loop below advances
+  // it to its attempt-2 retry through the panel's rejection path.
+  const reissues: (typeof panelRequests)[number][] = [];
+  const tombstones = new Map<string, string>();
+  for (const request of panelRequests) {
+    if (captured.value.has(captureKey(request.authority.slotId, request.authority.attempt))) continue;
+    const rejection = await durableCaptureRejection(handle, request.authority);
+    if (rejection === null) reissues.push(request);
+    else tombstones.set(request.authority.slotId, rejection);
+  }
+  if (reissues.length > 0) {
+    return {
+      ok: true,
+      action: { kind: "spawn-batch", runId: handle.runId, requests: executableRefutationRequests(handle, reissues, true) },
+    };
+  }
+  let panelState = startPersistentRefutationPanel(preparation.panel).state;
+  // Collect the FULL immutable event prefix as the panel runs. The legacy
+  // completed-state projection records accepted verdicts only, so a slot
+  // accepted on attempt 2 (after an attempt-1 verdict was rejected) cannot
+  // be replayed from it — the durable restart would see the slot still
+  // awaiting attempt 1 and reject the :2 request. The canonical T2
+  // checkpoint below carries the rejection events and replay reaches the
+  // exact terminal state.
+  const panelEvents: PersistentRefutationPanelEvent[] = [];
+  for (const request of panelRequests) {
+    const bytes = handle.readTranscriptBytes(request.authority);
+    // A tombstoned attempt-1 slot has no evidence: the capture runtime
+    // terminally rejected the attempt, so there is no verdict to parse.
+    // The slot advances to its attempt-2 retry through the panel's
+    // rejection path — with the capture diagnostic as the rejection
+    // message, which the attempt-2 task repeats to the verifier. Kept
+    // as a fail-closed guard: a runtime whose missing-filter and this
+    // loop disagree must fail loudly, not pass an undefined tombstone
+    // downstream as if the slot had a verdict.
+    let submitted = bytes.ok
+      ? submitRefutationVerdict(panelState, resolver, panelRequestIdentity(request), Buffer.from(bytes.value).toString("utf8"))
+      : rejectRefutationVerdict(panelState, resolver, panelRequestIdentity(request), tombstones.get(request.authority.slotId) ?? bytes.error.message);
+    if (!submitted.ok) return failed(submitted.error.message);
+    panelState = submitted.value.state;
+    if (submitted.value.recordedEvent !== undefined) panelEvents.push(submitted.value.recordedEvent);
+    if (submitted.value.action?.kind === "spawn-refutation-verifiers") {
+      const retryAuthority = submitted.value.action.requests[0];
+      const retry = await recoverOrPublishRefutationRetry(
+        handle, retryAuthority, preparation.retryInputs, resolver, "standalone-refutation",
+      );
+      if (!retry.ok) {
+        // The attempt-2 capture was TERMINALLY rejected: the capture
+        // runtime refuses any future capture for this slot, so re-issuing
+        // the spawn can never land evidence — that is the attempt-2 doom
+        // loop this exists to break. Attempt 2 is the FINAL attempt, so
+        // the panel machine records the rejection as an explicit panel
+        // rejection (terminal-blocked) instead of the resume re-failing
+        // the same raw recovery error forever — the same terminal path a
+        // semantic attempt-2 rejection already takes.
+        if (retry.kind !== "capture-rejected" || retry.request === null) return failed(retry.message);
+        submitted = rejectRefutationVerdict(panelState, resolver, panelRequestIdentity(retry.request), retry.rejection);
+        if (!submitted.ok) return failed(submitted.error.message);
+        panelState = submitted.value.state;
+        if (submitted.value.recordedEvent !== undefined) panelEvents.push(submitted.value.recordedEvent);
+        if (submitted.value.action?.kind === "refutation-blocked") {
+          return failed(submitted.value.action.diagnostic.message);
+        }
+        return failed("refutation capture rejection did not terminal-block the panel");
+      }
+      const attempts = handle.readCapturedAttempts();
+      if (!attempts.ok) return failed(attempts.error.message);
+      if (!attempts.value.has(captureKey(retry.request.authority.slotId, retry.request.authority.attempt))) {
+        return { ok: true, action: {
+          kind: "spawn-batch", runId: handle.runId,
+          requests: executableRefutationRequests(
+            handle, [retry.request], true, refutationRejectionDiagnostic(submitted.value.recordedEvent),
+          ),
+        } };
+      }
+      const retryBytes = handle.readTranscriptBytes(retry.request.authority);
+      if (!retryBytes.ok) return failed(retryBytes.error.message);
+      submitted = submitRefutationVerdict(
+        panelState, resolver, panelRequestIdentity(retry.request), Buffer.from(retryBytes.value).toString("utf8"),
+      );
+      if (!submitted.ok) return failed(submitted.error.message);
+      panelState = submitted.value.state;
+      if (submitted.value.recordedEvent !== undefined) panelEvents.push(submitted.value.recordedEvent);
+      if (submitted.value.action?.kind === "refutation-blocked") {
+        return failed(submitted.value.action.diagnostic.message);
+      }
+    }
+  }
+  const completed = completePersistentRefutationPanel(panelState, resolver, preparation.threshold);
+  if (!completed.ok || completed.value.state.stage !== "done") return failed(completed.ok ? "refutation did not reach done" : completed.error.message);
+  if (completed.value.recordedEvent !== undefined) panelEvents.push(completed.value.recordedEvent);
+  const canonical = refutationPanelCheckpoint(completed.value.state, panelEvents, resolver);
+  if (!canonical.ok) return failed(canonical.error.message);
+  const completion = parseStandaloneRefutationCompletion({
+    panelAuthority: preparation.frozen,
+    aggregate: state.aggregate,
+    completedPanelState: completed.value.state,
+    completedPanelCheckpoint: canonical.value,
+    publicationResolver: resolver,
+  });
+  if (!completion.ok) return failed(completion.error.message);
+  const ready = reduceStandaloneReviewMachine(state, { kind: "refutation-completed", completion: completion.value });
+  if (!ready.ok || ready.value.kind !== "ready-to-finalize") return failed(ready.ok ? "refutation did not unlock finalization" : ready.error.message);
+  return finalizeStandaloneState(handle, ready.value);
+}
+
+async function resumeAwaitingResults(
+  handle: RunDirHandle,
+  state: Extract<StandaloneReviewMachineState, { kind: "awaiting-results" }>,
+  resolver: PublicationAuthorityResolver,
+  reviewerProtocols: StandaloneReviewerProtocolResolver,
+): Promise<FacadeDriveResult> {
+  const activeAuthority = state.authority;
+  const recovered = durableRequests(handle, activeAuthority, resolver);
+  if (recovered.kind !== "found") {
+    return failed(recovered.kind === "absent"
+      ? "standalone publication authority is absent"
+      : recovered.message);
+  }
+  const attemptOneBySlot = new Map(recovered.requests.map((request) => [request.authority.slotId, request] as const));
+  const captured = handle.readCapturedAttempts();
+  if (!captured.ok) return failed(captured.error.message);
+  const pendingBySlot = new Map(state.pending.map(({ slotId, expectedAttempt }) => [slotId, expectedAttempt] as const));
+
+  // Phase A admission — see resumeAwaitingRefutation for the canonical deadlock
+  // reasoning. Two refusal classes (a semantically refused transcript; a capture
+  // terminally rejected by the harness runtime) both REJECT the slot HERE —
+  // where the LC-2 lifecycle can advance it to attempt 2 — instead of
+  // dead-ending the whole run with no recovery path.
+  const rejected: Readonly<{ slot: AgentRequestAuthority; problems: readonly string[] }>[] = [];
+  for (const slot of activeAuthority.roster.orderedSlots) {
+    if ((pendingBySlot.get(slot.slotId) ?? 1) !== 1) continue;
+    const attemptOne = attemptOneBySlot.get(slot.slotId);
+    if (attemptOne === undefined) {
+      return failed(`standalone attempt-1 issuance authority is missing for ${slot.slotId}`);
+    }
+    if (!captured.value.has(captureKey(attemptOne.authority.slotId, 1))) {
+      const captureRejection = await durableCaptureRejection(handle, attemptOne.authority);
+      if (captureRejection !== null) {
+        rejected.push({ slot: attemptOne.authority, problems: Object.freeze([captureRejection]) });
+      }
+      continue;
+    }
+    const bytes = handle.readTranscriptBytes(attemptOne.authority);
+    if (!bytes.ok) return failed(bytes.error.message);
+    const admission = admitCapturedStandaloneTranscript(
+      reviewerProtocols,
+      attemptOne.authority,
+      bytes.value,
+    );
+    if (!admission.ok) rejected.push({ slot: attemptOne.authority, problems: [...admission.problems] });
+  }
+  let machine: StandaloneReviewMachineState = state;
+  if (rejected.length > 0) {
+    for (const { slot, problems } of rejected) {
+      const reduced = reduceStandaloneReviewMachine(machine, {
+        kind: "result-rejected",
+        request: { runId: handle.runId, slotId: slot.slotId, requestId: slot.requestId, attempt: 1 },
+        message: problems.join("; "),
+      });
+      if (!reduced.ok || reduced.value.kind !== "awaiting-results") {
+        return failed(reduced.ok ? "standalone semantic rejection did not remain awaiting results" : reduced.error.message);
+      }
+      machine = reduced.value;
+    }
+    // Append the append-only audit events BEFORE committing the attempt-2
+    // projection: a failed append leaves the checkpoint still expecting
+    // attempt 1, so the next resume rediscovers the rejection and retries
+    // it; a succeeded append followed by a failed checkpoint write is
+    // re-discovered the same way, and the journal's dedup key makes the
+    // repeat idempotent.
+    for (const { slot, problems } of rejected) {
+      await appendStandaloneRejection(handle, slot, slot.attempt, problems.join("; "));
+    }
+    await handle.writeCheckpoint(serializeStandaloneReviewMachineState(machine));
+  }
+
+  // Phase B — assemble the issued-request set. Slots still expected at
+  // attempt 1 come from the original batch publication; slots at attempt 2
+  // (freshly rejected here or retried in an earlier resume) come from the
+  // per-slot retry batch, published now if a crash left it unpublished.
+  const rejectedSlotIds = new Set(rejected.map(({ slot }) => slot.slotId));
+  // Read the diagnostic off the REDUCED machine, not off this pass's `rejected`
+  // set: a resume that merely re-issues an already-recorded retry has an empty
+  // `rejected` set, and reading from it there silently degraded the attempt-2
+  // prompt to the generic fallback.
+  const rejectedDiagnostics = new Map(machine.pending.flatMap(({ slotId, rejectionDiagnostic }) =>
+    rejectionDiagnostic === null ? [] : [[slotId, rejectionDiagnostic] as const]));
+  const issued: SpawnRequest[] = [];
+  for (const slot of activeAuthority.roster.orderedSlots) {
+    const expected = rejectedSlotIds.has(slot.slotId) ? 2 : (pendingBySlot.get(slot.slotId) ?? 1);
+    if (expected === 1) {
+      const attemptOne = attemptOneBySlot.get(slot.slotId);
+      if (attemptOne === undefined) {
+        return failed(`standalone attempt-1 issuance authority is missing for ${slot.slotId}`);
+      }
+      issued.push(attemptOne);
+      continue;
+    }
+    const retry = await recoverOrPublishStandaloneRetry(handle, activeAuthority, slot, resolver);
+    if (!retry.ok) return failed(retry.message);
+    issued.push(retry.request);
+  }
+  const captureAuthority = bindStandaloneCaptureAuthority(activeAuthority, issued);
+  if (!captureAuthority.ok) return failed(captureAuthority.error.message);
+
+  // Phase C — accept captured expected attempts. A captured attempt 2 that
+  // STILL fails the frozen-scope validator terminal-blocks the run exactly as
+  // the LC-2 lifecycle prescribes for a second and final attempt.
+  const accepted = [];
+  const missing: SpawnRequest[] = [];
+  for (const request of issued) {
+    if (!captured.value.has(captureKey(request.authority.slotId, request.authority.attempt))) {
+      const rejection = request.authority.attempt === 2 ? await durableCaptureRejection(handle, request.authority) : null;
+      if (rejection !== null) {
+        const terminal = reduceStandaloneReviewMachine(machine, { kind: "result-rejected", request: request.authority, message: rejection });
+        if (!terminal.ok || terminal.value.kind !== "terminal-blocked") {
+          return failed(terminal.ok ? "final capture rejection did not terminal-block" : terminal.error.message);
+        }
+        // Audit event before the terminal checkpoint commit: a failed append
+        // leaves the machine awaiting results, so the next resume re-derives
+        // and retries it; the journal dedup key makes the repeat idempotent.
+        await appendStandaloneRejection(handle, request.authority, 2, rejection);
+        await handle.writeCheckpoint(serializeStandaloneReviewMachineState(terminal.value));
+        return { ok: true, action: { kind: "blocked", runId: handle.runId, diagnostic: terminal.value } };
+      }
+      missing.push(request);
+      continue;
+    }
+    const bytes = handle.readTranscriptBytes(request.authority);
+    if (!bytes.ok) return failed(bytes.error.message);
+    if (request.authority.attempt === 2) {
+      const admission = admitCapturedStandaloneTranscript(
+        reviewerProtocols,
+        request.authority,
+        bytes.value,
+      );
+      if (!admission.ok) {
+        const problems = [...admission.problems];
+        const terminal = reduceStandaloneReviewMachine(machine, {
+          kind: "result-rejected",
+          request: { runId: handle.runId, slotId: request.authority.slotId, requestId: request.authority.requestId, attempt: 2 },
+          message: problems.join("; "),
+        });
+        if (!terminal.ok || terminal.value.kind !== "terminal-blocked") {
+          return failed(terminal.ok ? "standalone attempt-2 rejection did not terminal-block" : terminal.error.message);
+        }
+        // Audit event before the terminal checkpoint commit: a failed append
+        // leaves the machine awaiting results, so the next resume re-derives
+        // and retries it; the journal dedup key makes the repeat idempotent.
+        await appendStandaloneRejection(handle, request.authority, 2, problems.join("; "));
+        await handle.writeCheckpoint(serializeStandaloneReviewMachineState(terminal.value));
+        return { ok: true, action: { kind: "blocked", runId: handle.runId, diagnostic: terminal.value } };
+      }
+    }
+    const prepared = captureStandaloneReviewerBytes(captureAuthority.value, request.authority.requestId, bytes.value);
+    if (!prepared.ok) return failed(prepared.error.message);
+    const completed = completeStandaloneReviewerCapture(prepared.value, {
+      kind: "raw-transcript-captured",
+      effectId: prepared.value.intent.effectId,
+      runId: handle.runId,
+      requestId: request.authority.requestId,
+      artifact: prepared.value.expectedArtifact,
+    });
+    if (!completed.ok) return failed(completed.error.message);
+    accepted.push(completed.value);
+  }
+  if (missing.length > 0) {
+    const effectId = standalonePublicationEffectId(activeAuthority);
+    if (!effectId.ok) return failed(effectId.error.message);
+    const receipt = JSON.parse(readRunBytesNoFollow(
+      `${handle.runDirectory}/artifacts/${publicationFile(effectId.value)}`,
+    ).toString("utf8")) as Record<string, unknown>;
+    return { ok: true, action: {
+      kind: "spawn-batch",
+      runId: handle.runId,
+      publicationIdentity: {
+        schemaVersion: 1,
+        kind: "batch-publication-identity",
+        runId: handle.runId,
+        effectId: effectId.value,
+        publicationDigest: receipt.publicationDigest,
+      },
+      idempotencyKey: { runId: handle.runId, effectId: effectId.value },
+      receipt,
+      requests: missing.map((request) => {
+        const task = renderSpawnTask(
+          handle,
+          request.authority,
+          "Read the immutable context packet at LOOM_CONTEXT_PATH and emit only the required reviewer result.",
+          { standalone: true },
+        );
+        return {
+          ...request,
+          task: request.authority.attempt === 2
+            ? standaloneRetryTask(task, rejectedDiagnostics.get(request.authority.slotId) ?? null, activeAuthority)
+            : task,
+        };
+      }),
+    } };
+  }
+  const completion = proveStandaloneRosterCompletion(activeAuthority, resolver, accepted, reviewerProtocols);
+  if (!completion.ok) return failed(completion.error.violations.map((entry) => JSON.stringify(entry)).join("; "));
+  let reduced = reduceStandaloneReviewMachine(machine, { kind: "complete-roster-proved", completion: completion.value });
+  if (!reduced.ok) return failed(reduced.error.message);
+  if (reduced.value.kind !== "aggregating") return failed("standalone roster did not reach aggregation");
+  const aggregate = aggregateStandaloneReview({ authority: activeAuthority, completion: completion.value });
+  if (!aggregate.ok) return failed(aggregate.errors.join("; "));
+  if (aggregate.value.kind !== "clean") {
+    const preparation = standaloneRefutationPreparation(handle, activeAuthority, aggregate.value.aggregate);
+    reduced = reduceStandaloneReviewMachine(reduced.value, {
+      kind: "aggregate-has-criticals",
+      aggregate: aggregate.value.aggregate,
+      panelAuthority: preparation.frozen,
+      refutationAuthority: preparation.panel,
+    });
+    if (!reduced.ok || reduced.value.kind !== "awaiting-refutation") return failed(reduced.ok ? "critical route did not reach refutation" : reduced.error.message);
+    await handle.writeCheckpoint(serializeStandaloneReviewMachineState(reduced.value));
+    const published = await publishInitialBatch(handle, preparation.inputs, preparation.packets, "standalone-refutation");
+    return published.ok ? { ok: true, action: published.action } : failed(published.message);
+  }
+  reduced = reduceStandaloneReviewMachine(reduced.value, { kind: "aggregate-clean", aggregate: aggregate.value.aggregate });
+  if (!reduced.ok || reduced.value.kind !== "ready-to-finalize") return failed(reduced.ok ? "standalone finalization did not become ready" : reduced.error.message);
+  return finalizeStandaloneState(handle, reduced.value);
+}
+
 

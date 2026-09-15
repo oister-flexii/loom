@@ -19,6 +19,31 @@ export type RegisteredStandaloneSuccessorProgram = Readonly<{
   input: StandaloneSuccessorStartInput; authority: unknown; currentSource: ByteSection; previousContexts: readonly ByteSection[];
 }>;
 const bad = (message: string): ProgramParse<never> => ({ ok: false, message });
+const MAX_CAUSE_TEXT = 256;
+const boundedCauseText = (value: string): string =>
+  value.length <= MAX_CAUSE_TEXT ? value : `${value.slice(0, MAX_CAUSE_TEXT - 1)}…`;
+/**
+ * Bounded thrown-cause capture (the boundedParserCause pattern): the fatal
+ * TextDecoder decode of hostile predecessor bytes throws here, and the cause
+ * is the debugging context the operator needs to distinguish invalid UTF-8
+ * bytes from other encoding failures — bounded so no full input is exposed.
+ */
+function boundedThrownCause(thrown: unknown): { name: string; message: string } {
+  try {
+    if (thrown instanceof Error) {
+      return {
+        name: boundedCauseText(typeof thrown.name === "string" && thrown.name !== "" ? thrown.name : "Error"),
+        message: boundedCauseText(typeof thrown.message === "string" ? thrown.message : "successor source inspection failed"),
+      };
+    }
+    return {
+      name: "NonErrorThrown",
+      message: boundedCauseText(typeof thrown === "string" ? thrown : "successor source inspection failed with a non-Error cause"),
+    };
+  } catch {
+    return { name: "UninspectableCause", message: "successor source inspection failed with an uninspectable cause" };
+  }
+}
 function exact(raw: unknown, keys: readonly string[]): raw is Record<string, unknown> {
   return typeof raw === "object" && raw !== null && !Array.isArray(raw) && Reflect.ownKeys(raw).length === keys.length &&
     keys.every(key => { const field = Object.getOwnPropertyDescriptor(raw, key); return field !== undefined && "value" in field && field.enumerable; });
@@ -65,7 +90,8 @@ export function parseStandaloneSuccessorRegistration(raw: unknown): ProgramParse
     const decoded = parseBoundedReviewerJson(Uint8Array.from(raw.currentSource.bytes), STANDALONE_LINEAGE_LIMITS.retainedBytes);
     if (!decoded.ok) return bad(decoded.error.message);
     const section = encodeByteSection("standalone-frozen-source", new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(raw.currentSource.bytes)));
-    if (!section.ok || section.value.digest !== raw.currentSource.digest || section.value.byteLength !== raw.currentSource.byteLength) return bad("frozen successor source section differs from exact bytes");
+    if (!section.ok) return bad(`frozen successor source section could not be encoded: ${section.error.message}`);
+    if (section.value.digest !== raw.currentSource.digest || section.value.byteLength !== raw.currentSource.byteLength) return bad("frozen successor source section differs from exact bytes");
     if (!Array.isArray(raw.previousContexts) || raw.previousContexts.length > STANDALONE_REVIEWER_ROLES.length * 2 + 1) return bad("bounded predecessor contexts are required");
     const previousContexts: ByteSection[] = [];
     let remaining = 2_097_152;
@@ -74,10 +100,14 @@ export function parseStandaloneSuccessorRegistration(raw: unknown): ProgramParse
           !Array.isArray(previous.bytes) || previous.bytes.length > remaining || previous.bytes.some(byte => !Number.isInteger(byte) || byte < 0 || byte > 255)) return bad("invalid bounded predecessor context section");
       remaining -= previous.bytes.length;
       const section = encodeByteSection(previous.label, new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(previous.bytes)));
-      if (!section.ok || section.value.digest !== previous.digest || section.value.byteLength !== previous.byteLength) return bad("predecessor context section differs from exact bytes");
+      if (!section.ok) return bad(`predecessor context section could not be encoded: ${section.error.message}`);
+      if (section.value.digest !== previous.digest || section.value.byteLength !== previous.byteLength) return bad("predecessor context section differs from exact bytes");
       previousContexts.push(section.value);
     }
     return { ok: true, value: Object.freeze({ schemaVersion: 3, kind: "standalone-review", reviewerProtocol: descriptor.value,
       input: input.value, authority: raw.authority, currentSource: section.value, previousContexts: Object.freeze(previousContexts) }) };
-  } catch { return bad("frozen successor source cannot be decoded"); }
+  } catch (thrown) {
+    const cause = boundedThrownCause(thrown);
+    return bad(`frozen successor source cannot be decoded: ${cause.name}: ${cause.message}`);
+  }
 }

@@ -30,7 +30,7 @@ import {
   readStandaloneReviewPublication,
   type AuthoritativeStandaloneReviewResult,
 } from "./standalone-review-machine";
-import { parseStoredFindings, type Finding, type RefutedFinding } from "./findings";
+import { parseFindingId as parseCanonicalFindingId, parseStoredFindings, type Finding, type RefutedFinding } from "./findings";
 import { STANDALONE_LINEAGE_LIMITS } from "./standalone-lineage-contract";
 import { parseReviewPath, sha256Hex, type ReviewPath } from "./review-packet";
 import {
@@ -363,8 +363,22 @@ function createSourceFindingInventory(
 
 declare const DECLARED_TEXT: unique symbol;
 declare const REPAIR_GROUP_ID: unique symbol;
+declare const FINDING_ID: unique symbol;
 type DeclaredText = string & { readonly [DECLARED_TEXT]: true };
 type RepairGroupId = string & { readonly [REPAIR_GROUP_ID]: true };
+type FindingId = string & { readonly [FINDING_ID]: true };
+
+/** Every disposition and repair-group join keys on the Finding id; branding it
+ *  through the canonical parseFindingId shape extends the kernel's identity-branded
+ *  pattern (OrchestrationRunId, RequestId, SlotId, RepairGroupId) to that id, so a
+ *  RepairGroupId-shaped string is no longer silently assignable where a finding
+ *  id is expected. */
+function parseFindingId(raw: unknown, path: string): InternalParse<FindingId> {
+  const canonical = parseCanonicalFindingId(raw);
+  return canonical !== null
+    ? parsed(canonical as FindingId)
+    : rejected(problem("invalid-declaration", path, `${path} must be a non-empty exact source Finding id`));
+}
 
 type DeclaredSemanticClaim = Readonly<{
   provenance: "DECLARED";
@@ -372,9 +386,9 @@ type DeclaredSemanticClaim = Readonly<{
 }>;
 
 type CriticalFindingDisposition =
-  | Readonly<{ findingId: string; status: "repaired"; repairGroupId: RepairGroupId }>
-  | Readonly<{ findingId: string; status: "unresolved"; reason: DeclaredText }>
-  | Readonly<{ findingId: string; status: "out-of-scope"; reason: DeclaredText }>;
+  | Readonly<{ findingId: FindingId; status: "repaired"; repairGroupId: RepairGroupId }>
+  | Readonly<{ findingId: FindingId; status: "unresolved"; reason: DeclaredText }>
+  | Readonly<{ findingId: FindingId; status: "out-of-scope"; reason: DeclaredText }>;
 
 type SiblingDisposition =
   | Readonly<{ path: ReviewPath; status: "repaired"; reason: DeclaredText }>
@@ -406,7 +420,7 @@ type DeclaredRepairGroup = Readonly<{
   kind: "declared-repair-group";
   provenance: "DECLARED";
   repairGroupId: RepairGroupId;
-  findingIds: NonEmpty<string>;
+  findingIds: NonEmpty<FindingId>;
   rootCause: DeclaredSemanticClaim;
   invariant: DeclaredSemanticClaim;
   siblings: DeclaredSiblingAccounting;
@@ -573,15 +587,14 @@ function parseDisposition(raw: unknown, path: string): InternalParse<CriticalFin
   const record = exactRecord(raw, fields, path);
   if (!record.ok) return record;
   const failures: DefectFamilyFailure[] = [];
-  if (typeof record.value.findingId !== "string" || record.value.findingId.trim() !== record.value.findingId || record.value.findingId === "") {
-    failures.push(problem("invalid-declaration", `${path}.findingId`, `${path}.findingId must be a non-empty exact source Finding id`));
-  }
+  const findingId = parseFindingId(record.value.findingId, `${path}.findingId`);
+  if (!findingId.ok) failures.push(...findingId.error);
   if (record.value.status === "repaired") {
     const groupId = parseRepairGroupId(record.value.repairGroupId, `${path}.repairGroupId`);
     if (!groupId.ok) failures.push(...groupId.error);
-    return failures.length === 0 && groupId.ok
+    return failures.length === 0 && groupId.ok && findingId.ok
       ? parsed(canonicalRecord({
-          findingId: record.value.findingId as string,
+          findingId: findingId.value,
           status: "repaired" as const,
           repairGroupId: groupId.value,
         }))
@@ -592,23 +605,24 @@ function parseDisposition(raw: unknown, path: string): InternalParse<CriticalFin
   }
   const reason = declaredText(record.value.reason, `${path}.reason`);
   if (!reason.ok) failures.push(...reason.error);
-  return failures.length === 0 && reason.ok &&
+  return failures.length === 0 && reason.ok && findingId.ok &&
       (record.value.status === "unresolved" || record.value.status === "out-of-scope")
     ? parsed(canonicalRecord({
-        findingId: record.value.findingId as string,
+        findingId: findingId.value,
         status: record.value.status,
         reason: reason.value,
       }))
     : failure(immutableArray(failures));
 }
 
-function parseStringIds(raw: unknown, path: string): InternalParse<NonEmpty<string>> {
+function parseStringIds(raw: unknown, path: string): InternalParse<NonEmpty<FindingId>> {
   const entries = denseArray(raw, path, true);
   if (!entries.ok) return entries;
   const failures: DefectFamilyFailure[] = [];
   const ids = entries.value.flatMap((entry, index) => {
-    if (typeof entry === "string" && entry.trim() === entry && entry.length > 0) return [entry];
-    failures.push(problem("invalid-repair-group", `${path}[${index}]`, `${path}[${index}] must be a non-empty exact Finding id`));
+    const findingId = parseFindingId(entry, `${path}[${index}]`);
+    if (findingId.ok) return [findingId.value];
+    failures.push(...findingId.error);
     return [];
   });
   const duplicates = ids.filter((id, index) => ids.indexOf(id) !== index);
@@ -619,7 +633,7 @@ function parseStringIds(raw: unknown, path: string): InternalParse<NonEmpty<stri
   ));
   const [head, ...tail] = [...ids].sort(compareStrings);
   return failures.length === 0 && head !== undefined
-    ? parsed(Object.freeze([head, ...tail]) as NonEmpty<string>)
+    ? parsed(Object.freeze([head, ...tail]) as NonEmpty<FindingId>)
     : failure(immutableArray(failures));
 }
 
@@ -696,7 +710,10 @@ function validateAccounting(
   groups: readonly DeclaredRepairGroup[],
 ): readonly DefectFamilyFailure[] {
   const failures: DefectFamilyFailure[] = [];
-  const dispositionIds = dispositions.map(({ findingId }) => findingId);
+  // The inventory's surviving-critical ids are plain strings; comparisons
+  // against them are string comparisons. The FindingId brand earns its keep at
+  // the parse boundary and the repair-group join, not here.
+  const dispositionIds: readonly string[] = dispositions.map(({ findingId }) => findingId);
   for (const id of dispositionIds) {
     const foreign = classifyForeignFinding(inventory, id, "defectFamily.dispositions");
     if (foreign !== null) failures.push(foreign);

@@ -57,6 +57,52 @@ function confirmAnchoredAbsence(path: string, operations: SourceObservationOpera
   }
   throw sourceChanged(path);
 }
+function observeSourceFile(path: string, remaining: number, operations: SourceObservationOperations,
+  initialStats: Map<string, Stats | null>): FrozenSourceEntry {
+  let before: Stats;
+  try {
+    before = operations.lstat(path);
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause;
+    confirmAnchoredAbsence(path, operations);
+    initialStats.set(path, null);
+    return Object.freeze({ path, kind: "absent" as const, digest: null, byteLength: 0 });
+  }
+  if (!before.isFile()) throw new Error(`successor source ${path} is not a regular no-follow file`);
+  let bytes: Buffer;
+  try {
+    bytes = operations.read(path, Math.min(remaining, SUCCESSOR_SOURCE_FILE_BYTES));
+    if (!sameStat(before, operations.lstat(path))) throw sourceChanged(path);
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code === "ENOENT") throw sourceChanged(path);
+    throw cause;
+  }
+  initialStats.set(path, before);
+  return Object.freeze({ path, kind: "binary" as const, digest: hash(bytes), byteLength: bytes.length,
+    contentBase64: bytes.toString("base64"), mode: (before.mode & 0o111) === 0 ? "100644" as const : "100755" as const });
+}
+
+function confirmSourceStats(scope: readonly string[], initialStats: Map<string, Stats | null>, operations: SourceObservationOperations): void {
+  for (const path of scope) {
+    const before = initialStats.get(path);
+    if (before === null) {
+      confirmAnchoredAbsence(path, operations);
+      continue;
+    }
+    if (before === undefined) throw new Error(`successor source ${path} lacks an initial observation`);
+    try {
+      if (!sameStat(before, operations.lstat(path))) throw sourceChanged(path);
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code === "ENOENT") throw sourceChanged(path);
+      throw cause;
+    }
+  }
+}
+
+type FrozenSourceEntry = Readonly<{ path: string; kind: "absent"; digest: null; byteLength: 0 }> | Readonly<{
+  path: string; kind: "binary"; digest: string; byteLength: number; contentBase64: string; mode: "100644" | "100755";
+}>;
+
 export function observeStableStandaloneSuccessorSource<T>(scope: readonly string[], observeAuthority: () => Readonly<{
   headRevision: string;
   value: T;
@@ -69,54 +115,19 @@ export function observeStableStandaloneSuccessorSource<T>(scope: readonly string
   try {
     let remaining = SUCCESSOR_SOURCE_BYTES;
     const initialStats = new Map<string, Stats | null>();
-    const files = scope.map(path => {
-      let before: Stats;
-      try {
-        before = operations.lstat(path);
-      } catch (cause) {
-        if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause;
-        confirmAnchoredAbsence(path, operations);
-        initialStats.set(path, null);
-        return Object.freeze({ path, kind: "absent" as const, digest: null, byteLength: 0 });
-      }
-      if (!before.isFile()) throw new Error(`successor source ${path} is not a regular no-follow file`);
-      let bytes: Buffer;
-      try {
-        bytes = operations.read(path, Math.min(remaining, SUCCESSOR_SOURCE_FILE_BYTES));
-        if (!sameStat(before, operations.lstat(path))) throw sourceChanged(path);
-      } catch (cause) {
-        if ((cause as NodeJS.ErrnoException).code === "ENOENT") throw sourceChanged(path);
-        throw cause;
-      }
-      initialStats.set(path, before);
-      remaining -= bytes.length;
-      return Object.freeze({ path, kind: "binary" as const, digest: hash(bytes), byteLength: bytes.length,
-        contentBase64: bytes.toString("base64"), mode: (before.mode & 0o111) === 0 ? "100644" as const : "100755" as const });
+    const files = scope.map((path) => {
+      const entry = observeSourceFile(path, remaining, operations, initialStats);
+      remaining -= entry.byteLength;
+      return entry;
     });
-    const confirmSource = () => {
-      for (const path of scope) {
-        const before = initialStats.get(path);
-        if (before === null) {
-          confirmAnchoredAbsence(path, operations);
-          continue;
-        }
-        if (before === undefined) throw new Error(`successor source ${path} lacks an initial observation`);
-        try {
-          if (!sameStat(before, operations.lstat(path))) throw sourceChanged(path);
-        } catch (cause) {
-          if ((cause as NodeJS.ErrnoException).code === "ENOENT") throw sourceChanged(path);
-          throw cause;
-        }
-      }
-    };
     // One Git command sequence can straddle a ref/index transition without
     // changing scoped file stats. Production observes a compact witness at
     // derivation and again AFTER this final whole-scope pass, so drift during
     // either pass is detected before anything is encoded; generic callers
     // repeat their complete observation.
     const observed = observeAuthority();
-    confirmSource();
-    confirmSource();
+    confirmSourceStats(scope, initialStats, operations);
+    confirmSourceStats(scope, initialStats, operations);
     const stable = observed.stability === undefined
       ? canonicalStructuralEquals(observed, observeAuthority())
       : canonicalStructuralEquals(observed.stability.witness, observed.stability.observe());
