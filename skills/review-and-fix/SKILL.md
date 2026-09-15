@@ -123,7 +123,11 @@ prove neither truth, impact, reachability, execution, nor semantic test adequacy
 
 Malformed current output fails evidence admission and creates no synthetic
 Finding or P3 repair obligation. It receives only the existing bounded retry.
-The same panel lenses and strict majority assess the assertion including its
+The engine deterministically admits a final message that wraps exactly one
+strict JSON object in prose or a code fence: the extracted payload still
+crosses the frozen schema and rubric, the original transcript stays immutable
+audit evidence, and zero or ambiguous candidates fail closed to the bounded
+retry. The same panel lenses and strict majority assess the assertion including its
 basis; a true assertion is not refuted merely because repair seems unimportant.
 A surviving critical stays blocking, with no severity downgrade or standalone
 severity-dispute action. The old explicit Wave operator override remains separate
