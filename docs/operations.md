@@ -127,8 +127,9 @@ Pi’s native subagent transport accepts at most eight requests per call. Partit
 
 **P4 status:** merged as `96153ed` on 2026-09-10; publication and loaded-runtime
 reload were verified. See [ADR-0009](adr/ADR-0009-versioned-reviewer-protocol.md).
-P5 successors are separate feature-worktree implementation, with final validation,
-registered review and publication pending; see [Standalone lineage](#standalone-lineage-p5).
+P5 successor contracts are merged (PR #51) with review and remediation
+complete; publication and the /reload cutover happen after merge; see
+[Standalone lineage](#standalone-lineage-p5).
 
 Fresh independent standalone/Wave registrations select v2 internally. There is no
 independent-review protocol flag; only the explicit P5 successor input selects v3. Every reviewer reads the issued Context Packet first: its independent
