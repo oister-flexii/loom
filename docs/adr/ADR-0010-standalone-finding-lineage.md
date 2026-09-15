@@ -2,19 +2,27 @@
 
 ## Status
 
-Selected design implemented on the P5 feature worktree; **FINAL VALIDATION,
-REGISTERED REVIEW AND PUBLICATION PENDING**. Not shipped. The user approved
-immediate immutable advisory publication and all recommended P5 policies. The
-later Quint discussion refined the priority-8 backlog only; it did not extend P5.
+Selected design implemented, **registered review and remediation complete**;
+merge, publication, and loaded-runtime cutover pending. The registered review
+(run.p5-source-review-13) closed with zero surviving critical findings and 15
+advisories — two accepted and fixed (cli.ts stdin bounding, safeIoCause
+standard-error classification), thirteen deferred with recorded reasons; a
+distill pass tightened the three highest-leverage deferrals (dense-array
+unification, attempt-one admission, the v2-vs-v3 admission seam) and skipped
+the WeakMap caches extraction as a hypothetical seam. The full gate (engine
+typecheck, exact-baseline unit suite, root verify 23/23 including all six
+smokes) held after every change. The branch merged main's PR #52
+reviewer-protocol-v2 changes, resolving the one conflict in
+`engine/src/core/reviewer-protocol.ts` in favor of the shared strict byte
+grammar factored for both v2 and v3.
 
 P4 merged as `96153edc3dd755b4ac648ed48920b6670753c5a6`, with publication and
-loaded-runtime reload verified. Main remains admitted at
-`sha256:086c472e4e913376c07d69f5116c9ad9655546e22c91e40d28cba9fdd795bc79`.
-P5's own final registered review/remediation must use that main CLI and the frozen
-Skill 5.0.0 contract, including ordinary Plan advisory triage. It does not implement
-the P5 publisher. Feature mutations are confined to owned matching-runtime fixtures;
-never unset admission or retrofit P5 policy into the source review. New triage can
-publish new records honestly after merge/publication/reload.
+loaded-runtime reload verified. P5's review/remediation used admitted main
+runtime `sha256:086c472e4e913376c07d69f5116c9ad9655546e22c91e40d28cba9fdd795bc79`
+and the frozen Skill 5.0.0 contract, including ordinary Plan advisory triage.
+Feature mutations were confined to owned matching-runtime fixtures; admission
+was never unset and P5 policy was never retrofitted into the source review. New
+triage can publish new records honestly after merge/publication/reload.
 
 ## Context
 
@@ -239,9 +247,13 @@ pending; these observations are development evidence, not publication authority.
 Parent independent focused checks before this documentation pass: B3 core compiler
 +189 tests; B3 shell compiler +17; B4 P3 compiler +27; B4 native compiler +43. The
 native worker reported 1,252 co-scheduled passing tests. Counts overlap and do not
-substitute for root verification. Final root verification, all six smokes,
-full-project lint comparison, the single admitted registered review/remediation,
-installation, commit/merge and publication/reload are **not yet claimed**.
+substitute for root verification. Final root verification (23/23 including all six smokes) and the single admitted
+registered review/remediation are complete on the resolved merge head. The
+full-project lint comparison remains consciously deferred — the round-8
+deferral reason stands: the max-function-lines multi-line-signature regex blind
+spot would flag currently-escaping shell functions project-wide and alter the
+lint baseline. Commit/merge of this PR, publication, and the /reload cutover
+are pending.
 
 ## Consequences
 
