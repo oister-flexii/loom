@@ -8,6 +8,14 @@ export function safeIoCause(cause: unknown): string {
     const name = Object.getOwnPropertyDescriptor(cause, "name");
     if (name !== undefined && "value" in name && typeof name.value === "string" &&
         ["Error", "TypeError", "SyntaxError", "RangeError", "AggregateError"].includes(name.value)) return name.value;
+    // Standard-error branch: standard Error instances carry `name` on the prototype,
+    // so the own-property read above never fires and every non-filesystem throw used
+    // to degrade to "unknown cause" with zero discriminating signal. instanceof walks
+    // the prototype chain via [[GetPrototypeOf]] and the standard [[HasInstance]] —
+    // neither invokes hostile own getters. The allowlist still bounds the result — no
+    // untrusted echo. `instanceof Error` narrows the type, so `cause.name` is
+    // type-safe without an assertion.
+    if (cause instanceof Error && ["Error", "TypeError", "SyntaxError", "RangeError", "AggregateError"].includes(cause.name)) return cause.name;
     return "unknown cause";
   } catch { return "uninspectable cause"; }
 }
