@@ -236,9 +236,10 @@ function parsePathList(raw: unknown, label: string, errors: string[]): readonly 
 /**
  * A git revision at this boundary, exactly as the sibling boundaries SHA it:
  * `parseGitSha` (review-packet.ts) and `reviewedSourceSchema.headRevision`
- * (packages/pi-goal loom-review.ts). Producers emit the full hex from
- * `git rev-parse`/`git merge-base`; accepting any other string let a tampered
- * frozen authority name a branch where only a SHA was meant.
+ * (the standalone pi-goal repository, src/integration/loom-review.ts).
+ * Producers emit the full hex from `git rev-parse`/`git merge-base`; accepting
+ * any other string let a tampered frozen authority name a branch where only a
+ * SHA was meant.
  */
 const GIT_REVISION = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 

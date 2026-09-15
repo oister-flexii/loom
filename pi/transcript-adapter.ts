@@ -3,6 +3,7 @@
 import { attributeExit, classifyTestCommandDetailed, type ClassifiedTestCommand } from "../engine/src/machine";
 import { splitCommandSegmentsWithOps, stripComment, stripEnvPrefix } from "../engine/src/core/shell-command";
 import { extractTestEvidence } from "../engine/src/core/test-evidence";
+import { boundedThrownCause } from "../engine/src/handlers/helpers/programs/standalone-successor-registration";
 
 const TOOL_NAME_MAP: Readonly<Record<string, string>> = Object.freeze({
   bash: "Bash",
@@ -485,33 +486,6 @@ export function piFinalPayloadCandidates(
 }
 
 /** Bound decoded native input before the legacy adapter allocates copied message/block arrays. */
-const MAX_CAUSE_TEXT = 256;
-const boundedCauseText = (value: string): string =>
-  value.length <= MAX_CAUSE_TEXT ? value : `${value.slice(0, MAX_CAUSE_TEXT - 1)}…`;
-/**
- * Bounded thrown-cause capture (the boundedParserCause pattern): the budget
- * traversal walks potentially hostile in-memory values (Reflect.ownKeys and
- * Object.getOwnPropertyDescriptor over getters that can throw), and the cause
- * is the debugging context an operator needs — bounded so no full input is
- * exposed.
- */
-function boundedThrownCause(thrown: unknown): { name: string; message: string } {
-  try {
-    if (thrown instanceof Error) {
-      return {
-        name: boundedCauseText(typeof thrown.name === "string" && thrown.name !== "" ? thrown.name : "Error"),
-        message: boundedCauseText(typeof thrown.message === "string" ? thrown.message : "successor transcript inspection failed"),
-      };
-    }
-    return {
-      name: "NonErrorThrown",
-      message: boundedCauseText(typeof thrown === "string" ? thrown : "successor transcript inspection failed with a non-Error cause"),
-    };
-  } catch {
-    return { name: "UninspectableCause", message: "successor transcript inspection failed with an uninspectable cause" };
-  }
-}
-
 function successorTranscriptBudgetProblem(raw: unknown): string | null {
   const pending: { value: unknown; depth: number }[] = [{ value: raw, depth: 0 }];
   let remainingValues = 65_536;
@@ -559,7 +533,7 @@ export function piResultFinalPayloadCandidates(
       const problem = successorTranscriptBudgetProblem(messages);
       if (problem !== null) return { ok: false, errors: [problem] };
     } catch (thrown) {
-      const cause = boundedThrownCause(thrown);
+      const cause = boundedThrownCause(thrown, "transcript");
       return { ok: false, errors: [`successor native transcript cannot be inspected safely: ${cause.name}: ${cause.message}`] };
     }
   }

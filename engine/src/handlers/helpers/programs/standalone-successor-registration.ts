@@ -19,29 +19,32 @@ export type RegisteredStandaloneSuccessorProgram = Readonly<{
   input: StandaloneSuccessorStartInput; authority: unknown; currentSource: ByteSection; previousContexts: readonly ByteSection[];
 }>;
 const bad = (message: string): ProgramParse<never> => ({ ok: false, message });
-const MAX_CAUSE_TEXT = 256;
-const boundedCauseText = (value: string): string =>
+export const MAX_CAUSE_TEXT = 256;
+export const boundedCauseText = (value: string): string =>
   value.length <= MAX_CAUSE_TEXT ? value : `${value.slice(0, MAX_CAUSE_TEXT - 1)}…`;
 /**
  * Bounded thrown-cause capture (the boundedParserCause pattern): the fatal
  * TextDecoder decode of hostile predecessor bytes throws here, and the cause
  * is the debugging context the operator needs to distinguish invalid UTF-8
  * bytes from other encoding failures — bounded so no full input is exposed.
+ * Shared by both adapters (the transcript adapter and this one), differing only
+ * in the per-subject fallback message, so the 256-char budget and truncation
+ * shape cannot drift between them.
  */
-function boundedThrownCause(thrown: unknown): { name: string; message: string } {
+export function boundedThrownCause(thrown: unknown, subject: string): { name: string; message: string } {
   try {
     if (thrown instanceof Error) {
       return {
         name: boundedCauseText(typeof thrown.name === "string" && thrown.name !== "" ? thrown.name : "Error"),
-        message: boundedCauseText(typeof thrown.message === "string" ? thrown.message : "successor source inspection failed"),
+        message: boundedCauseText(typeof thrown.message === "string" ? thrown.message : `successor ${subject} inspection failed`),
       };
     }
     return {
       name: "NonErrorThrown",
-      message: boundedCauseText(typeof thrown === "string" ? thrown : "successor source inspection failed with a non-Error cause"),
+      message: boundedCauseText(typeof thrown === "string" ? thrown : `successor ${subject} inspection failed with a non-Error cause`),
     };
   } catch {
-    return { name: "UninspectableCause", message: "successor source inspection failed with an uninspectable cause" };
+    return { name: "UninspectableCause", message: `successor ${subject} inspection failed with an uninspectable cause` };
   }
 }
 function exact(raw: unknown, keys: readonly string[]): raw is Record<string, unknown> {
@@ -107,7 +110,7 @@ export function parseStandaloneSuccessorRegistration(raw: unknown): ProgramParse
     return { ok: true, value: Object.freeze({ schemaVersion: 3, kind: "standalone-review", reviewerProtocol: descriptor.value,
       input: input.value, authority: raw.authority, currentSource: section.value, previousContexts: Object.freeze(previousContexts) }) };
   } catch (thrown) {
-    const cause = boundedThrownCause(thrown);
+    const cause = boundedThrownCause(thrown, "source");
     return bad(`frozen successor source cannot be decoded: ${cause.name}: ${cause.message}`);
   }
 }
