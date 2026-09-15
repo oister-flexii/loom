@@ -16,6 +16,7 @@ import {
   type NonEmpty,
   type OrchestrationRunId,
 } from "./orchestration-contract";
+import { readDenseDataArray, type DataBoundaryError } from "./orchestration-contract/bytes";
 import {
   COMPLETION_REPORT_ROOT,
   isProtectedVerificationPath,
@@ -39,7 +40,6 @@ import {
 } from "./verification-manifest";
 import { MAX_STRUCTURED_REPORT_BYTES, parseReportSummary, type TestReportSummary } from "./structured-test-report";
 
-const MAX_COLLECTION_LENGTH = 1_048_576;
 const REPAIR_GROUP_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/;
 
 const success = <T, E = never>(value: T): DomainResult<T, E> => canonicalRecord({ ok: true, value });
@@ -185,40 +185,36 @@ function exactRecord(raw: unknown, fields: readonly string[], path: string): Int
   }
 }
 
+/** Dense own-data array boundary delegated to the shared kernel parser
+ *  (orchestration-contract/bytes.ts). The kernel's enumerable/configurable
+ *  own-data length rule is the canonical acceptance corner — one parser can no
+ *  longer disagree with the kernel about which arrays it accepts. */
 function denseArray(raw: unknown, path: string, nonEmpty = false): InternalParse<readonly unknown[]> {
-  try {
-    if (!Array.isArray(raw) || Object.getPrototypeOf(raw) !== Array.prototype) {
-      return rejected(problem("invalid-declaration", path, `${path} must be a plain array`));
-    }
-    const descriptor = Object.getOwnPropertyDescriptor(raw, "length");
-    if (descriptor === undefined || !("value" in descriptor) ||
-        typeof descriptor.value !== "number" || !Number.isSafeInteger(descriptor.value) ||
-        descriptor.value < 0 || descriptor.value > MAX_COLLECTION_LENGTH) {
-      return rejected(problem("invalid-declaration", path, `${path} has an invalid or excessive length`));
-    }
-    const length = descriptor.value;
-    if (nonEmpty && length === 0) {
-      return rejected(problem("invalid-declaration", path, `${path} must be non-empty`));
-    }
-    const keys = Reflect.ownKeys(raw);
-    if (keys.length !== length + 1 || keys[length] !== "length") {
-      return rejected(problem("invalid-declaration", path, `${path} must be dense and contain no extra fields`));
-    }
-    const values: unknown[] = [];
-    for (let index = 0; index < length; index += 1) {
-      if (keys[index] !== String(index)) {
-        return rejected(problem("invalid-declaration", `${path}[${index}]`, `${path} has a hole at index ${index}`));
-      }
-      const entry = Object.getOwnPropertyDescriptor(raw, String(index));
-      if (entry === undefined || !("value" in entry) || !entry.enumerable) {
-        return rejected(problem("invalid-declaration", `${path}[${index}]`, `${path}[${index}] must be own data`));
-      }
-      values.push(entry.value);
-    }
-    return parsed(Object.freeze(values));
-  } catch {
-    return rejected(problem("invalid-declaration", path, `${path} could not be safely inspected`));
+  const result = readDenseDataArray(raw, path);
+  if (!result.ok) return rejected(denseArrayProblem(path, result.error));
+  if (nonEmpty && result.value.length === 0) {
+    return rejected(problem("invalid-declaration", path, `${path} must be non-empty`));
   }
+  return parsed(result.value);
+}
+
+/** Translate the kernel's typed boundary failure into this module's exact
+ *  InternalParse vocabulary; callers here discriminate on these failures, not
+ *  on DataBoundaryError. */
+function denseArrayProblem(path: string, error: DataBoundaryError): DefectFamilyFailure {
+  if (error.reason === "sparse-array" && error.index !== null) {
+    return problem("invalid-declaration", `${path}[${error.index}]`, `${path} has a hole at index ${error.index}`);
+  }
+  if (error.reason === "accessor-field" || error.reason === "non-enumerable-field") {
+    const at = `${path}[${error.index ?? 0}]`;
+    return problem("invalid-declaration", at, `${at} must be own data`);
+  }
+  const message = error.reason === "not-array" ? `${path} must be a plain array`
+    : error.reason === "invalid-array-length" ? `${path} has an invalid or excessive length`
+    : error.reason === "symbol-field" || error.reason === "sparse-array"
+      ? `${path} must be dense and contain no extra fields`
+    : `${path} could not be safely inspected`;
+  return problem("invalid-declaration", path, message);
 }
 
 function declaredText(raw: unknown, path: string): InternalParse<DeclaredText> {

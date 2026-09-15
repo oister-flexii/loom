@@ -16,7 +16,8 @@ export type { StandaloneCaptureWitness, StandaloneEvidenceReplayResult, Standalo
 import { parseRunDirectoryReference } from '../../../orchestration/run-directory-handle';
 import { publishStandalonePanelView } from '../../../orchestration/standalone-panel-context';
 import { CURRENT_REVIEWER_PROTOCOL } from '../../../core/reviewer-contract';
-import type { AgentRequestAuthority, SpawnRequest, PublicationAuthorityResolver } from '../../../core/orchestration-contract';
+import type { AgentRequestAuthority, SpawnRequest, PublicationAuthorityResolver, SemanticAttempt } from '../../../core/orchestration-contract';
+import { decideAttemptOneSlots } from '../../../core/standalone-attempt-admission';
 import { aggregateStandaloneReview, bindStandaloneCaptureAuthority, captureStandaloneReviewerBytes, canonicalStandaloneResultArtifact, completeStandaloneReviewerCapture, parseStandaloneReviewScope, prepareFreshStandaloneReview, proveStandaloneRosterCompletion, serializeStandaloneReviewAuthority, serializeAdjudicatedStandaloneReview, type FrozenStandaloneReviewAuthority, type StandaloneReviewerProtocolResolver } from '../../../core/standalone-review';
 import { parseStandaloneReviewMachineState, reduceStandaloneReviewMachine, parseStandaloneRefutationCompletion, serializeStandaloneReviewMachineState, startStandaloneReviewMachine, type StandaloneReviewMachineState } from '../../../core/standalone-review-machine';
 import { completePersistentRefutationPanel, panelRequestIdentity, refutationPanelCheckpoint, rejectRefutationVerdict, startPersistentRefutationPanel, submitRefutationVerdict, type PersistentRefutationPanelEvent } from '../../../core/panel-program';
@@ -179,9 +180,9 @@ export async function startStandaloneFacade(
 export async function replayStandaloneCapturedEvidence(handle: RunDirHandle, registration: RegisteredStandaloneProgram,
   witnesses?: ReadonlyMap<string, StandaloneCaptureWitness>): Promise<StandaloneEvidenceReplayResult> {
   try {
-    const authenticated = registration.schemaVersion === 3 ? await readStandaloneSuccessorAuthority(handle, registration) : undefined;
-    if (authenticated !== undefined && !authenticated.ok) return authenticated;
-    return replayStandaloneCliCaptures(handle, registration, authenticated?.value.prepared, witnesses);
+    const admission = await admitStandaloneRun(handle, registration);
+    if (!admission.ok) return { ok: false, message: admission.message };
+    return replayStandaloneCliCaptures(admission.handle, registration, admission.authenticated?.prepared, witnesses);
   } catch (cause) { return { ok: false, message: cause instanceof Error ? cause.message : String(cause) }; }
 }
 
@@ -256,20 +257,44 @@ async function appendStandaloneRejection(
   });
 }
 
+/**
+ * The one v2-vs-v3 admission seam (ADR-0010). A v3 registration admits its
+ * bounded read handle, current capture witnesses, and successor authority IN
+ * THIS ORDER before any registered-authority read; v2 keeps the plain handle
+ * and no successor admission. The ordering invariant is enforced HERE at one
+ * seam instead of per-caller by discipline — every standalone orchestrator
+ * (inspect, resume, capture replay) crosses the same seam, so a caller cannot
+ * silently skip the witness check or read registered authority before the
+ * successor authority it must authenticate.
+ */
+type StandaloneSuccessorAdmission = Extract<Awaited<ReturnType<typeof readStandaloneSuccessorAuthority>>, { ok: true }>["value"];
+
+async function admitStandaloneRun(
+  opened: RunDirHandle,
+  registration: RegisteredStandaloneProgram,
+): Promise<
+  | { ok: true; handle: RunDirHandle; authenticated: StandaloneSuccessorAdmission | undefined }
+  | { ok: false; message: string }
+> {
+  const handle = registration.schemaVersion === 3 ? boundedStandaloneReadHandle(opened) : opened;
+  if (registration.schemaVersion !== 3) return { ok: true, handle, authenticated: undefined };
+  const captures = readStandaloneCaptureWitnesses(handle);
+  if (!captures.ok) return { ok: false, message: captures.message };
+  const authenticated = await readStandaloneSuccessorAuthority(handle, registration);
+  if (!authenticated.ok) return { ok: false, message: authenticated.message };
+  return { ok: true, handle, authenticated: authenticated.value };
+}
+
 /** Read-only LC-2 inspection: independent registration/protocol/publication proof, never checkpoint self-authority. */
 export async function inspectStandaloneFacade(
   opened: RunDirHandle,
   registration: RegisteredStandaloneProgram,
 ): Promise<ProgramParse<StandaloneReviewMachineState>> {
-  const handle = registration.schemaVersion === 3 ? boundedStandaloneReadHandle(opened) : opened;
   try {
-    if (registration.schemaVersion === 3) {
-      const captures = readStandaloneCaptureWitnesses(handle);
-      if (!captures.ok) return captures;
-    }
-    const authenticated = registration.schemaVersion === 3 ? await readStandaloneSuccessorAuthority(handle, registration) : undefined;
-    if (authenticated !== undefined && !authenticated.ok) return authenticated;
-    const successor = authenticated?.value.prepared;
+    const admission = await admitStandaloneRun(opened, registration);
+    if (!admission.ok) return { ok: false, message: admission.message };
+    const { handle, authenticated } = admission;
+    const successor = authenticated?.prepared;
     const authority = readRegisteredStandaloneAuthority(handle, registration, successor);
     if (!authority.ok) return authority;
     const checkpoint = await handle.readCheckpoint(16_777_216);
@@ -287,17 +312,14 @@ export async function resumeStandaloneFacade(
   opened: RunDirHandle,
   registration: RegisteredStandaloneProgram,
 ): Promise<FacadeDriveResult> {
-  const handle = registration.schemaVersion === 3 ? boundedStandaloneReadHandle(opened) : opened;
   try {
-    if (registration.schemaVersion === 3) {
-      const captures = readStandaloneCaptureWitnesses(handle);
-      if (!captures.ok) return failed(captures.message);
-    }
-    const authenticated = registration.schemaVersion === 3 ? await readStandaloneSuccessorAuthority(handle, registration) : undefined;
-    if (authenticated !== undefined && !authenticated.ok) return failed(authenticated.message);
-    const successor = authenticated?.value.prepared;
-    if (authenticated?.ok) {
-      for (const packet of authenticated.value.packets) {
+    const admission = await admitStandaloneRun(opened, registration);
+    if (!admission.ok) return failed(admission.message);
+    const handle = admission.handle;
+    const authenticated = admission.authenticated;
+    const successor = authenticated?.prepared;
+    if (authenticated) {
+      for (const packet of authenticated.packets) {
         const published = await handle.publishContext(packet);
         if (!published.ok) return failed(published.error.message);
       }
@@ -319,13 +341,13 @@ export async function resumeStandaloneFacade(
       const publication = durablePublicationDigest(handle, effectId.value);
       if (publication.kind === "corrupt") return failed(publication.message);
       if (publication.kind === "absent") {
-        if (registration.schemaVersion !== 3 || authenticated === undefined || !authenticated.ok) {
+        if (registration.schemaVersion !== 3 || authenticated === undefined) {
           return failed("standalone review checkpoint is missing and no durable batch publication exists");
         }
         const published = await publishInitialBatch(
           handle,
           initialStandaloneRequests(authorityResult.value),
-          authenticated.value.packets.filter((_, index) => index % 2 === 0),
+          authenticated.packets.filter((_, index) => index % 2 === 0),
           "standalone-review",
         );
         if (!published.ok) return failed(published.message);
@@ -399,25 +421,26 @@ async function resumeAwaitingRefutation(
   const panelRequests = recovered.requests;
   const captured = handle.readCapturedAttempts();
   if (!captured.ok) return failed(captured.error.message);
-  // Phase A — admission check for every attempt-1 slot the panel still
-  // expects at attempt 1. Two independent refusal classes both REJECT the
-  // slot HERE — where the panel machine can advance it to attempt 2 —
-  // instead of dead-locking the roster on every resume:
-  //   1. captured transcript the frozen-scope validator refuses (semantic);
-  //   2. capture terminally rejected by the harness runtime (no bytes
-  //      landed at all — a child that exited without a final payload).
-  // Without case 2 the refutation resume re-issues the terminally rejected
-  // attempt-1 request forever — the capture runtime will never accept its
-  // bytes again — dead-locking the panel. The tombstoned slot is dead for
-  // capture, so it is NOT re-issued here; the verdict loop below advances
-  // it to its attempt-2 retry through the panel's rejection path.
-  const reissues: (typeof panelRequests)[number][] = [];
-  const tombstones = new Map<string, string>();
+  // Phase A — decideAttemptOneSlots owns the canonical deadlock reasoning.
+  // Gather every non-captured slot's capture-rejection receipt first (the
+  // same durableCaptureRejection call per slot as before), then apply the
+  // pure decision; the I/O is no longer interleaved with the policy.
+  const rejectionReceipts = new Map<string, string>();
   for (const request of panelRequests) {
     if (captured.value.has(captureKey(request.authority.slotId, request.authority.attempt))) continue;
     const rejection = await durableCaptureRejection(handle, request.authority);
-    if (rejection === null) reissues.push(request);
-    else tombstones.set(request.authority.slotId, rejection);
+    if (rejection !== null) rejectionReceipts.set(request.authority.slotId, rejection);
+  }
+  const attemptOneDecisions = decideAttemptOneSlots(
+    panelRequests.map((request) => ({ slotId: request.authority.slotId, attempt: request.authority.attempt })),
+    captured.value, rejectionReceipts,
+  );
+  const reissues: (typeof panelRequests)[number][] = [];
+  const tombstones = new Map<string, string>();
+  for (const request of panelRequests) {
+    const decision = attemptOneDecisions.get(request.authority.slotId);
+    if (decision?.kind === "reissue") reissues.push(request);
+    else if (decision?.kind === "tombstoned") tombstones.set(request.authority.slotId, decision.diagnostic);
   }
   if (reissues.length > 0) {
     return {
@@ -533,33 +556,39 @@ async function resumeAwaitingResults(
   if (!captured.ok) return failed(captured.error.message);
   const pendingBySlot = new Map(state.pending.map(({ slotId, expectedAttempt }) => [slotId, expectedAttempt] as const));
 
-  // Phase A admission — see resumeAwaitingRefutation for the canonical deadlock
-  // reasoning. Two refusal classes (a semantically refused transcript; a capture
-  // terminally rejected by the harness runtime) both REJECT the slot HERE —
-  // where the LC-2 lifecycle can advance it to attempt 2 — instead of
-  // dead-ending the whole run with no recovery path.
-  const rejected: Readonly<{ slot: AgentRequestAuthority; problems: readonly string[] }>[] = [];
+  // Phase A admission — decideAttemptOneSlots owns the canonical deadlock
+  // reasoning. Gather every expected-attempt-1 slot's capture-rejection
+  // receipt first, then apply the pure decision in slot order: tombstoned
+  // slots advance to attempt 2 through the rejection path; reissue slots stay
+  // missing and Phase B re-issues them; captured slots proceed to semantic
+  // admission below.
+  const expectedAttemptOneSlots: { slotId: string; attempt: SemanticAttempt; authority: AgentRequestAuthority }[] = [];
+  const rejectionReceipts = new Map<string, string>();
   for (const slot of activeAuthority.roster.orderedSlots) {
     if ((pendingBySlot.get(slot.slotId) ?? 1) !== 1) continue;
     const attemptOne = attemptOneBySlot.get(slot.slotId);
     if (attemptOne === undefined) {
       return failed(`standalone attempt-1 issuance authority is missing for ${slot.slotId}`);
     }
-    if (!captured.value.has(captureKey(attemptOne.authority.slotId, 1))) {
+    expectedAttemptOneSlots.push({ slotId: slot.slotId, attempt: 1, authority: attemptOne.authority });
+    if (!captured.value.has(captureKey(slot.slotId, 1))) {
       const captureRejection = await durableCaptureRejection(handle, attemptOne.authority);
-      if (captureRejection !== null) {
-        rejected.push({ slot: attemptOne.authority, problems: Object.freeze([captureRejection]) });
-      }
+      if (captureRejection !== null) rejectionReceipts.set(slot.slotId, captureRejection);
+    }
+  }
+  const attemptOneDecisions = decideAttemptOneSlots(expectedAttemptOneSlots, captured.value, rejectionReceipts);
+  const rejected: Readonly<{ slot: AgentRequestAuthority; problems: readonly string[] }>[] = [];
+  for (const { slotId, authority } of expectedAttemptOneSlots) {
+    const decision = attemptOneDecisions.get(slotId);
+    if (decision?.kind === "tombstoned") {
+      rejected.push({ slot: authority, problems: Object.freeze([decision.diagnostic]) });
       continue;
     }
-    const bytes = handle.readTranscriptBytes(attemptOne.authority);
+    if (decision?.kind !== "captured") continue;
+    const bytes = handle.readTranscriptBytes(authority);
     if (!bytes.ok) return failed(bytes.error.message);
-    const admission = admitCapturedStandaloneTranscript(
-      reviewerProtocols,
-      attemptOne.authority,
-      bytes.value,
-    );
-    if (!admission.ok) rejected.push({ slot: attemptOne.authority, problems: [...admission.problems] });
+    const admission = admitCapturedStandaloneTranscript(reviewerProtocols, authority, bytes.value);
+    if (!admission.ok) rejected.push({ slot: authority, problems: [...admission.problems] });
   }
   let machine: StandaloneReviewMachineState = state;
   if (rejected.length > 0) {

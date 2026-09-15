@@ -23,6 +23,7 @@ import {
   type PublishArtifactSet,
   type VerifiedIndexInstalled,
 } from "./orchestration-contract";
+import { readDenseDataArray, type DataBoundaryError } from "./orchestration-contract/bytes";
 import {
   STANDALONE_RESULT_SLOT,
   serializeAdjudicatedStandaloneReview,
@@ -125,35 +126,27 @@ function exactRecord(
   }
 }
 
+/** Dense own-data array boundary delegated to the shared kernel parser
+ *  (orchestration-contract/bytes.ts); the kernel's enumerable/configurable
+ *  own-data length rule is the canonical acceptance corner, so this parser
+ *  can no longer disagree with the kernel about which arrays it accepts. */
 function denseArray(raw: unknown, label: string): DomainResult<readonly unknown[], string> {
-  try {
-    if (!Array.isArray(raw) || Object.getPrototypeOf(raw) !== Array.prototype) {
-      return fail(`${label} must be a plain array`);
-    }
-    const lengthDescriptor = Object.getOwnPropertyDescriptor(raw, "length");
-    if (lengthDescriptor === undefined || !("value" in lengthDescriptor) ||
-        typeof lengthDescriptor.value !== "number" || !Number.isSafeInteger(lengthDescriptor.value) ||
-        lengthDescriptor.value < 0 || lengthDescriptor.value > 1_048_576) {
-      return fail(`${label} has an invalid or excessive length`);
-    }
-    const length = lengthDescriptor.value;
-    const keys = Reflect.ownKeys(raw);
-    if (keys.length !== length + 1 || keys[length] !== "length") {
-      return fail(`${label} must be a dense array without extra fields`);
-    }
-    const values: unknown[] = [];
-    for (let index = 0; index < length; index++) {
-      if (keys[index] !== String(index)) return fail(`${label} has a hole at index ${index}`);
-      const descriptor = Object.getOwnPropertyDescriptor(raw, String(index));
-      if (descriptor === undefined || !("value" in descriptor) || !descriptor.enumerable) {
-        return fail(`${label}[${index}] must be an enumerable own data field`);
-      }
-      values.push(descriptor.value);
-    }
-    return ok(Object.freeze(values));
-  } catch {
-    return fail(`${label} could not be safely inspected`);
+  const result = readDenseDataArray(raw, label);
+  return result.ok ? ok(result.value) : fail(denseArrayProblem(label, result.error));
+}
+
+/** Translate the kernel's typed boundary failure into this module's exact
+ *  vocabulary; callers here discriminate on these strings, not DataBoundaryError. */
+function denseArrayProblem(label: string, error: DataBoundaryError): string {
+  if (error.reason === "sparse-array" && error.index !== null) return `${label} has a hole at index ${error.index}`;
+  if (error.reason === "accessor-field" || error.reason === "non-enumerable-field") {
+    return `${label}[${error.index ?? 0}] must be an enumerable own data field`;
   }
+  return error.reason === "not-array" ? `${label} must be a plain array`
+    : error.reason === "invalid-array-length" ? `${label} has an invalid or excessive length`
+    : error.reason === "symbol-field" || error.reason === "sparse-array"
+      ? `${label} must be a dense array without extra fields`
+    : `${label} could not be safely inspected`;
 }
 
 function sameArray<T>(left: readonly T[], right: readonly T[]): boolean {

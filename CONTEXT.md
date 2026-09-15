@@ -136,6 +136,10 @@ _Avoid_: Parent override, duplicate Finding, severity promotion
 A standalone successor's engine-derived complete-or-limited assessment coverage over inherited critical origins, including refuted/resolved history. A not-assessable critical origin yields explicit limitation even when no critical is currently active; P3 refuses before checks/candidate/installable authority. This is separate from fresh panel work and surviving-critical counts.
 _Avoid_: Zero-critical pass, new-finding count, test coverage
 
+**Attempt-One Admission**:
+The pure decision that classifies every expected attempt-1 slot of a resumed standalone review as captured, reissue, or tombstoned, given the captured-attempt set and every gathered capture-rejection receipt. Two refusal classes both reject the slot where the machine can advance it to attempt 2 instead of dead-locking the roster on every resume: a semantically refused transcript, and a capture terminally rejected by the harness runtime (no bytes landed at all). A tombstoned slot is dead for capture and is not re-issued; the machine advances it to attempt 2 through the rejection path. The shell gathers the I/O first and applies the returned trichotomy — the policy is never interleaved with I/O.
+_Avoid_: Admission sweep, Phase A (a reviewer's phase label, not the decision), retry decision
+
 **Defect-Family Accounting**:
 Exact accounting of one Standalone Review Run's surviving critical Finding IDs into Declared Repair Groups or explicit blocking dispositions. Grouping, root cause, invariant, sibling-path completeness, and Historical RED remain semantic declarations; accounting never changes the source Findings or creates a Resolved Finding.
 _Avoid_: Proven closure, automatic root-cause discovery, cross-run finding lineage
@@ -398,6 +402,7 @@ _Avoid_: Constraint (too generic), rule (alone), enforced guideline (advisory ru
 - Limited **Current Critical Coverage** cannot authorize P3 installation even when there are zero active criticals; full v3 canonical source bytes and original IDs remain in schema-2 remediation authority
 - Only new criticals and evidence-bound critical reopening require current **Refutation Panel** work; unchanged upheld inherited criticals remain active without a new panel or extra automatic reviewer roster
 - A **Standalone Reopening Proposal** preserves old adjudication and supplies explicit new evidence to current adjudication; only engine attribution creates new Finding IDs
+- **Attempt-One Admission** is one pure decision applied by every standalone resume orchestrator; the shell gathers capture-rejection receipts first and the policy is never interleaved with I/O
 - An **Issued Reviewer Protocol** binds the same parser/rubric through capture admission, retry, replay, panel projection, and publication; completed and unfinished issued v1 reviews retain their original contract
 - A **Finding Basis** distinguishes truth confidence from consequence; structural admission proves neither, and an admitted surviving critical stays blocking without a new severity-dispute authority
 - A **Reviewer Protocol Failure** blocks evidence completion, not product-defect accounting; the existing explicit Wave operator override remains separate from reviewer settlement
