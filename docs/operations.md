@@ -745,7 +745,7 @@ Without `LOOM_RUN_MODEL_CALIBRATION=1`, the script exits without running models.
 
 ### Locked bootstrap and mandatory full gate
 
-The development/CI baseline is a full-history Git checkout on non-root Linux, Node **22.23.2**, Bun **1.3.13**, npm, Git, jq, Bash **4+**, and GNU `timeout` on PATH. The existing macOS 13+ runtime support excludes strict critical-remediation report reset and is not a claim that this verification change was tested there; macOS would also need the development tools, including GNU coreutils and a suitable Bash. Full history is required because deterministic tests resolve the committed model-calibration corpus against historical revisions available through remote refs. A normal full clone checked out on `main` contains those objects; for an existing single-branch shallow clone, fetch every remote head before verification:
+The development/CI baseline is a full-history Git checkout on non-root Linux, Node **22.23.5**, Bun **1.3.13**, npm, Git, jq, Bash **4+**, and GNU `timeout` on PATH. The existing macOS 13+ runtime support excludes strict critical-remediation report reset and is not a claim that this verification change was tested there; macOS would also need the development tools, including GNU coreutils and a suitable Bash. Full history is required because deterministic tests resolve the committed model-calibration corpus against historical revisions available through remote refs. A normal full clone checked out on `main` contains those objects; for an existing single-branch shallow clone, fetch every remote head before verification:
 
 ```bash
 git fetch --unshallow origin '+refs/heads/*:refs/remotes/origin/*' --tags
